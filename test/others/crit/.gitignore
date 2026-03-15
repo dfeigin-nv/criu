@@ -3,3 +3,11 @@
 *.txt
 stats-*
 *.json
+comp/
+uncomp/
+cdc/
+dcd/
+sparse-compress/
+sparse-decompress/
+threshold-compress/
+truncated-decompress/
