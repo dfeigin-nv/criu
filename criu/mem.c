@@ -6,6 +6,7 @@
 #include <string.h>
 #include <sys/syscall.h>
 #include <sys/prctl.h>
+#include <sys/socket.h>
 #include <stdlib.h>
 
 #include "types.h"
@@ -1550,7 +1551,14 @@ static int prepare_vma_ios(struct pstree_item *t, struct task_restore_args *ta)
 		return -1;
 
 	ta->vma_ios_fd = img_raw_fd(pages);
-	if (ta->vma_ios_fd >= 0 && opts.image_io_mode == IMAGE_IO_DIRECT) {
+	/*
+	 * O_DIRECT requires aligned offset and length. Compressed pages
+	 * are variable-length blocks read at unaligned offsets (by the
+	 * decompression daemon), so O_DIRECT would fail with EINVAL.
+	 * Use buffered I/O for compressed images, and only take the
+	 * O_DIRECT path when --image-io-mode=direct was requested.
+	 */
+	if (ta->vma_ios_fd >= 0 && opts.image_io_mode == IMAGE_IO_DIRECT && !opts.compress_mode) {
 		int direct = probe_pages_o_direct(ta->vma_ios_fd);
 		if (direct < 0) {
 			close_image(pages);
@@ -1558,6 +1566,11 @@ static int prepare_vma_ios(struct pstree_item *t, struct task_restore_args *ta)
 		}
 		ta->vma_ios_use_direct = (direct == 1);
 	}
+
+	ta->compress_mode = opts.compress_mode;
+	ta->page_asyncd_fd = -1;
+	ta->page_asyncd_pid = -1;
+
 	return pagemap_render_iovec(&rsti(t)->vma_io, ta);
 }
 

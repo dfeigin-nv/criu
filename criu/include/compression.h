@@ -1,6 +1,9 @@
 #ifndef __CR_COMPRESSION_H__
 #define __CR_COMPRESSION_H__
 
+#include <stdint.h>
+#include <sys/types.h>
+
 #include "page.h"
 
 /*
@@ -84,6 +87,17 @@ static inline bool page_is_all_zero(const char *page)
 	return true;
 }
 
+/* Wire protocol header between the PIE restorer and the decompression service. */
+struct vma_io_compress_hdr {
+	pid_t remote_pid;
+	off_t offs;
+	uint64_t total_compressed_size;
+	int n_pages;
+	int nr_iovs;
+	int n_blocks;
+	uint32_t region_pages;
+} __attribute__((packed));
+
 #ifdef CONFIG_LZ4
 
 int compress_data(const char *input_data, size_t input_size,
@@ -114,16 +128,12 @@ int decompress_region(const char *src, int compressed_size,
 		      unsigned int n_pages, char *dst);
 
 /*
- * Start a helper daemon that decompresses memory pages on behalf of
- * the PIE restorer. The restorer code runs as position-independent
- * executable injected into the restored process address space, so it
- * cannot link against external libraries such as LZ4. The daemon
- * runs as a regular process, reads compressed pages from the image
- * file, decompresses them, and writes the result into the target
- * address space via process_vm_writev(). Communication with the
- * restorer happens over a pair of pipes.
+ * Start a dedicated decompression daemon for PIE VMA I/O. The returned
+ * socket is passed to PIE as task_restore_args.page_asyncd_fd, and the
+ * returned pid is reaped by PIE after it closes the socket.
  */
-int start_vma_io_pipe_daemon(int pages_img_fd, int pipe_fds[2][2]);
+int start_vma_io_compress_daemon(int pages_img_fd, unsigned int decompress_threads,
+				 int *sk, pid_t *pid);
 
 #else /* !CONFIG_LZ4 */
 
@@ -151,7 +161,9 @@ static inline int decompress_region(const char *src, int comp_sz,
 	return -1;
 }
 
-static inline int start_vma_io_pipe_daemon(int fd, int pipes[2][2])
+static inline int start_vma_io_compress_daemon(int pages_img_fd,
+					       unsigned int decompress_threads,
+					       int *sk, pid_t *pid)
 {
 	return -1;
 }
