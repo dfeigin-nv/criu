@@ -153,6 +153,15 @@ message criu_opts {
 	optional criu_image_io_mode	image_io_mode		= 72 [default = IMAGE_IO_WRITEBACK];
 	optional bool			memfd_cache		= 73;	/* node-local memfd content cache: share sealed populated memfds across restores */
 	optional string			memfd_cache_id		= 74;	/* cache scope key "checkpointID:version" */
+	/* 75 = stream_restore in the go-criu fork (dormant here); reserved to keep the criu/go-criu wire maps 1:1 */
+	/*
+	 * Memory page compression (PR #2895), renumbered from upstream's 72-75 to
+	 * 76+ so it does not collide with the fork's 72-75
+	 * (image_io_mode/memfd_cache/memfd_cache_id/stream_restore).
+	 * compress mode enum: 0 = off, 1 = per-page, 2 = region. Default 0.
+	 */
+	optional uint32			compress		= 76;
+	optional uint32			compress_acceleration	= 77;
 /*	optional bool			check_mounts		= 128;	*/
 }
 
