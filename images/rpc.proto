@@ -162,6 +162,12 @@ message criu_opts {
 	 */
 	optional uint32			compress		= 76;
 	optional uint32			compress_acceleration	= 77;
+	optional uint32			compress_region_size	= 78;
+	/*
+	 * Number of worker threads used to decompress memory pages on
+	 * restore. 0 or 1 means serial decompression. Restore-time only.
+	 */
+	optional uint32			decompress_threads	= 79;
 /*	optional bool			check_mounts		= 128;	*/
 }
 
