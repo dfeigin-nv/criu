@@ -13,6 +13,7 @@
 #include "cgroup.h"
 #include "cgroup-props.h"
 #include "common/bug.h"
+#include "compression.h"
 #include "cpu.h"
 #include "crtools.h"
 #include "cr_options.h"
@@ -618,7 +619,7 @@ int parse_options(int argc, char **argv, bool *usage_error, bool *has_exec_cmd, 
 		"no-" OPT_NAME, no_argument, SAVE_TO, false \
 	}
 
-	static const char short_opts[] = "dSsRt:hD:o:v::x::Vr:jJ:lW:L:M:";
+	static const char short_opts[] = "dSscRt:hD:o:v::x::Vr:jJ:lW:L:M:";
 	static struct option long_opts[] = {
 		{ "tree", required_argument, 0, 't' },
 		{ "leave-stopped", no_argument, 0, 's' },
@@ -705,6 +706,10 @@ int parse_options(int argc, char **argv, bool *usage_error, bool *has_exec_cmd, 
 		BOOL_OPT("unprivileged", &opts.unprivileged),
 		BOOL_OPT("ghost-fiemap", &opts.ghost_fiemap),
 		BOOL_OPT(OPT_ALLOW_UPROBES, &opts.allow_uprobes),
+		{ "compress",                no_argument,       0, 'c'  },
+		{ "compress-acceleration",   required_argument, 0, 1101 },
+		{ "compress-region",         required_argument, 0, 1102 },
+		{ "decompress-threads",      required_argument, 0, 1103 },
 		{},
 	};
 
@@ -814,6 +819,55 @@ int parse_options(int argc, char **argv, bool *usage_error, bool *has_exec_cmd, 
 			} else
 				opts.log_level++;
 			break;
+		case 'c':
+			if (opts.compress_mode == COMPRESS_REGION) {
+				pr_err("--compress conflicts with --compress-region\n");
+				return 1;
+			}
+			opts.compress_mode = COMPRESS_PER_PAGE;
+			break;
+		case 1101: {
+			char *endptr;
+			long accel = strtol(optarg, &endptr, 10);
+
+			if (*endptr != '\0' || accel < 1 || accel > LZ4_MAX_ACCELERATION) {
+				pr_err("Invalid --compress-acceleration value '%s' (must be 1..%d)\n",
+				       optarg, LZ4_MAX_ACCELERATION);
+				return 1;
+			}
+			opts.compress_acceleration = accel;
+			break;
+		}
+		case 1102: {
+			size_t sz = parse_size(optarg);
+
+			if (sz == 0 || sz % PAGE_SIZE != 0 ||
+			    sz > (size_t)MAX_REGION_PAGES * PAGE_SIZE) {
+				pr_err("Invalid --compress-region '%s' (must be a multiple of %lu, max %lu)\n",
+				       optarg, (unsigned long)PAGE_SIZE,
+				       (unsigned long)MAX_REGION_PAGES * PAGE_SIZE);
+				return 1;
+			}
+			if (opts.compress_mode == COMPRESS_PER_PAGE) {
+				pr_err("--compress-region conflicts with --compress\n");
+				return 1;
+			}
+			opts.compress_region_size = sz;
+			opts.compress_mode = COMPRESS_REGION;
+			break;
+		}
+		case 1103: {
+			char *endptr;
+			long n = strtol(optarg, &endptr, 10);
+
+			if (*endptr != '\0' || n < 0 || n > 1024) {
+				pr_err("Invalid --decompress-threads value '%s' (must be 0..1024)\n",
+				       optarg);
+				return 1;
+			}
+			opts.decompress_threads = (unsigned int)n;
+			break;
+		}
 		case 1043: {
 			int fd;
 
@@ -1076,6 +1130,79 @@ bad_arg:
 
 int check_options(void)
 {
+	/*
+	 * --compress-acceleration (CLI) or compress_acceleration (RPC) on
+	 * their own imply per-page compression. Resolve that here rather
+	 * than while parsing each option, so that passing acceleration
+	 * before --compress-region is not mistaken for a conflict with an
+	 * implicit --compress.
+	 */
+	if (opts.compress_acceleration && opts.compress_mode == COMPRESS_OFF)
+		opts.compress_mode = COMPRESS_PER_PAGE;
+
+	if (opts.compress_mode) {
+#ifndef CONFIG_LZ4
+		pr_err("Memory page compression requires CRIU built with LZ4 support (CONFIG_LZ4)\n");
+		return 1;
+#else
+		if (opts.compress_mode == COMPRESS_REGION) {
+			if (opts.compress_region_size == 0)
+				opts.compress_region_size = DEFAULT_REGION_PAGES * PAGE_SIZE;
+			if (opts.compress_region_size % PAGE_SIZE != 0 ||
+			    opts.compress_region_size > MAX_REGION_PAGES * PAGE_SIZE) {
+				pr_err("Invalid compress region size %u\n",
+				       opts.compress_region_size);
+				return 1;
+			}
+			pr_debug("Region compression of memory pages is enabled (region=%u bytes)\n",
+				 opts.compress_region_size);
+		} else {
+			pr_debug("Per-page compression of memory pages is enabled\n");
+		}
+#endif
+	}
+
+	/*
+	 * Region compression is currently only implemented for the local
+	 * dump path (and the corresponding restore daemon). The page-server
+	 * and image-streamer wire formats are per-page; combining them with
+	 * --compress-region would produce an image the receiver cannot read.
+	 * Reject the combination early.
+	 */
+	if (opts.compress_mode == COMPRESS_REGION) {
+		if (opts.use_page_server || opts.addr) {
+			pr_err("--compress-region is not supported with --page-server\n");
+			return 1;
+		}
+		if (opts.stream) {
+			pr_err("--compress-region is not supported with --stream\n");
+			return 1;
+		}
+	}
+
+	/*
+	 * The compressed page-server sender writes its records straight to
+	 * the socket and does not route them through the TLS helpers, so a
+	 * TLS page-server would receive plaintext into the encrypted stream.
+	 * Reject the combination until compressed sends learn to use TLS.
+	 */
+	if (opts.compress_mode && opts.tls && (opts.use_page_server || opts.addr)) {
+		pr_err("Memory page compression is not supported with a TLS page-server\n");
+		return 1;
+	}
+
+	/*
+	 * Lazy migration serves pages outside the compressed image layout:
+	 * a lazy dump keeps pages out of the image to be served on demand,
+	 * and lazy restore of a compressed image is rejected when the
+	 * inventory is read. A compressed lazy dump would thus produce a
+	 * checkpoint that no restore can consume, so reject the
+	 * combination on the dump side as well.
+	 */
+	if (opts.compress_mode && opts.lazy_pages) {
+		pr_err("Memory page compression is not supported with lazy migration\n");
+		return 1;
+	}
 	if (opts.tcp_established_ok)
 		pr_info("Will dump/restore TCP connections\n");
 	if (opts.tcp_skip_in_flight)

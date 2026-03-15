@@ -217,6 +217,39 @@ struct cr_options {
 	int tls;
 	int tls_no_cn_verify;
 
+	/*
+	 * Memory page compression mode (enum compress_mode):
+	 *   COMPRESS_OFF       (0) = no compression (default)
+	 *   COMPRESS_PER_PAGE  (1) = each 4 KiB page is its own LZ4 block
+	 *   COMPRESS_REGION    (2) = regions of compress_region_size bytes
+	 *                            are compressed as one LZ4 block
+	 *
+	 * Predicate "is compression on?" is just `if (opts.compress_mode)`.
+	 */
+	int compress_mode;
+
+	/*
+	 * LZ4 acceleration level for page compression.
+	 * Internal: 0 means the user did not set a value (default acceleration).
+	 * CLI/RPC accept 1..LZ4_MAX_ACCELERATION (higher = faster, lower ratio).
+	 */
+	unsigned int compress_acceleration;
+
+	/*
+	 * Region size in bytes when compress_mode == COMPRESS_REGION.
+	 * Must be a multiple of PAGE_SIZE and <= MAX_REGION_PAGES * PAGE_SIZE.
+	 * 0 means "use default".
+	 */
+	unsigned int compress_region_size;
+
+	/*
+	 * Number of worker threads used to decompress memory pages on
+	 * restore. 0 or 1 means serial decompression (no worker pool).
+	 * The effective per-batch pool is bounded by online CPUs and the
+	 * number of compressed blocks in the request.
+	 */
+	unsigned int decompress_threads;
+
 	/* This stores which method to use for file validation. */
 	int file_validation_method;
 

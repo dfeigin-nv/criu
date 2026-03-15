@@ -47,6 +47,7 @@
 
 #include "cr-errno.h"
 #include "namespaces.h"
+#include "compression.h"
 
 unsigned int service_sk_ino = -1;
 
@@ -823,6 +824,48 @@ static int setup_opts_from_req(int sk, CriuOpts *req)
 
 	if (req->mntns_compat_mode)
 		opts.mntns_compat_mode = true;
+
+	if (req->has_compress) {
+		if (req->compress > COMPRESS_REGION) {
+			pr_err("Invalid compress value %u\n", req->compress);
+			goto err;
+		}
+		opts.compress_mode = req->compress;
+	}
+
+	if (req->has_compress_acceleration && req->compress_acceleration > 0) {
+		if (req->compress_acceleration > LZ4_MAX_ACCELERATION) {
+			pr_err("Invalid compress_acceleration value %u (must be 1..%d)\n",
+			       req->compress_acceleration, LZ4_MAX_ACCELERATION);
+			goto err;
+		}
+		opts.compress_acceleration = req->compress_acceleration;
+	}
+
+	if (req->has_compress_region_size) {
+		if (req->compress_region_size == 0 ||
+		    req->compress_region_size % PAGE_SIZE != 0 ||
+		    req->compress_region_size > MAX_REGION_PAGES * PAGE_SIZE) {
+			pr_err("Invalid compress_region_size value %u\n",
+			       req->compress_region_size);
+			goto err;
+		}
+		if (opts.compress_mode == COMPRESS_PER_PAGE) {
+			pr_err("compress_region_size conflicts with compress=per-page\n");
+			goto err;
+		}
+		opts.compress_region_size = req->compress_region_size;
+		opts.compress_mode = COMPRESS_REGION;
+	}
+
+	if (req->has_decompress_threads) {
+		if (req->decompress_threads > 1024) {
+			pr_err("Invalid decompress_threads value %u (must be 0..1024)\n",
+			       req->decompress_threads);
+			goto err;
+		}
+		opts.decompress_threads = req->decompress_threads;
+	}
 
 	if (check_options())
 		goto err;
