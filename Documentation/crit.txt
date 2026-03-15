@@ -18,6 +18,10 @@ SYNOPSIS
 
 *crit* 'show' [-h] in
 
+*crit* 'compress' [-h] [--in-place] [--acceleration N] dir
+
+*crit* 'decompress' [-h] [--in-place] dir
+
 DESCRIPTION
 -----------
 *crit* is a feature-rich replacement for existing *criu* show.
@@ -43,11 +47,37 @@ Positional Arguments
 *show*::
     convert *criu* image from binary to human-readable JSON
 
+*compress*::
+    compress memory page images in a checkpoint directory using CRIU's
+    per-page LZ4 format. The command rewrites *pages-*.img*,
+    *pagemap-*.img*, and *inventory.img*. Pages that are zero-filled or
+    do not meet CRIU's compression threshold are stored without an LZ4
+    payload. By default, rewritten files are first renamed with a *.bak*
+    suffix; use *--in-place* to skip these backup files. The inventory
+    is updated to record compression metadata and the compressed-image
+    version.
+
+*decompress*::
+    decompress memory page images in a checkpoint directory back to
+    uncompressed page payloads. The command removes compression metadata
+    from the pagemap and inventory images and, when decompressing a
+    compressed-version inventory, restores the normal image version. By
+    default, rewritten files are first renamed with a *.bak* suffix; use
+    *--in-place* to skip these backup files.
+
 Optional Arguments
 ~~~~~~~~~~~~~~~~~~
 
 *-h*, *--help*::
     Print some help and exit
+
+*--in-place*::
+    Rewrite files without creating *.bak* backup files. This option is
+    accepted by *compress* and *decompress*.
+
+*--acceleration* 'N'::
+    Set the LZ4 acceleration level used by *compress*. Higher values
+    trade compression ratio for speed.
 
 SEE ALSO
 --------
