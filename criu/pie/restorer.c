@@ -41,6 +41,7 @@
 
 #include "common/lock.h"
 #include "common/page.h"
+#include "compression.h"
 #include "restorer.h"
 #include "aio.h"
 #include "seccomp.h"
@@ -64,6 +65,10 @@
 
 #ifndef PR_SET_PDEATHSIG
 #define PR_SET_PDEATHSIG 1
+#endif
+
+#ifndef PR_SET_PTRACER
+#define PR_SET_PTRACER 0x59616d61
 #endif
 
 #ifndef PR_SET_TIMERSLACK
@@ -107,6 +112,7 @@ static pid_t *helpers;
 static int n_helpers;
 static pid_t *zombies;
 static int n_zombies;
+static pid_t vma_io_helper_pid;
 
 static enum faults fi_strategy;
 bool fault_injected(enum faults f)
@@ -152,6 +158,9 @@ static void sigchld_handler(int signal, siginfo_t *siginfo, void *data)
 
 	/* We can ignore helpers that die, we expect them to after
 	 * CR_STATE_RESTORE is finished. */
+	if (siginfo->si_pid == vma_io_helper_pid)
+		return;
+
 	for (i = 0; i < n_helpers; i++)
 		if (siginfo->si_pid == helpers[i])
 			return;
@@ -1761,6 +1770,190 @@ static int reap_aio_events(struct task_restore_args *args, aio_context_t aio_ctx
 }
 
 /*
+ * Write exactly @size bytes to pipe @fd, handling short writes.
+ * Pipe writes can be short when the pipe buffer fills up
+ * (default 64 KB on Linux), which happens easily with large
+ * compressed_size arrays or iovec arrays.
+ */
+static int pipe_write_full(int fd, const void *buf, size_t size)
+{
+	size_t done = 0;
+
+	while (done < size) {
+		ssize_t ret = sys_write(fd, (const char *)buf + done,
+					size - done);
+		if (ret < 0) {
+			if (ret == -EINTR)
+				continue;
+			pr_err("Can't write compressed page request: %ld\n",
+			       (long)ret);
+			return -1;
+		}
+		if (ret == 0) {
+			pr_err("Unexpected short write for compressed page request\n");
+			return -1;
+		}
+		done += ret;
+	}
+	return 0;
+}
+
+/*
+ * Read exactly @size bytes from pipe @fd, handling short reads.
+ */
+static int pipe_read_full(int fd, void *buf, size_t size)
+{
+	size_t done = 0;
+
+	while (done < size) {
+		ssize_t ret = sys_read(fd, (char *)buf + done,
+				       size - done);
+		if (ret < 0) {
+			if (ret == -EINTR)
+				continue;
+			pr_err("Can't read compressed page response: %ld\n",
+			       (long)ret);
+			return -1;
+		}
+		if (ret == 0) {
+			pr_err("Unexpected EOF reading compressed page response\n");
+			return -1;
+		}
+		done += ret;
+	}
+	return 0;
+}
+
+/*
+ * compressed_preadv() delegates page decompression to a helper daemon, since
+ * the PIE restorer cannot link against LZ4.
+ *
+ * Protocol (must match vma_io_compress_loop() in compression.c):
+ *   1. struct vma_io_compress_hdr (pid, offs, total_cs, n_pages,
+ *                                  nr_iovs, n_blocks, region_pages)
+ *   2. uint32_t compressed_size[n_blocks]
+ *   3. uint16_t block_pages[n_blocks]   (only when region_pages > 0)
+ *   4. struct iovec iovs[nr_iovs]       (remote dest layout)
+ *
+ * Response: ssize_t total_uncompressed_size
+ */
+static ssize_t compressed_preadv(int fd, struct iovec *iovs, int nr_iovs,
+				 off_t offs, uint32_t *compressed_size,
+				 int n_blocks, int n_pages,
+				 uint64_t total_compressed_size,
+				 uint32_t region_pages, uint16_t *block_pages)
+{
+	struct vma_io_compress_hdr hdr;
+	ssize_t result;
+
+	hdr.remote_pid = sys_getpid();
+	hdr.offs = offs;
+	hdr.total_compressed_size = total_compressed_size;
+	hdr.n_pages = n_pages;
+	hdr.nr_iovs = nr_iovs;
+	hdr.n_blocks = n_blocks;
+	hdr.region_pages = region_pages;
+
+	if (pipe_write_full(fd, &hdr, sizeof(hdr)))
+		return -1;
+
+	if (pipe_write_full(fd, compressed_size,
+			    n_blocks * sizeof(uint32_t)))
+		return -1;
+
+	if (region_pages > 0 &&
+	    pipe_write_full(fd, block_pages,
+			    n_blocks * sizeof(uint16_t)))
+		return -1;
+
+	if (pipe_write_full(fd, iovs,
+			    nr_iovs * sizeof(struct iovec)))
+		return -1;
+
+	if (pipe_read_full(fd, &result, sizeof(ssize_t)))
+		return -1;
+
+	return result;
+}
+
+static int restore_vma_compressed(struct task_restore_args *args)
+{
+	struct restore_vma_io *rio = args->vma_ios;
+	unsigned int i;
+	int status = 0;
+
+	/*
+	 * The helper service reads compressed data from the pages image,
+	 * decompresses it, and writes the restored page contents via
+	 * process_vm_writev(). The PIE restorer cannot link against LZ4.
+	 *
+	 * process_vm_writev() needs PTRACE_MODE_ATTACH access to this task.
+	 * The daemon is our child, so under Yama (ptrace_scope >= 1) a child
+	 * tracing its parent is not a descendant relationship and is denied
+	 * unless we name it as an allowed tracer. Do so before the first
+	 * request. Best-effort: kernels without Yama return -EINVAL, which is
+	 * harmless (access is already permitted there).
+	 */
+	if (args->page_asyncd_pid > 0)
+		sys_prctl(PR_SET_PTRACER, args->page_asyncd_pid, 0, 0, 0);
+
+	for (i = 0; i < args->vma_ios_n; i++) {
+		struct iovec *iovs = rio->iovs;
+		int nr = rio->nr_iovs;
+		ssize_t r;
+		int n_pages = rio->n_pages > 0 ? rio->n_pages :
+						 rio->n_compressed_size;
+
+		pr_debug("Compressed preadv %lx:%d... (%d iovs, %d blocks, %d pages, region=%u)\n",
+			 (unsigned long)iovs->iov_base, (int)iovs->iov_len,
+			 nr, rio->n_compressed_size, n_pages, rio->region_pages);
+
+		r = compressed_preadv(args->page_asyncd_fd, iovs, nr, rio->off,
+				      rio->compressed_size,
+				      rio->n_compressed_size, n_pages,
+				      rio->total_compressed_size,
+				      rio->region_pages, rio->block_pages);
+		if (r < 0) {
+			pr_err("Can't decompress pages data (%d)\n", (int)r);
+			return -1;
+		}
+
+		rio = (struct restore_vma_io *)((char *)rio + RIO_SIZE(rio->nr_iovs));
+	}
+
+	/*
+	 * Close the socket used for communicating with the decompression
+	 * service. The service reads EOF and returns; reap it here because the
+	 * shared asyncd is stopped before PIE runs.
+	 */
+	if (args->page_asyncd_pid > 0) {
+		long ret;
+
+		vma_io_helper_pid = args->page_asyncd_pid;
+		sys_close(args->page_asyncd_fd);
+		do {
+			ret = sys_wait4(args->page_asyncd_pid, &status, 0, NULL);
+		} while (ret == -EINTR);
+
+		if (ret < 0) {
+			pr_err("Can't wait VMA decompression daemon: %ld\n", ret);
+			return -1;
+		}
+		if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+			pr_err("VMA decompression daemon exited with status %#x\n",
+			       status);
+			return -1;
+		}
+
+		return 0;
+	}
+
+	sys_close(args->page_asyncd_fd);
+
+	return 0;
+}
+
+/*
  * Call preadv() but limit size of the read. Zero `max_to_read` skips the limit.
  */
 static ssize_t preadv_limited(int fd, struct iovec *iovs, int nr, off_t offs, size_t max_to_read)
@@ -2258,14 +2451,21 @@ __visible long __export_restore_task(struct task_restore_args *args)
 	 * probe_pages_o_direct() at restore-args build time:
 	 *   true  -> restore_vma_aio()    (io_submit, O_DIRECT, batched)
 	 *   false -> restore_vma_preadv() (sys_preadv, buffered, sequential)
-	 * Both helpers consume args->vma_ios and close args->vma_ios_fd on exit.
+	 * The uncompressed helpers consume args->vma_ios and close
+	 * args->vma_ios_fd on exit. The compressed helper owns the pages image
+	 * fd before PIE starts, and PIE only talks to it over page_asyncd_fd.
 	 */
-	if (args->vma_ios_n > 0 && args->vma_ios_fd != -1) {
-		int rc = args->vma_ios_use_direct
-			? restore_vma_aio(args)
-			: restore_vma_preadv(args);
-		if (rc < 0)
-			goto core_restore_end;
+	if (args->vma_ios_n > 0) {
+		if (args->compress_mode && args->page_asyncd_fd != -1) {
+			if (restore_vma_compressed(args) < 0)
+				goto core_restore_end;
+		} else if (args->vma_ios_fd != -1) {
+			int rc = args->vma_ios_use_direct
+				? restore_vma_aio(args)
+				: restore_vma_preadv(args);
+			if (rc < 0)
+				goto core_restore_end;
+		}
 	}
 
 	/*

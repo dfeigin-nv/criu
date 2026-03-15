@@ -50,6 +50,7 @@
 #include "uffd.h"
 #include "namespaces.h"
 #include "asyncd.h"
+#include "compression.h"
 #include "mem.h"
 #include "mount.h"
 #include "fsnotify.h"
@@ -3258,6 +3259,19 @@ static int sigreturn_restore(pid_t pid, struct task_restore_args *task_args, uns
 			goto err;
 	}
 
+	if (task_args->compress_mode && task_args->vma_ios_n > 0 &&
+	    task_args->vma_ios_fd != -1) {
+		if (start_vma_io_compress_daemon(task_args->vma_ios_fd,
+						 opts.decompress_threads,
+						 &task_args->page_asyncd_fd,
+						 &task_args->page_asyncd_pid)) {
+			pr_err("Failed to start VMA IO decompression daemon\n");
+			goto err_nv;
+		}
+		close(task_args->vma_ios_fd);
+		task_args->vma_ios_fd = -1;
+	}
+
 	/*
 	 * We're about to search for free VM area and inject the restorer blob
 	 * into it. No irrelevant mmaps/mremaps beyond this point, otherwise
@@ -3402,6 +3416,18 @@ static int sigreturn_restore(pid_t pid, struct task_restore_args *task_args, uns
 	RST_MEM_FIXUP_PPTR(task_args->helpers);
 	RST_MEM_FIXUP_PPTR(task_args->zombies);
 	RST_MEM_FIXUP_PPTR(task_args->vma_ios);
+	{
+		struct restore_vma_io *rio = task_args->vma_ios;
+		unsigned int n;
+
+		for (n = 0; n < task_args->vma_ios_n; n++) {
+			if (rio->compressed_size)
+				RST_MEM_FIXUP_PPTR(rio->compressed_size);
+			if (rio->block_pages)
+				RST_MEM_FIXUP_PPTR(rio->block_pages);
+			rio = (struct restore_vma_io *)((char *)rio + RIO_SIZE(rio->nr_iovs));
+		}
+	}
 	RST_MEM_FIXUP_PPTR(task_args->inotify_fds);
 
 	task_args->compatible_mode = core_is_compat(core);
