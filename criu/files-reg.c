@@ -2279,6 +2279,7 @@ int open_path(struct file_desc *d, int (*open_cb)(int mntns_root, struct reg_fil
 	char *orig_path = NULL;
 	char path[PATH_MAX];
 	int inh_fd = -1;
+	bool remap_lock_held = false;
 	int ret;
 
 	if (inherited_fd(d, &tmp))
@@ -2318,6 +2319,7 @@ int open_path(struct file_desc *d, int (*open_cb)(int mntns_root, struct reg_fil
 			goto err;
 		pr_info("open_path remap lock: %s\n", rfi->path);
 		mutex_lock(m);
+		remap_lock_held = true;
 		if (rfi->remap->is_dir) {
 			/*
 			 * FIXME Can't make directory under new name.
@@ -2326,6 +2328,7 @@ int open_path(struct file_desc *d, int (*open_cb)(int mntns_root, struct reg_fil
 			orig_path = rfi->path;
 			rfi->path = rfi->remap->rpath;
 			mutex_unlock(m);
+			remap_lock_held = false;
 			mntns_root = mntns_get_root_by_mnt_id(rfi->rfe->mnt_id);
 			goto ext;
 		}
@@ -2440,10 +2443,11 @@ ext:
 			pthread_mutex_unlock(&rt->lock);
 		}
 
-		{
+		if (remap_lock_held) {
 			mutex_t *m = get_remap_lock(rfi->d.id);
 			if (m)
 				mutex_unlock(m);
+			remap_lock_held = false;
 		}
 	}
 	if (orig_path)
@@ -2456,7 +2460,7 @@ ext:
 
 	return tmp;
 err:
-	if (rfi->remap) {
+	if (remap_lock_held) {
 		mutex_t *m = get_remap_lock(rfi->d.id);
 		if (m)
 			mutex_unlock(m);
