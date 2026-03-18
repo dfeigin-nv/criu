@@ -2334,11 +2334,40 @@ int open_path(struct file_desc *d, int (*open_cb)(int mntns_root, struct reg_fil
 		}
 		pthread_mutex_lock(&rt->lock);
 		if (rt->remap_cached_fd >= 0) {
-			tmp = dup(rt->remap_cached_fd);
+			int cached = rt->remap_cached_fd;
+			int fl;
 			pthread_mutex_unlock(&rt->lock);
 			mutex_unlock(m);
+			/*
+			 * The cached fd may have been opened with flags that
+			 * differ from what this caller needs (e.g. a VMA open
+			 * used O_RDONLY but an fd-descriptor restore needs
+			 * O_RDWR). After the first open_path call, rfi->path
+			 * (the hard link) has been unlinked; the underlying
+			 * file is reachable only via the cached fd itself.
+			 *
+			 * If the access mode matches, dup() is sufficient.
+			 * If it differs, reopen via /proc/self/fd/<cached>
+			 * with the required flags.
+			 */
+			fl = fcntl(cached, F_GETFL);
+			if (fl >= 0 && (fl & O_ACCMODE) == (rfi->rfe->flags & O_ACCMODE)) {
+				tmp = dup(cached);
+			} else {
+				char proc_path[64];
+				snprintf(proc_path, sizeof(proc_path),
+					 "/proc/self/fd/%d", cached);
+				tmp = open(proc_path, rfi->rfe->flags & ~O_CREAT);
+				if (tmp >= 0 && !(rfi->rfe->flags & O_PATH) &&
+				    rfi->rfe->pos != (u64)-1ULL &&
+				    lseek(tmp, rfi->rfe->pos, SEEK_SET) < 0) {
+					pr_perror("Can't restore file pos for remap");
+					close(tmp);
+					tmp = -1;
+				}
+			}
 			if (tmp < 0) {
-				pr_perror("dup remap_cached_fd");
+				pr_perror("reopen remap_cached_fd");
 				return -1;
 			}
 			if (restore_fown(tmp, rfi->rfe->fown)) {
