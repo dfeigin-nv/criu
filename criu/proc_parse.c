@@ -2540,10 +2540,7 @@ int parse_threads(int pid, struct pid **_t, int *_n)
 	struct dirent *de;
 	DIR *dir;
 	struct pid *t = NULL;
-	int orig_n = *_n;
-	pid_t *tids = NULL;
-	int n_tids = 0;
-	int i, j;
+	int nr = 1;
 
 	if (*_t)
 		t = *_t;
@@ -2552,90 +2549,35 @@ int parse_threads(int pid, struct pid **_t, int *_n)
 	if (!dir)
 		return -1;
 
-	/* First pass: collect all tids */
 	while ((de = readdir(dir))) {
-		pid_t tid;
+		struct pid *tmp;
 
 		if (de->d_name[0] == '.')
 			continue;
 
-		tid = atoi(de->d_name);
-		tids = xrealloc(tids, (n_tids + 1) * sizeof(pid_t));
-		if (!tids) {
-			closedir(dir);
-			return -1;
+		if (*_t == NULL) {
+			tmp = xrealloc(t, nr * sizeof(struct pid));
+			if (!tmp) {
+				xfree(t);
+				closedir(dir);
+				return -1;
+			}
+			t = tmp;
+			t[nr - 1].ns[0].virt = -1;
 		}
-		tids[n_tids++] = tid;
+		t[nr - 1].real = atoi(de->d_name);
+		t[nr - 1].state = TASK_THREAD;
+		nr++;
 	}
+
 	closedir(dir);
 
-	if (n_tids < orig_n) {
-		pr_err("parse_threads: thread count mismatch for pid %d "
-		       "(expected %d from image, got %d from /proc)\n",
-		       pid, orig_n, n_tids);
-		xfree(tids);
-		return -1;
-	}
-	/* When orig_n > 0 we are re-parsing (e.g. restore) and expect exact count. When orig_n == 0 we are discovering (e.g. dump) and accept any count. */
-	if (orig_n > 0 && n_tids > orig_n) {
-		pr_err("parse_threads: unexpected extra threads for pid %d "
-		       "(expected %d, got %d)\n",
-		       pid, orig_n, n_tids);
-		xfree(tids);
-		return -1;
-	}
-
-	/* Build output: image threads first (leader in slot 0) */
 	if (*_t == NULL) {
-		t = xmalloc(n_tids * sizeof(struct pid));
-		if (!t) {
-			xfree(tids);
-			return -1;
-		}
-		for (i = 0; i < n_tids; i++)
-			t[i].ns[0].virt = -1;
-	} else if (n_tids > orig_n) {
-		t = xrealloc(t, n_tids * sizeof(struct pid));
-		if (!t) {
-			xfree(tids);
-			return -1;
-		}
-		for (i = orig_n; i < n_tids; i++)
-			t[i].ns[0].virt = -1;
-	}
+		*_t = t;
+		*_n = nr - 1;
+	} else
+		BUG_ON(nr - 1 != *_n);
 
-	j = 0;
-	/* Slot 0 = leader (tid == pid); preserve existing image thread order for others */
-	for (i = 0; i < n_tids; i++) {
-		if (tids[i] == pid) {
-			t[0].real = tids[i];
-			t[0].state = TASK_THREAD;
-			break;
-		}
-	}
-	if (i >= n_tids) {
-		pr_err("parse_threads: leader tid %d not found in /proc/%d/task\n", pid, pid);
-		xfree(tids);
-		return -1;
-	}
-	/* Remaining slots: other image threads (orig_n > 1) then extras */
-	j = 1;
-	for (i = 0; i < n_tids && j < n_tids; i++) {
-		if (tids[i] == pid)
-			continue;
-		t[j].real = tids[i];
-		t[j].state = TASK_THREAD;
-		if (j < orig_n)
-			; /* preserve ns[0].virt from image */
-		else
-			t[j].ns[0].virt = -1;
-		j++;
-	}
-
-	xfree(tids);
-
-	*_t = t;
-	*_n = n_tids;
 	return 0;
 }
 

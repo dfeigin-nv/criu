@@ -22,11 +22,8 @@ struct reg_file_info {
 	struct file_desc d;
 	RegFileEntry *rfe;
 	struct file_remap *remap;
-	bool size_mode_checked;
 	bool is_dir;
 	char *path;
-	/* For remap: cached fd in this process (-1 if not set); one link per file, rest dup. */
-	int remap_cached_fd;
 };
 
 extern int open_reg_by_id(u32 id);

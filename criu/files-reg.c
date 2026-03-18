@@ -12,6 +12,7 @@
 #include <sched.h>
 #include <sys/capability.h>
 #include <sys/ioctl.h>
+#include <pthread.h>
 #include <elf.h>
 #include <linux/fiemap.h>
 #include <linux/fs.h>
@@ -82,6 +83,44 @@ struct ghost_file {
 
 static u32 ghost_file_ids = 1;
 static LIST_HEAD(ghost_files);
+
+struct reg_file_runtime {
+	struct list_head list;
+	u32 id;
+	bool size_mode_checked;
+	int remap_cached_fd;
+	pthread_mutex_t lock;
+};
+
+static LIST_HEAD(reg_file_runtimes);
+static pthread_mutex_t reg_file_runtimes_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static struct reg_file_runtime *get_reg_file_runtime(struct reg_file_info *rfi)
+{
+	struct reg_file_runtime *rt;
+
+	pthread_mutex_lock(&reg_file_runtimes_lock);
+	list_for_each_entry(rt, &reg_file_runtimes, list) {
+		if (rt->id == rfi->d.id) {
+			pthread_mutex_unlock(&reg_file_runtimes_lock);
+			return rt;
+		}
+	}
+
+	rt = xmalloc(sizeof(*rt));
+	if (!rt) {
+		pthread_mutex_unlock(&reg_file_runtimes_lock);
+		return NULL;
+	}
+
+	rt->id = rfi->d.id;
+	rt->size_mode_checked = false;
+	rt->remap_cached_fd = -1;
+	pthread_mutex_init(&rt->lock, NULL);
+	list_add_tail(&rt->list, &reg_file_runtimes);
+	pthread_mutex_unlock(&reg_file_runtimes_lock);
+	return rt;
+}
 
 /*
  * When opening remaps we first create a link on the remap
@@ -374,14 +413,8 @@ static int mkreg_ghost(char *path, GhostFileEntry *gfe, struct cr_img *img)
 
 	gfd = open(path, O_WRONLY | O_CREAT | O_EXCL, gfe->mode);
 	if (gfd < 0) {
-		/*
-		 * EEXIST: another concurrent restore process (rst_sibling) already
-		 * created this ghost file for the same shared deleted inode. Both
-		 * processes read identical checkpoint data so the file content is
-		 * correct; treat this as success and reuse the existing ghost.
-		 */
 		if (errno == EEXIST)
-			return 0;
+			pr_err("Ghost %s already exists before content restore completed\n", path);
 		return -1;
 	}
 
@@ -856,7 +889,6 @@ int prepare_remaps(void)
 		return ret;
 
 	list_for_each_entry(ri, &remaps, list) {
-		ri->rfi->remap_cached_fd = -1;
 		ret = prepare_one_remap(ri);
 		if (ret)
 			break;
@@ -2241,6 +2273,7 @@ int open_path(struct file_desc *d, int (*open_cb)(int mntns_root, struct reg_fil
 {
 	int tmp = -1, mntns_root, level = 0;
 	struct reg_file_info *rfi;
+	struct reg_file_runtime *rt;
 	char *orig_path = NULL;
 	char path[PATH_MAX];
 	int inh_fd = -1;
@@ -2250,6 +2283,9 @@ int open_path(struct file_desc *d, int (*open_cb)(int mntns_root, struct reg_fil
 		return tmp;
 
 	rfi = container_of(d, struct reg_file_info, d);
+	rt = get_reg_file_runtime(rfi);
+	if (!rt)
+		return -1;
 
 	if (rfi->rfe->ext) {
 		tmp = inherit_fd_lookup_id(rfi->rfe->name);
@@ -2291,8 +2327,10 @@ int open_path(struct file_desc *d, int (*open_cb)(int mntns_root, struct reg_fil
 			mntns_root = mntns_get_root_by_mnt_id(rfi->rfe->mnt_id);
 			goto ext;
 		}
-		if (rfi->remap_cached_fd >= 0) {
-			tmp = dup(rfi->remap_cached_fd);
+		pthread_mutex_lock(&rt->lock);
+		if (rt->remap_cached_fd >= 0) {
+			tmp = dup(rt->remap_cached_fd);
+			pthread_mutex_unlock(&rt->lock);
 			mutex_unlock(m);
 			if (tmp < 0) {
 				pr_perror("dup remap_cached_fd");
@@ -2304,6 +2342,7 @@ int open_path(struct file_desc *d, int (*open_cb)(int mntns_root, struct reg_fil
 			}
 			return tmp;
 		}
+		pthread_mutex_unlock(&rt->lock);
 		/*
 		 * First open of this remap in this process: create link,
 		 * open, cache fd, then unlink while still holding the lock.
@@ -2339,16 +2378,20 @@ ext:
 	}
 	close_safe(&inh_fd);
 
-	if ((rfi->rfe->has_size || rfi->rfe->has_mode) && !rfi->size_mode_checked) {
+	pthread_mutex_lock(&rt->lock);
+	if ((rfi->rfe->has_size || rfi->rfe->has_mode) && !rt->size_mode_checked) {
 		struct stat st;
 
 		if (fstat(tmp, &st) < 0) {
+			pthread_mutex_unlock(&rt->lock);
 			pr_perror("Can't fstat opened file");
 			goto err;
 		}
 
-		if (!validate_file(tmp, &st, rfi))
+		if (!validate_file(tmp, &st, rfi)) {
+			pthread_mutex_unlock(&rt->lock);
 			goto err;
+		}
 
 		if (rfi->rfe->has_mode) {
 			mode_t curr_mode = st.st_mode;
@@ -2360,6 +2403,7 @@ ext:
 			}
 
 			if (curr_mode != saved_mode) {
+				pthread_mutex_unlock(&rt->lock);
 				pr_err("File %s has bad mode 0%o (expect 0%o)\n"
 				       "File r/w/x checks can be skipped with the --skip-file-rwx-check option\n",
 				       rfi->path, (int)curr_mode, saved_mode);
@@ -2372,8 +2416,9 @@ ext:
 		 * change w/o locks. Other tasks sharing the same
 		 * file will get one via unix sockets.
 		 */
-		rfi->size_mode_checked = true;
+		rt->size_mode_checked = true;
 	}
+	pthread_mutex_unlock(&rt->lock);
 
 	if (rfi->remap) {
 		if (!rfi->remap->is_dir) {
@@ -2390,7 +2435,9 @@ ext:
 			if (rm_parent_dirs(mntns_root, rfi->path, level))
 				goto err;
 
-			rfi->remap_cached_fd = tmp;
+			pthread_mutex_lock(&rt->lock);
+			rt->remap_cached_fd = tmp;
+			pthread_mutex_unlock(&rt->lock);
 		}
 
 		{
@@ -2697,7 +2744,6 @@ static int collect_one_regfile(void *o, ProtobufCMessage *base, struct cr_img *i
 	else
 		rfi->path = rfi->rfe->name + 1;
 	rfi->remap = NULL;
-	rfi->size_mode_checked = false;
 
 	pr_info("Collected [%s] ID %#x\n", rfi->path, rfi->rfe->id);
 	return file_desc_add(&rfi->d, rfi->rfe->id, &reg_desc_ops);
