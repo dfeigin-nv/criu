@@ -558,6 +558,24 @@ static void advance_piov(struct page_read_iov *piov, ssize_t len)
 	pr_debug("Advanced iov %zu bytes, %d->%d iovs, %zu tail\n", olen, onr, piov->nr, len);
 }
 
+/*
+ * Drain (free without reading) all async entries in pr and its parent chain.
+ * Called on error paths to satisfy BUG_ON(!list_empty(&pr->async)) in
+ * close_page_read().
+ */
+static void drain_async_queue(struct page_read *pr)
+{
+	struct page_read_iov *piov, *n;
+
+	list_for_each_entry_safe(piov, n, &pr->async, l) {
+		list_del(&piov->l);
+		xfree(piov->to);
+		xfree(piov);
+	}
+	if (pr->parent)
+		drain_async_queue(pr->parent);
+}
+
 static int process_async_reads(struct page_read *pr)
 {
 	int fd, ret = 0;
@@ -587,40 +605,39 @@ static int process_async_reads(struct page_read *pr)
 	}
 	gettimeofday(&tv1, NULL);
 	list_for_each_entry_safe(piov, n, &pr->async, l) {
-		ssize_t ret;
+		ssize_t bytes;
 		struct iovec *iovs = piov->to;
+		bool io_failed = false;
 
 		pr_debug("Read piov iovs %d, from %ju, len %ju, first %p:%zu\n", piov->nr, piov->from,
 			 piov->end - piov->from, piov->to->iov_base, piov->to->iov_len);
 	more:
-		ret = preadv(fd, piov->to, piov->nr, piov->from);
+		bytes = preadv(fd, piov->to, piov->nr, piov->from);
 		if (fault_injected(FI_PARTIAL_PAGES)) {
 			/*
 			 * We might have read everything, but for debug
 			 * purposes let's try to force the advance_piov()
 			 * and re-read tail.
 			 */
-			if (ret > 0 && piov->nr >= 2) {
-				pr_debug("`- trim preadv %zu\n", ret);
-				ret /= 2;
+			if (bytes > 0 && piov->nr >= 2) {
+				pr_debug("`- trim preadv %zu\n", bytes);
+				bytes /= 2;
 			}
 		}
 
-			if (ret < 0) {
-				pr_err("Can't read async pr bytes (%zd / %ju read, %ju off, %d iovs)\n", ret,
+			if (bytes < 0) {
+				pr_err("Can't read async pr bytes (%zd / %ju read, %ju off, %d iovs)\n", bytes,
 				       piov->end - piov->from, piov->from, piov->nr);
-				return -1;
-			}
-			if (ret == 0) {
+				io_failed = true;
+			} else if (bytes == 0) {
 				pr_err("Unexpected EOF in async page read (%ju bytes remaining at off %ju, %d iovs)\n",
 				       piov->end - piov->from, piov->from, piov->nr);
-				return -1;
+				io_failed = true;
+			} else if (opts.auto_dedup && punch_hole(pr, piov->from, bytes, false)) {
+				io_failed = true;
 			}
 
-			if (opts.auto_dedup && punch_hole(pr, piov->from, ret, false))
-				return -1;
-
-		if (ret != piov->end - piov->from) {
+		if (!io_failed && bytes != piov->end - piov->from) {
 			/*
 			 * The preadv() can return less than requested. It's
 			 * valid and doesn't mean error or EOF. We should advance
@@ -630,8 +647,21 @@ static int process_async_reads(struct page_read *pr)
 			 * anyway.
 			 */
 
-			advance_piov(piov, ret);
+			advance_piov(piov, bytes);
 			goto more;
+		}
+
+		/*
+		 * On I/O failure drain all remaining async entries (current pr
+		 * and parent chain) so that BUG_ON(!list_empty(&pr->async)) in
+		 * close_page_read() is satisfied.
+		 */
+		if (io_failed) {
+			list_del(&piov->l);
+			xfree(iovs);
+			xfree(piov);
+			drain_async_queue(pr);
+			return -1;
 		}
 
 		BUG_ON(pr->io_complete); /* FIXME -- implement once needed */
