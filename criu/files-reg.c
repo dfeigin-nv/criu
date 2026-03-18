@@ -2358,12 +2358,10 @@ int open_path(struct file_desc *d, int (*open_cb)(int mntns_root, struct reg_fil
 
 			if (rfi_remap(rfi, &level)) {
 				pr_perror("Can't create even fake link!");
-				mutex_unlock(m);
 				goto err;
 			}
 		} else if (ret < 0) {
 			pr_perror("Can't link %s -> %s", rfi->remap->rpath, rfi->path);
-			mutex_unlock(m);
 			goto err;
 		}
 	}
