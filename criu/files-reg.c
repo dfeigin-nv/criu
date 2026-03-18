@@ -413,8 +413,10 @@ static int mkreg_ghost(char *path, GhostFileEntry *gfe, struct cr_img *img)
 
 	gfd = open(path, O_WRONLY | O_CREAT | O_EXCL, gfe->mode);
 	if (gfd < 0) {
-		if (errno == EEXIST)
-			pr_err("Ghost %s already exists before content restore completed\n", path);
+		if (errno == EEXIST) {
+			pr_info("Ghost %s already created by sibling restorer, skipping\n", path);
+			return 0;
+		}
 		return -1;
 	}
 
