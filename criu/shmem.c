@@ -497,8 +497,10 @@ static int shmem_restore_async(struct page_read *pr, void *addr, unsigned long s
 		}
 	}
 
-	if (ret < 0)
+	if (ret < 0) {
+		pr->sync(pr); /* drain async queue before close */
 		return -1;
+	}
 
 	return pr->sync(pr);
 }
