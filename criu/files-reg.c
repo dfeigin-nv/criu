@@ -2454,6 +2454,18 @@ ext:
 		rfi->path = orig_path;
 
 	if (restore_fown(tmp, rfi->rfe->fown)) {
+		/*
+		 * If the fd was cached in rt->remap_cached_fd (branch's per-rfi
+		 * fd cache), invalidate the cache entry before closing tmp.
+		 * Otherwise a subsequent open_path() would try to dup the now-
+		 * closed fd number and get EBADF.
+		 */
+		if (rfi->remap) {
+			pthread_mutex_lock(&rt->lock);
+			if (rt->remap_cached_fd == tmp)
+				rt->remap_cached_fd = -1;
+			pthread_mutex_unlock(&rt->lock);
+		}
 		close(tmp);
 		return -1;
 	}
