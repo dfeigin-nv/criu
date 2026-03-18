@@ -75,6 +75,9 @@ struct page_read {
 	struct iovec bunch;   /* record consequent neighbour iovecs to punch together */
 	unsigned id;	      /* for logging */
 	unsigned long img_id; /* pagemap image file ID */
+	unsigned long direct_pages;
+	unsigned long direct_misaligned_pages;
+	unsigned long direct_misaligned_reads;
 
 	PagemapEntry **pmes;
 	int nr_pmes;

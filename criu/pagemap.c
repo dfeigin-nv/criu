@@ -2,6 +2,7 @@
 #include <stdio.h>
 #include <unistd.h>
 #include <errno.h>
+#include <string.h>
 #include <linux/falloc.h>
 #include <sys/time.h>
 #include <sys/uio.h>
@@ -238,6 +239,10 @@ static int read_local_page(struct page_read *pr, unsigned long vaddr, unsigned l
 	int fd;
 	ssize_t ret;
 	size_t curr = 0;
+	void *aligned_buf = NULL;
+	void *read_buf = buf;
+	int fl;
+	unsigned long nr_pages = len / PAGE_SIZE;
 
 	fd = img_raw_fd(pr->pi);
 	if (fd < 0) {
@@ -251,16 +256,40 @@ static int read_local_page(struct page_read *pr, unsigned long vaddr, unsigned l
 	if (pr->sync(pr))
 		return -1;
 
+	fl = fcntl(fd, F_GETFL);
+	if (fl >= 0 && (fl & O_DIRECT)) {
+		pr->direct_pages += nr_pages;
+		if (((unsigned long)buf & (PAGE_SIZE - 1)) || (len & (PAGE_SIZE - 1)) || (pr->pi_off & (PAGE_SIZE - 1))) {
+			int err;
+
+			pr->direct_misaligned_pages += nr_pages;
+			pr->direct_misaligned_reads++;
+
+			err = posix_memalign(&aligned_buf, PAGE_SIZE, len);
+			if (err) {
+				pr_err("Can't allocate aligned buffer for direct read (%lu bytes, err=%d)\n", len, err);
+				return -1;
+			}
+			read_buf = aligned_buf;
+		}
+	}
+
 	pr_debug("\tpr%lu-%u Read page from self %lx/%" PRIx64 "\n", pr->img_id, pr->id, pr->cvaddr, pr->pi_off);
 	while (1) {
-		ret = pread(fd, buf + curr, len - curr, pr->pi_off + curr);
+		ret = pread(fd, read_buf + curr, len - curr, pr->pi_off + curr);
 		if (ret < 1) {
 			pr_perror("Can't read mapping page %zd", ret);
+			xfree(aligned_buf);
 			return -1;
 		}
 		curr += ret;
 		if (curr == len)
 			break;
+	}
+
+	if (aligned_buf) {
+		memcpy(buf, aligned_buf, len);
+		xfree(aligned_buf);
 	}
 
 	if (opts.auto_dedup && !pr->disable_dedup) {
@@ -649,6 +678,14 @@ static void close_page_read(struct page_read *pr)
 	if (pr->pi)
 		close_image(pr->pi);
 
+	if (pr->direct_pages > 0) {
+		double pct = (100.0 * pr->direct_misaligned_pages) / pr->direct_pages;
+
+		pr_info("pr%lu-%u direct-io alignment: %lu/%lu pages non-aligned (%.2f%%) across %lu reads\n",
+			pr->img_id, pr->id, pr->direct_misaligned_pages, pr->direct_pages, pct,
+			pr->direct_misaligned_reads);
+	}
+
 	if (pr->pmes)
 		free_pagemaps(pr);
 }
@@ -832,6 +869,9 @@ int open_page_read_at(int dfd, unsigned long img_id, struct page_read *pr, int p
 	pr->pmes = NULL;
 	pr->pieok = false;
 	pr->disable_dedup = false;
+	pr->direct_pages = 0;
+	pr->direct_misaligned_pages = 0;
+	pr->direct_misaligned_reads = 0;
 
 	pr->pmi = open_image_at(dfd, i_typ, O_RSTR, img_id);
 	if (!pr->pmi)
@@ -921,5 +961,8 @@ void dup_page_read(struct page_read *src, struct page_read *dst)
 	memcpy(dst, src, sizeof(*dst));
 	INIT_LIST_HEAD(&dst->async);
 	dst->id = src->id + DUP_IDS_BASE * dup_ids++;
+	dst->direct_pages = 0;
+	dst->direct_misaligned_pages = 0;
+	dst->direct_misaligned_reads = 0;
 	dst->reset(dst);
 }
