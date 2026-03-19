@@ -1849,10 +1849,33 @@ static int prepare_vma_ios(struct pstree_item *t, struct task_restore_args *ta)
 		int fl = fcntl(ta->vma_ios_fd, F_GETFL);
 		if (fl >= 0) {
 			int ret = fcntl(ta->vma_ios_fd, F_SETFL, fl | O_DIRECT);
-			if (ret < 0)
+			if (ret < 0) {
 				pr_warn("Failed to set O_DIRECT on pages fd: %s\n", strerror(errno));
-			else
-				pr_info("O_DIRECT enabled on pages fd %d\n", ta->vma_ios_fd);
+			} else {
+				/*
+				 * Probe: some NFS servers (e.g. Azure) accept O_DIRECT via
+				 * fcntl but reject it at pread time with EINVAL. Fall back
+				 * to buffered I/O in that case.
+				 */
+				char probe[4096] __attribute__((aligned(4096)));
+				if (pread(ta->vma_ios_fd, probe, sizeof(probe), 0) < 0 && errno == EINVAL) {
+					pr_info("O_DIRECT rejected at read time on pages fd %d (NFS?), using buffered I/O\n",
+						ta->vma_ios_fd);
+					if (fcntl(ta->vma_ios_fd, F_SETFL, fl) < 0)
+						pr_warn("Failed to clear O_DIRECT on pages fd %d: %s\n",
+							ta->vma_ios_fd, strerror(errno));
+					/*
+					 * Hint the kernel to use large sequential read-ahead.
+					 * Linux 5.4+ reduced the default NFS read_ahead_kb from
+					 * ~15 MB to 128 KB, which severely hurts sequential
+					 * throughput on Azure NFS. POSIX_FADV_SEQUENTIAL asks
+					 * the kernel to double the read-ahead window automatically.
+					 */
+					posix_fadvise(ta->vma_ios_fd, 0, 0, POSIX_FADV_SEQUENTIAL);
+				} else {
+					pr_info("O_DIRECT enabled on pages fd %d\n", ta->vma_ios_fd);
+				}
+			}
 		}
 	}
 	return pagemap_render_iovec(&rsti(t)->vma_io, ta);
