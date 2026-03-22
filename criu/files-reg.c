@@ -2280,6 +2280,7 @@ int open_path(struct file_desc *d, int (*open_cb)(int mntns_root, struct reg_fil
 	char path[PATH_MAX];
 	int inh_fd = -1;
 	bool remap_lock_held = false;
+	mutex_t *remap_lock = NULL;
 	int ret;
 
 	if (inherited_fd(d, &tmp))
@@ -2317,6 +2318,7 @@ int open_path(struct file_desc *d, int (*open_cb)(int mntns_root, struct reg_fil
 		m = get_remap_lock(rfi->d.id);
 		if (!m)
 			goto err;
+		remap_lock = m;
 		pr_info("open_path remap lock: %s\n", rfi->path);
 		mutex_lock(m);
 		remap_lock_held = true;
@@ -2336,8 +2338,7 @@ int open_path(struct file_desc *d, int (*open_cb)(int mntns_root, struct reg_fil
 		if (rt->remap_cached_fd >= 0) {
 			int cached = rt->remap_cached_fd;
 			int fl;
-			pthread_mutex_unlock(&rt->lock);
-			mutex_unlock(m);
+
 			/*
 			 * The cached fd may have been opened with flags that
 			 * differ from what this caller needs (e.g. a VMA open
@@ -2349,7 +2350,15 @@ int open_path(struct file_desc *d, int (*open_cb)(int mntns_root, struct reg_fil
 			 * If the access mode matches, dup() is sufficient.
 			 * If it differs, reopen via /proc/self/fd/<cached>
 			 * with the required flags.
+			 *
+			 * dup()/open() must happen while rt->lock is held.
+			 * The slow-path invalidation path also holds rt->lock
+			 * before closing the cached fd, so there is no window
+			 * in which we could dup a fd that another thread is
+			 * about to close.
 			 */
+			mutex_unlock(m);
+			remap_lock_held = false;
 			fl = fcntl(cached, F_GETFL);
 			if (fl >= 0 && (fl & O_ACCMODE) == (rfi->rfe->flags & O_ACCMODE)) {
 				tmp = dup(cached);
@@ -2366,6 +2375,7 @@ int open_path(struct file_desc *d, int (*open_cb)(int mntns_root, struct reg_fil
 					tmp = -1;
 				}
 			}
+			pthread_mutex_unlock(&rt->lock);
 			if (tmp < 0) {
 				pr_perror("reopen remap_cached_fd");
 				return -1;
@@ -2443,11 +2453,6 @@ ext:
 			}
 		}
 
-		/*
-		 * This is only visible in the current process, so
-		 * change w/o locks. Other tasks sharing the same
-		 * file will get one via unix sockets.
-		 */
 		rt->size_mode_checked = true;
 	}
 	pthread_mutex_unlock(&rt->lock);
@@ -2473,9 +2478,7 @@ ext:
 		}
 
 		if (remap_lock_held) {
-			mutex_t *m = get_remap_lock(rfi->d.id);
-			if (m)
-				mutex_unlock(m);
+			mutex_unlock(remap_lock);
 			remap_lock_held = false;
 		}
 	}
@@ -2484,10 +2487,9 @@ ext:
 
 	if (restore_fown(tmp, rfi->rfe->fown)) {
 		/*
-		 * If the fd was cached in rt->remap_cached_fd (branch's per-rfi
-		 * fd cache), invalidate the cache entry before closing tmp.
-		 * Otherwise a subsequent open_path() would try to dup the now-
-		 * closed fd number and get EBADF.
+		 * Invalidate the fd cache before closing tmp so that a
+		 * concurrent fast-path caller (which holds rt->lock while
+		 * dup()-ing) cannot dup a fd we are about to close.
 		 */
 		if (rfi->remap) {
 			pthread_mutex_lock(&rt->lock);
@@ -2501,11 +2503,8 @@ ext:
 
 	return tmp;
 err:
-	if (remap_lock_held) {
-		mutex_t *m = get_remap_lock(rfi->d.id);
-		if (m)
-			mutex_unlock(m);
-	}
+	if (remap_lock_held)
+		mutex_unlock(remap_lock);
 	close_safe(&tmp);
 	return -1;
 }

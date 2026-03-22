@@ -531,16 +531,17 @@ static int restore_memfd_shmem_content_ex(int fd, unsigned long shmid, unsigned 
 	if (!size)
 		return 0;
 
-	if (ftruncate(fd, size) < 0) {
-		pr_perror("Can't resize shmem 0x%lx size=%ld", shmid, size);
-		return -1;
-	}
-
 	ret = open_page_read(shmid, &pr, PR_SHMEM);
 	if (ret < 0)
 		return -1;
 	if (!ret)
 		return 0;
+
+	if (ftruncate(fd, size) < 0) {
+		pr_perror("Can't resize shmem 0x%lx size=%ld", shmid, size);
+		pr.close(&pr);
+		return -1;
+	}
 
 	addr = mmap(NULL, size, PROT_WRITE | PROT_READ, MAP_SHARED, fd, 0);
 	if (addr == MAP_FAILED) {
@@ -631,10 +632,6 @@ static int open_shmem(int pid, struct vma_area *vma)
 			goto err;
 		}
 
-		if (ftruncate(f, si->size)) {
-			pr_perror("Unable to truncate memfd");
-			goto err;
-		}
 		flags |= MAP_FILE;
 		use_memfd = true;
 	} else {

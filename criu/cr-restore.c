@@ -1725,6 +1725,16 @@ static int attach_to_tasks(bool root_seized)
 		if (parse_threads(item->pid->real, &item->threads, &item->nr_threads))
 			return -1;
 
+		/*
+		 * nr_threads must equal nr_threads_image: all pthread workers
+		 * from open_vmas are joined before sigreturn_restore(), which
+		 * decrements the RESTORE stage counter. The coordinator only
+		 * reaches attach_to_tasks() after that counter hits zero.
+		 * core[] and rseqe[] are sized by nr_threads_image; a mismatch
+		 * here means something broke that ordering guarantee.
+		 */
+		BUG_ON(item->nr_threads != item->nr_threads_image);
+
 		for (i = 0; i < item->nr_threads; i++) {
 			pid_t pid = item->threads[i].real;
 

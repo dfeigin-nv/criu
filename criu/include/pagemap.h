@@ -61,6 +61,11 @@ struct page_read {
 	/* Whether or not disable image deduplication*/
 	bool disable_dedup;
 
+	/* Whether O_DIRECT is active on the pages fd. Set once during
+	 * open_page_read_fd_at() after the NFS probe; never changes after
+	 * that. Cached here to avoid a fcntl(F_GETFL) syscall per page read. */
+	bool use_direct;
+
 	/* Private data of reader */
 	struct cr_img *pmi;
 	struct cr_img *pi;

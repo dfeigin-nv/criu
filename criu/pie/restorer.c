@@ -1565,13 +1565,6 @@ static int fd_poll(int inotify_fd)
 	return sys_ppoll(&pfd, 1, &tmo, NULL, sizeof(sigset_t));
 }
 
-#ifndef POSIX_FADV_WILLNEED
-#define POSIX_FADV_WILLNEED 3
-#endif
-#ifndef POSIX_FADV_SEQUENTIAL
-#define POSIX_FADV_SEQUENTIAL 2
-#endif
-
 /*
  * Advance restore_vma_io by 'res' bytes consumed. Updates rio in place.
  * Returns the new (iov_ptr, nr_iovs) for resubmission, or 0 if fully done.
@@ -1950,6 +1943,7 @@ __visible long __export_restore_task(struct task_restore_args *args)
 					 MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
 		if (IS_ERR(iocbs)) {
 			pr_err("Can't mmap AIO buffers: %ld\n", PTR_ERR(iocbs));
+			sys_io_destroy(aio_ctx);
 			goto core_restore_end;
 		}
 		iocbps = (struct iocb **)((void *)iocbs + n * sizeof(struct iocb));
@@ -1988,7 +1982,7 @@ __visible long __export_restore_task(struct task_restore_args *args)
 				if (aio_ret <= 0) {
 					pr_err("io_submit failed: %ld (submitted %u/%u)\n",
 					       aio_ret, submitted, n);
-					goto core_restore_end;
+					goto aio_error;
 				}
 				submitted += aio_ret;
 			}
@@ -1998,13 +1992,21 @@ __visible long __export_restore_task(struct task_restore_args *args)
 				aio_ret = sys_io_getevents(aio_ctx, 1, AIO_BATCH, events, NULL);
 				if (aio_ret <= 0) {
 					pr_err("io_getevents failed: %ld\n", aio_ret);
-					goto core_restore_end;
+					goto aio_error;
 				}
 				for (long k = 0; k < aio_ret; k++) {
 					if (events[k].res < 0) {
 						pr_err("AIO read failed: %lld\n",
 						       events[k].res);
-						goto core_restore_end;
+						goto aio_error;
+					}
+					{
+						struct iocb *cb = (struct iocb *)(unsigned long)events[k].obj;
+
+						if (args->auto_dedup && events[k].res > 0)
+							sys_fallocate(fd,
+								      FALLOC_FL_KEEP_SIZE | FALLOC_FL_PUNCH_HOLE,
+								      (off_t)cb->aio_offset, (off_t)events[k].res);
 					}
 					if ((__u64)events[k].res == events[k].data) {
 						completed++;
@@ -2014,7 +2016,7 @@ __visible long __export_restore_task(struct task_restore_args *args)
 					if (events[k].res == 0) {
 						pr_err("AIO zero read (expected %llu)\n",
 						       events[k].data);
-						goto core_restore_end;
+						goto aio_error;
 					}
 					{
 						struct iocb *cb = (struct iocb *)(unsigned long)events[k].obj;
@@ -2038,7 +2040,7 @@ __visible long __export_restore_task(struct task_restore_args *args)
 							if (ret2 != 1) {
 								pr_err("AIO retry submit failed: %ld\n",
 								       ret2);
-								goto core_restore_end;
+								goto aio_error;
 							}
 						}
 					}
@@ -2046,6 +2048,14 @@ __visible long __export_restore_task(struct task_restore_args *args)
 			}
 		}
 
+		goto aio_done;
+	aio_error:
+		sys_io_destroy(aio_ctx);
+		sys_munmap(iocbs, alloc_sz);
+		sys_close(fd);
+		args->vma_ios_fd = -1;
+		goto core_restore_end;
+	aio_done:
 		sys_io_destroy(aio_ctx);
 		sys_munmap(iocbs, alloc_sz);
 		sys_gettimeofday(&tv1, NULL);

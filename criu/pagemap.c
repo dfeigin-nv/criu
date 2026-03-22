@@ -241,7 +241,6 @@ static int read_local_page(struct page_read *pr, unsigned long vaddr, unsigned l
 	size_t curr = 0;
 	void *aligned_buf = NULL;
 	void *read_buf = buf;
-	int fl;
 	unsigned long nr_pages = len / PAGE_SIZE;
 
 	fd = img_raw_fd(pr->pi);
@@ -256,8 +255,7 @@ static int read_local_page(struct page_read *pr, unsigned long vaddr, unsigned l
 	if (pr->sync(pr))
 		return -1;
 
-	fl = fcntl(fd, F_GETFL);
-	if (fl >= 0 && (fl & O_DIRECT)) {
+	if (pr->use_direct) {
 		pr->direct_pages += nr_pages;
 		if (((unsigned long)buf & (PAGE_SIZE - 1)) || (len & (PAGE_SIZE - 1)) || (pr->pi_off & (PAGE_SIZE - 1))) {
 			int err;
@@ -625,17 +623,17 @@ static int process_async_reads(struct page_read *pr)
 			}
 		}
 
-			if (bytes < 0) {
-				pr_err("Can't read async pr bytes (%zd / %ju read, %ju off, %d iovs)\n", bytes,
-				       piov->end - piov->from, piov->from, piov->nr);
-				io_failed = true;
-			} else if (bytes == 0) {
-				pr_err("Unexpected EOF in async page read (%ju bytes remaining at off %ju, %d iovs)\n",
-				       piov->end - piov->from, piov->from, piov->nr);
-				io_failed = true;
-			} else if (opts.auto_dedup && punch_hole(pr, piov->from, bytes, false)) {
-				io_failed = true;
-			}
+		if (bytes < 0) {
+			pr_err("Can't read async pr bytes (%zd / %ju read, %ju off, %d iovs)\n", bytes,
+			       piov->end - piov->from, piov->from, piov->nr);
+			io_failed = true;
+		} else if (bytes == 0) {
+			pr_err("Unexpected EOF in async page read (%ju bytes remaining at off %ju, %d iovs)\n",
+			       piov->end - piov->from, piov->from, piov->nr);
+			io_failed = true;
+		} else if (opts.auto_dedup && punch_hole(pr, piov->from, bytes, false)) {
+			io_failed = true;
+		}
 
 		if (!io_failed && bytes != piov->end - piov->from) {
 			/*
@@ -940,8 +938,12 @@ int open_page_read_at(int dfd, unsigned long img_id, struct page_read *pr, int p
 					char probe[4096] __attribute__((aligned(4096)));
 					if (pread(pfd, probe, sizeof(probe), 0) < 0 && errno == EINVAL) {
 						pr_info("O_DIRECT rejected at read time on pages fd %d (NFS?), using buffered I/O\n", pfd);
-						if (fcntl(pfd, F_SETFL, fl) < 0)
-							pr_warn("Failed to clear O_DIRECT on pages fd %d: %s\n", pfd, strerror(errno));
+						if (fcntl(pfd, F_SETFL, fl) < 0) {
+							pr_err("Failed to clear O_DIRECT on pages fd %d: %s"
+							       " -- all subsequent reads will fail with EINVAL\n",
+							       pfd, strerror(errno));
+							return -1;
+						}
 						/*
 						 * Hint the kernel to use large sequential read-ahead.
 						 * Linux 5.4+ reduced the default NFS read_ahead_kb from
@@ -952,6 +954,7 @@ int open_page_read_at(int dfd, unsigned long img_id, struct page_read *pr, int p
 						posix_fadvise(pfd, 0, 0, POSIX_FADV_SEQUENTIAL);
 					} else {
 						pr_debug("O_DIRECT enabled on pages fd %d\n", pfd);
+						pr->use_direct = true;
 					}
 				}
 			}

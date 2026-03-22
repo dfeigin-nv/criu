@@ -1666,8 +1666,15 @@ static int open_vmas_unique_open(struct open_vma_unique *unique, int nr_unique)
 		} else
 			fd = open_file_for_vma(u->rep_vma, u->flags);
 
-		if (fd < 0)
+		if (fd < 0) {
+			/* close fds opened so far in this loop */
+			for (int j = 0; j < i; j++)
+				if (unique[j].fd >= 0) {
+					close(unique[j].fd);
+					unique[j].fd = -1;
+				}
 			return -1;
+		}
 		u->fd = fd;
 	}
 	return 0;
@@ -1688,8 +1695,6 @@ int open_vmas(struct pstree_item *t)
 	} *last_per_fd = NULL;
 	int nr_last = 0, cap_last = 0;
 	int i, ret = -1;
-
-	filemap_ctx_init(false);
 
 	/* Phase 1: non-filemap VMAs (shmem, socket) + plugin; collect filemap + memfd for parallel open */
 	list_for_each_entry(vma, &vmas->h, list) {
@@ -1752,8 +1757,6 @@ int open_vmas(struct pstree_item *t)
 				vma->e->status |= VMA_CLOSE;
 		}
 	}
-
-	filemap_ctx_fini();
 
 	/* Phase 2: open unique files (AIO used for reads in restorer) */
 	if (nr_unique > 0)
@@ -1861,9 +1864,12 @@ static int prepare_vma_ios(struct pstree_item *t, struct task_restore_args *ta)
 				if (pread(ta->vma_ios_fd, probe, sizeof(probe), 0) < 0 && errno == EINVAL) {
 					pr_info("O_DIRECT rejected at read time on pages fd %d (NFS?), using buffered I/O\n",
 						ta->vma_ios_fd);
-					if (fcntl(ta->vma_ios_fd, F_SETFL, fl) < 0)
-						pr_warn("Failed to clear O_DIRECT on pages fd %d: %s\n",
-							ta->vma_ios_fd, strerror(errno));
+					if (fcntl(ta->vma_ios_fd, F_SETFL, fl) < 0) {
+						pr_err("Failed to clear O_DIRECT on pages fd %d: %s"
+						      " -- all subsequent reads will fail with EINVAL\n",
+						      ta->vma_ios_fd, strerror(errno));
+						return -1;
+					}
 					/*
 					 * Hint the kernel to use large sequential read-ahead.
 					 * Linux 5.4+ reduced the default NFS read_ahead_kb from
