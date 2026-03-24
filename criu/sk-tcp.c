@@ -1,4 +1,5 @@
 #include <netinet/tcp.h>
+#include <stdbool.h>
 #include <unistd.h>
 #include <stdlib.h>
 #include <sys/mman.h>
@@ -32,6 +33,47 @@
 
 static LIST_HEAD(cpt_tcp_repair_sockets);
 static LIST_HEAD(rst_tcp_repair_sockets);
+
+static bool is_loopback_addr(int family, const u32 *addr)
+{
+	static const unsigned char v6_loopback[16] = {
+		[15] = 1,
+	};
+	static const unsigned char v4_mapped_prefix[12] = {
+		[10] = 0xff,
+		[11] = 0xff,
+	};
+	const unsigned char *bytes = (const unsigned char *)addr;
+
+	if (family == AF_INET)
+		return bytes[0] == 127;
+
+	if (family == AF_INET6) {
+		if (!memcmp(bytes, v6_loopback, sizeof(v6_loopback)))
+			return true;
+
+		if (!memcmp(bytes, v4_mapped_prefix, sizeof(v4_mapped_prefix)))
+			return bytes[12] == 127;
+	}
+
+	return false;
+}
+
+static bool should_restore_tcp_as_closed(const struct inet_sk_info *ii)
+{
+	const InetSkEntry *ie = ii->ie;
+
+	if (ie->state != TCP_CLOSE || ie->n_src_addr == 0 || ie->src_addr == NULL)
+		return false;
+
+	if (!is_loopback_addr(ie->family, ie->src_addr))
+		return true;
+
+	if (ie->dst_port != 0 && ie->n_dst_addr != 0 && ie->dst_addr != NULL)
+		return !is_loopback_addr(ie->family, ie->dst_addr);
+
+	return false;
+}
 
 static int lock_connection(struct inet_sk_desc *sk)
 {
@@ -461,7 +503,9 @@ int restore_one_tcp(int fd, struct inet_sk_info *ii)
 
 	pr_info("Restoring TCP connection\n");
 
-	if (opts.tcp_close) {
+	if (opts.tcp_close || should_restore_tcp_as_closed(ii)) {
+		if (!opts.tcp_close)
+			pr_info("Restoring TCP_CLOSE socket id %x ino %x as closed because it is not loopback\n", ii->ie->id, ii->ie->ino);
 		if (shutdown(fd, SHUT_RDWR) && errno != ENOTCONN) {
 			pr_perror("Unable to shutdown the socket id %x ino %x", ii->ie->id, ii->ie->ino);
 		}
