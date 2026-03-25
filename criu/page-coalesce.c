@@ -99,6 +99,29 @@ struct hash_pool {
 	unsigned int nr_threads;
 };
 
+struct chunk_schedule {
+	u32 *pages;
+	size_t nr_chunks;
+	size_t cap;
+};
+
+struct read_ahead {
+	int fd;
+	pthread_t thread;
+	pthread_mutex_t lock;
+	pthread_cond_t have_work;
+	pthread_cond_t work_done;
+	char *buffer;
+	size_t len;
+	off_t offset;
+	u64 read_us;
+	int status;
+	bool stop;
+	bool pending;
+	bool done;
+	bool started;
+};
+
 struct coalesce_stats {
 	u64 old_bytes;
 	u64 blob_bytes;
@@ -468,6 +491,192 @@ static int hash_pool_run(struct hash_pool *pool, const char *pages, struct page_
 	return 0;
 }
 
+static int append_chunk_schedule(struct chunk_schedule *schedule, u32 chunk_pages)
+{
+	u32 *grown;
+	size_t new_cap;
+
+	if (schedule->nr_chunks < schedule->cap) {
+		schedule->pages[schedule->nr_chunks++] = chunk_pages;
+		return 0;
+	}
+
+	new_cap = schedule->cap ? schedule->cap * 2 : 64;
+	grown = xrealloc(schedule->pages, new_cap * sizeof(*schedule->pages));
+	if (!grown)
+		return -1;
+
+	schedule->pages = grown;
+	schedule->cap = new_cap;
+	schedule->pages[schedule->nr_chunks++] = chunk_pages;
+	return 0;
+}
+
+static int build_chunk_schedule(struct cr_img *pagemap, struct chunk_schedule *schedule)
+{
+	PagemapEntry *pe = NULL;
+	int ret = -1;
+
+	memzero(schedule, sizeof(*schedule));
+
+	while (1) {
+		int pb_ret = pb_read_one_eof(pagemap, &pe, PB_PAGEMAP);
+		u64 i;
+
+		if (pb_ret < 0)
+			goto out;
+		if (pb_ret == 0) {
+			ret = 0;
+			goto out;
+		}
+
+		init_compat_pagemap_entry(pe);
+		if (!pagemap_present(pe)) {
+			pagemap_entry__free_unpacked(pe, NULL);
+			pe = NULL;
+			continue;
+		}
+
+		for (i = 0; i < pe->nr_pages;) {
+			u32 chunk_pages = pe->nr_pages - i;
+
+			if (chunk_pages > COALESCE_BATCH_PAGES)
+				chunk_pages = COALESCE_BATCH_PAGES;
+			if (append_chunk_schedule(schedule, chunk_pages))
+				goto out;
+			i += chunk_pages;
+		}
+
+		pagemap_entry__free_unpacked(pe, NULL);
+		pe = NULL;
+	}
+
+out:
+	if (pe)
+		pagemap_entry__free_unpacked(pe, NULL);
+	if (ret) {
+		xfree(schedule->pages);
+		memzero(schedule, sizeof(*schedule));
+	}
+	return ret;
+}
+
+static int read_full_at(int fd, char *buffer, size_t len, off_t offset, u64 *read_us)
+{
+	size_t consumed = 0;
+	u64 start_us = now_us();
+
+	while (consumed < len) {
+		ssize_t nr = pread(fd, buffer + consumed, len - consumed, offset + consumed);
+
+		if (nr < 0) {
+			if (errno == EINTR)
+				continue;
+			pr_perror("Can't pread page chunk at %jd", (intmax_t)(offset + consumed));
+			return -1;
+		}
+		if (!nr) {
+			pr_err("Short pread on page chunk at %jd: read %zu/%zu bytes\n",
+			       (intmax_t)offset, consumed, len);
+			return -1;
+		}
+		consumed += nr;
+	}
+
+	*read_us += now_us() - start_us;
+	return 0;
+}
+
+static void *read_ahead_main(void *arg)
+{
+	struct read_ahead *reader = arg;
+
+	pthread_mutex_lock(&reader->lock);
+	for (;;) {
+		u64 local_read_us = 0;
+		int status;
+
+		while (!reader->stop && !reader->pending)
+			pthread_cond_wait(&reader->have_work, &reader->lock);
+
+		if (reader->stop) {
+			pthread_mutex_unlock(&reader->lock);
+			return NULL;
+		}
+
+		pthread_mutex_unlock(&reader->lock);
+		status = read_full_at(reader->fd, reader->buffer, reader->len, reader->offset, &local_read_us);
+		pthread_mutex_lock(&reader->lock);
+		reader->read_us += local_read_us;
+		reader->status = status;
+		reader->pending = false;
+		reader->done = true;
+		pthread_cond_signal(&reader->work_done);
+	}
+}
+
+static int read_ahead_init(struct read_ahead *reader, int fd)
+{
+	memzero(reader, sizeof(*reader));
+	reader->fd = fd;
+	pthread_mutex_init(&reader->lock, NULL);
+	pthread_cond_init(&reader->have_work, NULL);
+	pthread_cond_init(&reader->work_done, NULL);
+	if (pthread_create(&reader->thread, NULL, read_ahead_main, reader) != 0) {
+		pr_err("pthread_create failed for page read-ahead worker\n");
+		pthread_cond_destroy(&reader->work_done);
+		pthread_cond_destroy(&reader->have_work);
+		pthread_mutex_destroy(&reader->lock);
+		return -1;
+	}
+	reader->started = true;
+	return 0;
+}
+
+static void read_ahead_fini(struct read_ahead *reader)
+{
+	if (!reader->started)
+		return;
+
+	pthread_mutex_lock(&reader->lock);
+	reader->stop = true;
+	pthread_cond_signal(&reader->have_work);
+	pthread_mutex_unlock(&reader->lock);
+	pthread_join(reader->thread, NULL);
+	pthread_cond_destroy(&reader->work_done);
+	pthread_cond_destroy(&reader->have_work);
+	pthread_mutex_destroy(&reader->lock);
+}
+
+static int read_ahead_submit(struct read_ahead *reader, char *buffer, size_t len, off_t offset)
+{
+	pthread_mutex_lock(&reader->lock);
+	while (reader->pending)
+		pthread_cond_wait(&reader->work_done, &reader->lock);
+	reader->buffer = buffer;
+	reader->len = len;
+	reader->offset = offset;
+	reader->done = false;
+	reader->status = 0;
+	reader->pending = true;
+	pthread_cond_signal(&reader->have_work);
+	pthread_mutex_unlock(&reader->lock);
+	return 0;
+}
+
+static int read_ahead_wait(struct read_ahead *reader)
+{
+	int status;
+
+	pthread_mutex_lock(&reader->lock);
+	while (!reader->done)
+		pthread_cond_wait(&reader->work_done, &reader->lock);
+	status = reader->status;
+	reader->done = false;
+	pthread_mutex_unlock(&reader->lock);
+	return status;
+}
+
 static int collect_page_targets(int dfd, struct page_target **targets, size_t *nr_targets)
 {
 	DIR *dir;
@@ -540,15 +749,17 @@ static int coalesce_one_pagemap(int dfd, struct hash_pool *pool, struct page_sto
 	struct cr_img *index = NULL;
 	struct cr_img *old_pages = NULL;
 	struct cr_img *pagemap = NULL;
-	PagemapEntry *pe = NULL;
+	struct chunk_schedule schedule = {};
+	struct read_ahead reader = {};
 	u32 pages_id = 0;
 	off_t old_pages_size;
 	off_t source_off = 0;
 	int old_pages_fd;
-	const char *old_pages_map = NULL;
-	bool old_pages_mapped = false;
+	char *chunk_buffers[2] = {};
+	unsigned int current_buffer = 0;
 	size_t chunk_groups_cap;
 	u64 step_start_us = 0;
+	u64 image_start_us = 0;
 	u64 image_present_pages = 0;
 	u64 image_zero_pages = 0;
 	u64 image_unique_pages = 0;
@@ -595,138 +806,127 @@ static int coalesce_one_pagemap(int dfd, struct hash_pool *pool, struct page_sto
 	if (old_pages_fd < 0 || old_pages_size < 0)
 		goto out;
 
-	step_start_us = now_us();
-	/* Read the source pages directly from the mapped image to avoid a copy. */
-	old_pages_map = mmap(NULL, (size_t)old_pages_size, PROT_READ, MAP_PRIVATE, old_pages_fd, 0);
-	if (old_pages_map == MAP_FAILED) {
-		pr_perror("Can't mmap pages image for id %u", pages_id);
-		old_pages_map = NULL;
+	if (build_chunk_schedule(pagemap, &schedule))
 		goto out;
-	}
-	old_pages_mapped = true;
-	(void)posix_fadvise(old_pages_fd, 0, 0, POSIX_FADV_SEQUENTIAL);
-	(void)madvise((void *)old_pages_map, (size_t)old_pages_size, MADV_SEQUENTIAL);
-	image_read_us += now_us() - step_start_us;
 
-	while (1) {
-		int pb_ret = pb_read_one_eof(pagemap, &pe, PB_PAGEMAP);
-		u64 i;
+	chunk_buffers[0] = xmalloc(COALESCE_BATCH_PAGES * PAGE_SIZE);
+	chunk_buffers[1] = xmalloc(COALESCE_BATCH_PAGES * PAGE_SIZE);
+	if (!chunk_buffers[0] || !chunk_buffers[1])
+		goto out;
 
-		if (pb_ret < 0)
+	if (read_ahead_init(&reader, old_pages_fd))
+		goto out;
+
+	image_start_us = now_us();
+	if (schedule.nr_chunks && read_full_at(old_pages_fd, chunk_buffers[0], (size_t)schedule.pages[0] * PAGE_SIZE, 0, &image_read_us))
+		goto out;
+
+	for (size_t chunk_idx = 0; chunk_idx < schedule.nr_chunks; chunk_idx++) {
+		unsigned int chunk_pages = schedule.pages[chunk_idx];
+		size_t chunk_bytes = (size_t)chunk_pages * PAGE_SIZE;
+		unsigned int next_buffer = current_buffer ^ 1U;
+		const char *chunk_pages_ptr = chunk_buffers[current_buffer];
+		u64 lookup_start_us;
+		unsigned int j;
+		unsigned int nr_blob_pages = 0;
+		unsigned int group_count = 0;
+		unsigned int chunk_nonzero_pages = 0;
+
+		if (chunk_idx + 1 < schedule.nr_chunks) {
+			size_t next_chunk_bytes = (size_t)schedule.pages[chunk_idx + 1] * PAGE_SIZE;
+
+			if (read_ahead_submit(&reader, chunk_buffers[next_buffer], next_chunk_bytes, source_off + chunk_bytes))
+				goto out;
+		}
+
+		if (hash_pool_run(pool, chunk_pages_ptr, meta, chunk_pages, &image_hash_us))
 			goto out;
-		if (pb_ret == 0)
-			break;
 
-		init_compat_pagemap_entry(pe);
-		if (!pagemap_present(pe)) {
-			pagemap_entry__free_unpacked(pe, NULL);
-			pe = NULL;
-			continue;
+		if (!chunk_group_generation) {
+			memzero(chunk_groups, chunk_groups_cap * sizeof(*chunk_groups));
+			chunk_group_generation = 1;
 		}
 
-		for (i = 0; i < pe->nr_pages;) {
-			unsigned int chunk_pages = pe->nr_pages - i;
-			size_t chunk_bytes;
-			u64 step_start_us;
-			unsigned int j;
-			unsigned int nr_blob_pages = 0;
-			u64 lookup_start_us;
-			unsigned int group_count = 0;
-			unsigned int chunk_nonzero_pages = 0;
-			const char *chunk_pages_ptr = old_pages_map + source_off;
+		for (j = 0; j < chunk_pages; j++) {
+			unsigned int group_id;
+			bool is_new;
 
-			if (chunk_pages > COALESCE_BATCH_PAGES)
-				chunk_pages = COALESCE_BATCH_PAGES;
-			chunk_bytes = (size_t)chunk_pages * PAGE_SIZE;
+			if (meta[j].zero) {
+				offsets[j] = PAGE_INDEX_ZERO;
+				image_zero_pages++;
+				continue;
+			}
 
-			if (hash_pool_run(pool, chunk_pages_ptr, meta, chunk_pages, &image_hash_us))
+			chunk_nonzero_pages++;
+			if (chunk_group_lookup_or_reserve(chunk_groups, chunk_groups_cap, chunk_group_generation, &meta[j].key,
+							  group_count, &group_id, &is_new))
 				goto out;
+			chunk_group_of_page[j] = group_id;
+			if (is_new)
+				chunk_rep_page[group_count++] = j;
+		}
 
-			/* Collapse identical pages inside the chunk before hitting the global table. */
-			if (!chunk_group_generation) {
-				memzero(chunk_groups, chunk_groups_cap * sizeof(*chunk_groups));
-				chunk_group_generation = 1;
+		lookup_start_us = now_us();
+		for (j = 0; j < group_count; j++) {
+			unsigned int rep = chunk_rep_page[j];
+			bool is_new;
+
+			if (page_store_lookup_or_reserve(store, &meta[rep].key, &chunk_group_offsets[j], &is_new))
+				goto out;
+			if (is_new) {
+				blob_iov[nr_blob_pages].iov_base = (void *)(chunk_pages_ptr + rep * PAGE_SIZE);
+				blob_iov[nr_blob_pages].iov_len = PAGE_SIZE;
+				nr_blob_pages++;
+				image_unique_pages++;
 			}
+		}
+		image_lookup_us += now_us() - lookup_start_us;
+		image_lookup_candidates += group_count;
+		image_local_duplicate_pages += chunk_nonzero_pages - group_count;
 
-			for (j = 0; j < chunk_pages; j++) {
-				unsigned int group_id;
-				bool is_new;
+		for (j = 0; j < chunk_pages; j++) {
+			if (!meta[j].zero)
+				offsets[j] = chunk_group_offsets[chunk_group_of_page[j]];
+		}
 
-				if (meta[j].zero) {
-					offsets[j] = PAGE_INDEX_ZERO;
-					image_zero_pages++;
-					continue;
-				}
-
-				chunk_nonzero_pages++;
-				if (chunk_group_lookup_or_reserve(chunk_groups, chunk_groups_cap, chunk_group_generation, &meta[j].key,
-								  group_count, &group_id, &is_new))
-					goto out;
-				chunk_group_of_page[j] = group_id;
-				if (is_new)
-					chunk_rep_page[group_count++] = j;
-			}
-
-			lookup_start_us = now_us();
-			for (j = 0; j < group_count; j++) {
-				unsigned int rep = chunk_rep_page[j];
-				bool is_new;
-
-				if (page_store_lookup_or_reserve(store, &meta[rep].key, &chunk_group_offsets[j], &is_new))
-					goto out;
-				if (is_new) {
-					blob_iov[nr_blob_pages].iov_base = (void *)(chunk_pages_ptr + rep * PAGE_SIZE);
-					blob_iov[nr_blob_pages].iov_len = PAGE_SIZE;
-					nr_blob_pages++;
-					image_unique_pages++;
-				}
-			}
-			image_lookup_us += now_us() - lookup_start_us;
-			image_lookup_candidates += group_count;
-			image_local_duplicate_pages += chunk_nonzero_pages - group_count;
-
-			for (j = 0; j < chunk_pages; j++) {
-				if (!meta[j].zero)
-					offsets[j] = chunk_group_offsets[chunk_group_of_page[j]];
-			}
-
-			if (nr_blob_pages > 0) {
-				step_start_us = now_us();
-				for (j = 0; j < nr_blob_pages;) {
-					unsigned int batch_iov = nr_blob_pages - j;
-					int written;
-
-					if (batch_iov > IOV_MAX)
-						batch_iov = IOV_MAX;
-
-					written = bwritev(&store->blob->_x, &blob_iov[j], batch_iov);
-					if (written < 0) {
-						pr_perror("Can't write coalesced page blob");
-						goto out;
-					}
-					if (written != (int)(batch_iov * PAGE_SIZE)) {
-						pr_err("Short write to coalesced page blob: %d/%zu bytes\n", written,
-						       (size_t)batch_iov * PAGE_SIZE);
-						goto out;
-					}
-					j += batch_iov;
-				}
-				store->blob_write_us += now_us() - step_start_us;
-			}
-
+		if (nr_blob_pages > 0) {
 			step_start_us = now_us();
-			if (write_img_buf(index, offsets, chunk_pages * sizeof(*offsets)))
-				goto out;
-			image_index_write_us += now_us() - step_start_us;
+			for (j = 0; j < nr_blob_pages;) {
+				unsigned int batch_iov = nr_blob_pages - j;
+				int written;
 
-			image_present_pages += chunk_pages;
-			source_off += chunk_bytes;
-			i += chunk_pages;
-			chunk_group_generation++;
+				if (batch_iov > IOV_MAX)
+					batch_iov = IOV_MAX;
+
+				written = bwritev(&store->blob->_x, &blob_iov[j], batch_iov);
+				if (written < 0) {
+					pr_perror("Can't write coalesced page blob");
+					goto out;
+				}
+				if (written != (int)(batch_iov * PAGE_SIZE)) {
+					pr_err("Short write to coalesced page blob: %d/%zu bytes\n", written,
+					       (size_t)batch_iov * PAGE_SIZE);
+					goto out;
+				}
+				j += batch_iov;
+			}
+			store->blob_write_us += now_us() - step_start_us;
 		}
 
-		pagemap_entry__free_unpacked(pe, NULL);
-		pe = NULL;
+		step_start_us = now_us();
+		if (write_img_buf(index, offsets, chunk_pages * sizeof(*offsets)))
+			goto out;
+		image_index_write_us += now_us() - step_start_us;
+
+		image_present_pages += chunk_pages;
+		source_off += chunk_bytes;
+		chunk_group_generation++;
+
+		if (chunk_idx + 1 < schedule.nr_chunks) {
+			if (read_ahead_wait(&reader))
+				goto out;
+			current_buffer = next_buffer;
+		}
 	}
 
 	if (source_off != old_pages_size) {
@@ -738,7 +938,7 @@ static int coalesce_one_pagemap(int dfd, struct hash_pool *pool, struct page_sto
 	snprintf(pages_path, sizeof(pages_path), imgset_template[CR_FD_PAGES].fmt, pages_id);
 
 	image_blob_write_us = store->blob_write_us - stats->blob_write_us;
-	image_total_us = image_read_us + image_hash_us + image_lookup_us + image_blob_write_us + image_index_write_us;
+	image_total_us = now_us() - image_start_us;
 
 	stats->old_bytes += old_pages_size;
 	stats->index_bytes += image_present_pages * sizeof(*offsets);
@@ -765,16 +965,16 @@ static int coalesce_one_pagemap(int dfd, struct hash_pool *pool, struct page_sto
 
 	ret = 0;
 out:
-	if (pe)
-		pagemap_entry__free_unpacked(pe, NULL);
-	if (old_pages_mapped)
-		munmap((void *)old_pages_map, old_pages_size);
+	read_ahead_fini(&reader);
 	if (index)
 		close_image(index);
 	if (old_pages)
 		close_image(old_pages);
 	if (pagemap)
 		close_image(pagemap);
+	xfree(chunk_buffers[0]);
+	xfree(chunk_buffers[1]);
+	xfree(schedule.pages);
 	xfree(offsets);
 	xfree(meta);
 	xfree(blob_iov);
