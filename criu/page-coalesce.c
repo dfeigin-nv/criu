@@ -10,12 +10,14 @@
 #include <sys/uio.h>
 #include <sys/time.h>
 #include <unistd.h>
+#include <stdlib.h>
 
 #undef LOG_PREFIX
 #define LOG_PREFIX "page-coalesce: "
 
 #include "types.h"
 #include "cr_options.h"
+#include "common/list.h"
 #include "image.h"
 #include "image-desc.h"
 #include "log.h"
@@ -136,6 +138,31 @@ struct coalesce_stats {
 	u64 lookup_us;
 	u64 blob_write_us;
 	u64 index_write_us;
+};
+
+struct coalesce_job {
+	struct list_head list;
+	int pagemap_type;
+	unsigned long img_id;
+};
+
+struct coalesce_worker_state {
+	pthread_t thread;
+	pthread_mutex_t lock;
+	pthread_cond_t ready;
+	struct list_head jobs;
+	struct hash_pool pool;
+	struct page_store store;
+	struct coalesce_stats stats;
+	int dfd;
+	bool started;
+	bool stop;
+	bool failed;
+};
+
+/* One background worker consumes completed pagemap/pages pairs while dump continues. */
+static struct coalesce_worker_state online_state = {
+	.jobs = LIST_HEAD_INIT(online_state.jobs),
 };
 
 static u64 now_us(void)
@@ -976,7 +1003,228 @@ out:
 	return ret;
 }
 
-int coalesce_checkpoint_pages(void)
+static int should_run_page_coalesce(void)
+{
+	if (!opts.auto_dedup)
+		return 0;
+
+	if (opts.lazy_pages || opts.use_page_server || opts.stream) {
+		pr_warn("Skipping page coalescing because lazy-pages, page-server, or image streaming is enabled\n");
+		return 0;
+	}
+
+	return 1;
+}
+
+static int coalesce_worker_init(struct coalesce_worker_state *state)
+{
+	memzero(state, sizeof(*state));
+	INIT_LIST_HEAD(&state->jobs);
+
+	state->dfd = get_service_fd(IMG_FD_OFF);
+	if (state->dfd < 0) {
+		pr_err("Image directory is not open\n");
+		return -1;
+	}
+
+	if (hash_pool_init(&state->pool))
+		return -1;
+
+	state->store.blob = open_image_at(state->dfd, CR_FD_PAGES_BLOB, O_RDWR | O_CREAT | O_TRUNC);
+	if (!state->store.blob) {
+		hash_pool_fini(&state->pool);
+		return -1;
+	}
+
+	pthread_mutex_init(&state->lock, NULL);
+	pthread_cond_init(&state->ready, NULL);
+	state->started = true;
+	return 0;
+}
+
+static void coalesce_worker_destroy(struct coalesce_worker_state *state)
+{
+	struct coalesce_job *job, *tmp;
+
+	if (!state->started)
+		return;
+
+	list_for_each_entry_safe(job, tmp, &state->jobs, list) {
+		list_del(&job->list);
+		xfree(job);
+	}
+
+	close_image(state->store.blob);
+	hash_pool_fini(&state->pool);
+	xfree(state->store.slots);
+	pthread_cond_destroy(&state->ready);
+	pthread_mutex_destroy(&state->lock);
+	memzero(state, sizeof(*state));
+	INIT_LIST_HEAD(&state->jobs);
+}
+
+static void *coalesce_worker_main(void *arg)
+{
+	struct coalesce_worker_state *state = arg;
+
+	for (;;) {
+		struct coalesce_job *job;
+		struct page_target target;
+
+		pthread_mutex_lock(&state->lock);
+		while (list_empty(&state->jobs) && !state->stop)
+			pthread_cond_wait(&state->ready, &state->lock);
+
+		if (list_empty(&state->jobs) && state->stop) {
+			pthread_mutex_unlock(&state->lock);
+			return NULL;
+		}
+
+		job = list_first_entry(&state->jobs, struct coalesce_job, list);
+		list_del(&job->list);
+		pthread_mutex_unlock(&state->lock);
+
+		target.pagemap_type = job->pagemap_type;
+		target.img_id = job->img_id;
+		if (coalesce_one_pagemap(state->dfd, &state->pool, &state->store, &target, &state->stats)) {
+			pthread_mutex_lock(&state->lock);
+			state->failed = true;
+			state->stop = true;
+			pthread_cond_broadcast(&state->ready);
+			pthread_mutex_unlock(&state->lock);
+			xfree(job);
+			return NULL;
+		}
+
+		xfree(job);
+	}
+}
+
+int coalesce_checkpoint_pages_start(void)
+{
+	if (!should_run_page_coalesce())
+		return 0;
+
+	if (online_state.failed)
+		return -1;
+
+	if (online_state.started)
+		return 0;
+
+	if (coalesce_worker_init(&online_state))
+		return -1;
+
+	if (pthread_create(&online_state.thread, NULL, coalesce_worker_main, &online_state) != 0) {
+		pr_err("pthread_create failed for online page coalescer\n");
+		coalesce_worker_destroy(&online_state);
+		return -1;
+	}
+
+	return 0;
+}
+
+int coalesce_checkpoint_pages_enqueue(int pagemap_type, unsigned long img_id)
+{
+	struct coalesce_job *job;
+
+	if (!should_run_page_coalesce())
+		return 0;
+	if (!online_state.started)
+		return 0;
+
+	job = xmalloc(sizeof(*job));
+	if (!job) {
+		pthread_mutex_lock(&online_state.lock);
+		online_state.failed = true;
+		pthread_mutex_unlock(&online_state.lock);
+		return -1;
+	}
+
+	job->pagemap_type = pagemap_type;
+	job->img_id = img_id;
+
+	pthread_mutex_lock(&online_state.lock);
+	if (online_state.failed) {
+		pthread_mutex_unlock(&online_state.lock);
+		xfree(job);
+		return -1;
+	}
+	list_add_tail(&job->list, &online_state.jobs);
+	pthread_cond_signal(&online_state.ready);
+	pthread_mutex_unlock(&online_state.lock);
+	return 0;
+}
+
+void coalesce_checkpoint_pages_abort(void)
+{
+	struct coalesce_job *job, *tmp;
+
+	if (!online_state.started)
+		return;
+
+	pthread_mutex_lock(&online_state.lock);
+	online_state.stop = true;
+	online_state.failed = true;
+	list_for_each_entry_safe(job, tmp, &online_state.jobs, list) {
+		list_del(&job->list);
+		xfree(job);
+	}
+	pthread_cond_broadcast(&online_state.ready);
+	pthread_mutex_unlock(&online_state.lock);
+
+	pthread_join(online_state.thread, NULL);
+	coalesce_worker_destroy(&online_state);
+}
+
+static int coalesce_checkpoint_pages_finish_online(void)
+{
+	int ret = 0;
+
+	pthread_mutex_lock(&online_state.lock);
+	online_state.stop = true;
+	pthread_cond_broadcast(&online_state.ready);
+	pthread_mutex_unlock(&online_state.lock);
+
+	pthread_join(online_state.thread, NULL);
+	if (online_state.failed)
+		ret = -1;
+
+	if (!ret) {
+		online_state.stats.total_us = online_state.stats.read_us + online_state.stats.hash_us + online_state.stats.lookup_us +
+					      online_state.store.blob_write_us + online_state.stats.index_write_us;
+		online_state.stats.blob_write_us = online_state.store.blob_write_us;
+		online_state.stats.blob_bytes = online_state.store.next_offset;
+
+		pr_info("Coalesced %llu present pages across %llu pagemap images into %llu unique non-zero pages, eliding %llu zero pages\n",
+			(unsigned long long)online_state.stats.present_pages, (unsigned long long)online_state.stats.images,
+			(unsigned long long)online_state.stats.unique_pages, (unsigned long long)online_state.stats.zero_pages);
+		pr_info("Chunk-local dedupe candidates: lookup=%llu local_duplicate=%llu\n",
+			(unsigned long long)online_state.stats.lookup_candidates,
+			(unsigned long long)online_state.stats.local_duplicate_pages);
+		pr_info("Page payload bytes: old=%llu blob=%llu index=%llu combined=%llu saved=%lld\n",
+			(unsigned long long)online_state.stats.old_bytes, (unsigned long long)online_state.stats.blob_bytes,
+			(unsigned long long)online_state.stats.index_bytes,
+			(unsigned long long)(online_state.stats.blob_bytes + online_state.stats.index_bytes),
+			(long long)(online_state.stats.old_bytes -
+				   (online_state.stats.blob_bytes + online_state.stats.index_bytes)));
+		pr_info("Coalesce timings: total=%llu ms read=%llu ms hash=%llu ms lookup=%llu ms blob=%llu ms index=%llu ms grow=%llu ms table_used=%zu table_cap=%zu table_load=%llu%% workers=%u batch_pages=%u mode=online\n",
+			(unsigned long long)(online_state.stats.total_us / 1000ULL),
+			(unsigned long long)(online_state.stats.read_us / 1000ULL),
+			(unsigned long long)(online_state.stats.hash_us / 1000ULL),
+			(unsigned long long)(online_state.stats.lookup_us / 1000ULL),
+			(unsigned long long)(online_state.stats.blob_write_us / 1000ULL),
+			(unsigned long long)(online_state.stats.index_write_us / 1000ULL),
+			(unsigned long long)(online_state.store.grow_us / 1000ULL), online_state.store.used,
+			online_state.store.cap,
+			(unsigned long long)(online_state.store.cap ? (online_state.store.used * 100ULL / online_state.store.cap) : 0),
+			online_state.pool.nr_threads, COALESCE_BATCH_PAGES);
+	}
+
+	coalesce_worker_destroy(&online_state);
+	return ret;
+}
+
+static int coalesce_checkpoint_pages_postpass(void)
 {
 	struct hash_pool pool;
 	struct page_store store = {};
@@ -988,13 +1236,8 @@ int coalesce_checkpoint_pages(void)
 	int ret = 0;
 	u64 start_us;
 
-	if (!opts.auto_dedup)
+	if (!should_run_page_coalesce())
 		return 0;
-
-	if (opts.lazy_pages || opts.use_page_server || opts.stream) {
-		pr_warn("Skipping page coalescing because lazy-pages, page-server, or image streaming is enabled\n");
-		return 0;
-	}
 
 	dfd = get_service_fd(IMG_FD_OFF);
 	if (dfd < 0) {
@@ -1057,4 +1300,12 @@ int coalesce_checkpoint_pages(void)
 		(unsigned long long)(store.grow_us / 1000ULL), store.used, store.cap,
 		(unsigned long long)(store.cap ? (store.used * 100ULL / store.cap) : 0), pool.nr_threads, COALESCE_BATCH_PAGES);
 	return 0;
+}
+
+int coalesce_checkpoint_pages(void)
+{
+	if (online_state.started)
+		return coalesce_checkpoint_pages_finish_online();
+
+	return coalesce_checkpoint_pages_postpass();
 }
