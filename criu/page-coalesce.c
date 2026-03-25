@@ -105,21 +105,19 @@ struct chunk_schedule {
 	size_t cap;
 };
 
-struct read_ahead {
-	int fd;
+struct blob_writer {
+	struct cr_img *blob;
 	pthread_t thread;
 	pthread_mutex_t lock;
-	pthread_cond_t have_work;
-	pthread_cond_t work_done;
-	char *buffer;
-	size_t len;
-	off_t offset;
-	u64 read_us;
+	pthread_cond_t ready;
+	pthread_cond_t idle;
+	struct iovec *iovecs;
+	unsigned int nr_iovecs;
 	int status;
 	bool stop;
 	bool pending;
-	bool done;
 	bool started;
+	u64 write_us;
 };
 
 struct coalesce_stats {
@@ -561,120 +559,130 @@ out:
 	return ret;
 }
 
-static int read_full_at(int fd, char *buffer, size_t len, off_t offset, u64 *read_us)
+static void *blob_writer_main(void *arg)
 {
-	size_t consumed = 0;
-	u64 start_us = now_us();
+	struct blob_writer *writer = arg;
 
-	while (consumed < len) {
-		ssize_t nr = pread(fd, buffer + consumed, len - consumed, offset + consumed);
-
-		if (nr < 0) {
-			if (errno == EINTR)
-				continue;
-			pr_perror("Can't pread page chunk at %jd", (intmax_t)(offset + consumed));
-			return -1;
-		}
-		if (!nr) {
-			pr_err("Short pread on page chunk at %jd: read %zu/%zu bytes\n",
-			       (intmax_t)offset, consumed, len);
-			return -1;
-		}
-		consumed += nr;
-	}
-
-	*read_us += now_us() - start_us;
-	return 0;
-}
-
-static void *read_ahead_main(void *arg)
-{
-	struct read_ahead *reader = arg;
-
-	pthread_mutex_lock(&reader->lock);
+	pthread_mutex_lock(&writer->lock);
 	for (;;) {
-		u64 local_read_us = 0;
-		int status;
+		u64 local_write_us = 0;
+		unsigned int i;
+		int status = 0;
 
-		while (!reader->stop && !reader->pending)
-			pthread_cond_wait(&reader->have_work, &reader->lock);
+		while (!writer->stop && !writer->pending)
+			pthread_cond_wait(&writer->ready, &writer->lock);
 
-		if (reader->stop) {
-			pthread_mutex_unlock(&reader->lock);
+		if (writer->stop) {
+			pthread_mutex_unlock(&writer->lock);
 			return NULL;
 		}
 
-		pthread_mutex_unlock(&reader->lock);
-		status = read_full_at(reader->fd, reader->buffer, reader->len, reader->offset, &local_read_us);
-		pthread_mutex_lock(&reader->lock);
-		reader->read_us += local_read_us;
-		reader->status = status;
-		reader->pending = false;
-		reader->done = true;
-		pthread_cond_signal(&reader->work_done);
+		pthread_mutex_unlock(&writer->lock);
+		local_write_us = now_us();
+		for (i = 0; i < writer->nr_iovecs;) {
+			unsigned int batch_iov = writer->nr_iovecs - i;
+			int written;
+
+			if (batch_iov > IOV_MAX)
+				batch_iov = IOV_MAX;
+
+			written = bwritev(&writer->blob->_x, &writer->iovecs[i], batch_iov);
+			if (written < 0) {
+				pr_perror("Can't write coalesced page blob");
+				status = -1;
+				break;
+			}
+			if (written != (int)(batch_iov * PAGE_SIZE)) {
+				pr_err("Short write to coalesced page blob: %d/%zu bytes\n", written,
+				       (size_t)batch_iov * PAGE_SIZE);
+				status = -1;
+				break;
+			}
+			i += batch_iov;
+		}
+		local_write_us = now_us() - local_write_us;
+
+		pthread_mutex_lock(&writer->lock);
+		writer->write_us += local_write_us;
+		writer->status = status;
+		writer->pending = false;
+		writer->nr_iovecs = 0;
+		pthread_cond_signal(&writer->idle);
 	}
 }
 
-static int read_ahead_init(struct read_ahead *reader, int fd)
+static int blob_writer_init(struct blob_writer *writer, struct cr_img *blob)
 {
-	memzero(reader, sizeof(*reader));
-	reader->fd = fd;
-	pthread_mutex_init(&reader->lock, NULL);
-	pthread_cond_init(&reader->have_work, NULL);
-	pthread_cond_init(&reader->work_done, NULL);
-	if (pthread_create(&reader->thread, NULL, read_ahead_main, reader) != 0) {
-		pr_err("pthread_create failed for page read-ahead worker\n");
-		pthread_cond_destroy(&reader->work_done);
-		pthread_cond_destroy(&reader->have_work);
-		pthread_mutex_destroy(&reader->lock);
+	memzero(writer, sizeof(*writer));
+	writer->blob = blob;
+	writer->iovecs = xmalloc(COALESCE_BATCH_PAGES * sizeof(*writer->iovecs));
+	if (!writer->iovecs)
+		return -1;
+	pthread_mutex_init(&writer->lock, NULL);
+	pthread_cond_init(&writer->ready, NULL);
+	pthread_cond_init(&writer->idle, NULL);
+	if (pthread_create(&writer->thread, NULL, blob_writer_main, writer) != 0) {
+		pr_err("pthread_create failed for page blob writer\n");
+		pthread_cond_destroy(&writer->idle);
+		pthread_cond_destroy(&writer->ready);
+		pthread_mutex_destroy(&writer->lock);
+		xfree(writer->iovecs);
+		memzero(writer, sizeof(*writer));
 		return -1;
 	}
-	reader->started = true;
+	writer->started = true;
 	return 0;
 }
 
-static void read_ahead_fini(struct read_ahead *reader)
-{
-	if (!reader->started)
-		return;
-
-	pthread_mutex_lock(&reader->lock);
-	reader->stop = true;
-	pthread_cond_signal(&reader->have_work);
-	pthread_mutex_unlock(&reader->lock);
-	pthread_join(reader->thread, NULL);
-	pthread_cond_destroy(&reader->work_done);
-	pthread_cond_destroy(&reader->have_work);
-	pthread_mutex_destroy(&reader->lock);
-}
-
-static int read_ahead_submit(struct read_ahead *reader, char *buffer, size_t len, off_t offset)
-{
-	pthread_mutex_lock(&reader->lock);
-	while (reader->pending)
-		pthread_cond_wait(&reader->work_done, &reader->lock);
-	reader->buffer = buffer;
-	reader->len = len;
-	reader->offset = offset;
-	reader->done = false;
-	reader->status = 0;
-	reader->pending = true;
-	pthread_cond_signal(&reader->have_work);
-	pthread_mutex_unlock(&reader->lock);
-	return 0;
-}
-
-static int read_ahead_wait(struct read_ahead *reader)
+static int blob_writer_wait(struct blob_writer *writer)
 {
 	int status;
 
-	pthread_mutex_lock(&reader->lock);
-	while (!reader->done)
-		pthread_cond_wait(&reader->work_done, &reader->lock);
-	status = reader->status;
-	reader->done = false;
-	pthread_mutex_unlock(&reader->lock);
+	if (!writer->started)
+		return 0;
+
+	pthread_mutex_lock(&writer->lock);
+	while (writer->pending)
+		pthread_cond_wait(&writer->idle, &writer->lock);
+	status = writer->status;
+	writer->status = 0;
+	pthread_mutex_unlock(&writer->lock);
 	return status;
+}
+
+static int blob_writer_submit(struct blob_writer *writer, const struct iovec *iovecs, unsigned int nr_iovecs)
+{
+	if (!writer->started || !nr_iovecs)
+		return 0;
+
+	pthread_mutex_lock(&writer->lock);
+	while (writer->pending)
+		pthread_cond_wait(&writer->idle, &writer->lock);
+	memcpy(writer->iovecs, iovecs, nr_iovecs * sizeof(*iovecs));
+	writer->nr_iovecs = nr_iovecs;
+	writer->status = 0;
+	writer->pending = true;
+	pthread_cond_signal(&writer->ready);
+	pthread_mutex_unlock(&writer->lock);
+	return 0;
+}
+
+static void blob_writer_fini(struct blob_writer *writer)
+{
+	if (!writer->started)
+		return;
+
+	pthread_mutex_lock(&writer->lock);
+	while (writer->pending)
+		pthread_cond_wait(&writer->idle, &writer->lock);
+	writer->stop = true;
+	pthread_cond_signal(&writer->ready);
+	pthread_mutex_unlock(&writer->lock);
+	pthread_join(writer->thread, NULL);
+	pthread_cond_destroy(&writer->idle);
+	pthread_cond_destroy(&writer->ready);
+	pthread_mutex_destroy(&writer->lock);
+	xfree(writer->iovecs);
 }
 
 static int collect_page_targets(int dfd, struct page_target **targets, size_t *nr_targets)
@@ -750,13 +758,13 @@ static int coalesce_one_pagemap(int dfd, struct hash_pool *pool, struct page_sto
 	struct cr_img *old_pages = NULL;
 	struct cr_img *pagemap = NULL;
 	struct chunk_schedule schedule = {};
-	struct read_ahead reader = {};
+	struct blob_writer writer = {};
 	u32 pages_id = 0;
 	off_t old_pages_size;
 	off_t source_off = 0;
 	int old_pages_fd;
-	char *chunk_buffers[2] = {};
-	unsigned int current_buffer = 0;
+	const char *old_pages_map = NULL;
+	bool old_pages_mapped = false;
 	size_t chunk_groups_cap;
 	u64 step_start_us = 0;
 	u64 image_start_us = 0;
@@ -809,35 +817,31 @@ static int coalesce_one_pagemap(int dfd, struct hash_pool *pool, struct page_sto
 	if (build_chunk_schedule(pagemap, &schedule))
 		goto out;
 
-	chunk_buffers[0] = xmalloc(COALESCE_BATCH_PAGES * PAGE_SIZE);
-	chunk_buffers[1] = xmalloc(COALESCE_BATCH_PAGES * PAGE_SIZE);
-	if (!chunk_buffers[0] || !chunk_buffers[1])
+	step_start_us = now_us();
+	old_pages_map = mmap(NULL, (size_t)old_pages_size, PROT_READ, MAP_PRIVATE, old_pages_fd, 0);
+	if (old_pages_map == MAP_FAILED) {
+		pr_perror("Can't mmap pages image for id %u", pages_id);
+		old_pages_map = NULL;
 		goto out;
+	}
+	old_pages_mapped = true;
+	(void)posix_fadvise(old_pages_fd, 0, 0, POSIX_FADV_SEQUENTIAL);
+	(void)madvise((void *)old_pages_map, (size_t)old_pages_size, MADV_SEQUENTIAL);
+	image_read_us += now_us() - step_start_us;
 
-	if (read_ahead_init(&reader, old_pages_fd))
+	if (blob_writer_init(&writer, store->blob))
 		goto out;
 
 	image_start_us = now_us();
-	if (schedule.nr_chunks && read_full_at(old_pages_fd, chunk_buffers[0], (size_t)schedule.pages[0] * PAGE_SIZE, 0, &image_read_us))
-		goto out;
-
 	for (size_t chunk_idx = 0; chunk_idx < schedule.nr_chunks; chunk_idx++) {
 		unsigned int chunk_pages = schedule.pages[chunk_idx];
 		size_t chunk_bytes = (size_t)chunk_pages * PAGE_SIZE;
-		unsigned int next_buffer = current_buffer ^ 1U;
-		const char *chunk_pages_ptr = chunk_buffers[current_buffer];
+		const char *chunk_pages_ptr = old_pages_map + source_off;
 		u64 lookup_start_us;
 		unsigned int j;
 		unsigned int nr_blob_pages = 0;
 		unsigned int group_count = 0;
 		unsigned int chunk_nonzero_pages = 0;
-
-		if (chunk_idx + 1 < schedule.nr_chunks) {
-			size_t next_chunk_bytes = (size_t)schedule.pages[chunk_idx + 1] * PAGE_SIZE;
-
-			if (read_ahead_submit(&reader, chunk_buffers[next_buffer], next_chunk_bytes, source_off + chunk_bytes))
-				goto out;
-		}
 
 		if (hash_pool_run(pool, chunk_pages_ptr, meta, chunk_pages, &image_hash_us))
 			goto out;
@@ -890,27 +894,10 @@ static int coalesce_one_pagemap(int dfd, struct hash_pool *pool, struct page_sto
 		}
 
 		if (nr_blob_pages > 0) {
-			step_start_us = now_us();
-			for (j = 0; j < nr_blob_pages;) {
-				unsigned int batch_iov = nr_blob_pages - j;
-				int written;
-
-				if (batch_iov > IOV_MAX)
-					batch_iov = IOV_MAX;
-
-				written = bwritev(&store->blob->_x, &blob_iov[j], batch_iov);
-				if (written < 0) {
-					pr_perror("Can't write coalesced page blob");
-					goto out;
-				}
-				if (written != (int)(batch_iov * PAGE_SIZE)) {
-					pr_err("Short write to coalesced page blob: %d/%zu bytes\n", written,
-					       (size_t)batch_iov * PAGE_SIZE);
-					goto out;
-				}
-				j += batch_iov;
-			}
-			store->blob_write_us += now_us() - step_start_us;
+			if (blob_writer_wait(&writer))
+				goto out;
+			if (blob_writer_submit(&writer, blob_iov, nr_blob_pages))
+				goto out;
 		}
 
 		step_start_us = now_us();
@@ -921,12 +908,6 @@ static int coalesce_one_pagemap(int dfd, struct hash_pool *pool, struct page_sto
 		image_present_pages += chunk_pages;
 		source_off += chunk_bytes;
 		chunk_group_generation++;
-
-		if (chunk_idx + 1 < schedule.nr_chunks) {
-			if (read_ahead_wait(&reader))
-				goto out;
-			current_buffer = next_buffer;
-		}
 	}
 
 	if (source_off != old_pages_size) {
@@ -935,10 +916,13 @@ static int coalesce_one_pagemap(int dfd, struct hash_pool *pool, struct page_sto
 		goto out;
 	}
 
+	if (blob_writer_wait(&writer))
+		goto out;
+
 	snprintf(pages_path, sizeof(pages_path), imgset_template[CR_FD_PAGES].fmt, pages_id);
 
-	image_read_us += reader.read_us;
-	image_blob_write_us = store->blob_write_us - stats->blob_write_us;
+	store->blob_write_us += writer.write_us;
+	image_blob_write_us = writer.write_us;
 	image_total_us = now_us() - image_start_us;
 
 	stats->old_bytes += old_pages_size;
@@ -966,15 +950,15 @@ static int coalesce_one_pagemap(int dfd, struct hash_pool *pool, struct page_sto
 
 	ret = 0;
 out:
-	read_ahead_fini(&reader);
+	blob_writer_fini(&writer);
 	if (index)
 		close_image(index);
 	if (old_pages)
 		close_image(old_pages);
 	if (pagemap)
 		close_image(pagemap);
-	xfree(chunk_buffers[0]);
-	xfree(chunk_buffers[1]);
+	if (old_pages_mapped)
+		munmap((void *)old_pages_map, old_pages_size);
 	xfree(schedule.pages);
 	xfree(offsets);
 	xfree(meta);
