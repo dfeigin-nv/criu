@@ -43,7 +43,7 @@
  * Batch inherited COW page reads so compact restore can amortize indexed
  * lookup and preadv overhead.
  */
-#define COW_COMPARE_BATCH_PAGES 256
+#define COW_COMPARE_BATCH_PAGES 1024
 
 static int task_reset_dirty_track(int pid)
 {
