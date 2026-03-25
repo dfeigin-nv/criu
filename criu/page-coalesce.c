@@ -937,6 +937,7 @@ static int coalesce_one_pagemap(int dfd, struct hash_pool *pool, struct page_sto
 
 	snprintf(pages_path, sizeof(pages_path), imgset_template[CR_FD_PAGES].fmt, pages_id);
 
+	image_read_us += reader.read_us;
 	image_blob_write_us = store->blob_write_us - stats->blob_write_us;
 	image_total_us = now_us() - image_start_us;
 
