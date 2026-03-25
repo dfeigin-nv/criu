@@ -1605,14 +1605,38 @@ static inline bool compact_io_is_zero(loff_t off);
 static inline bool compact_io_is_compact(loff_t off);
 static inline loff_t compact_io_decode(loff_t off);
 
+static void restore_vma_io_apply_copies(struct restore_vma_io *rio, size_t *copy_restore_len,
+					 unsigned int *copy_ios, u64 *copy_us)
+{
+	struct restore_vma_copy *copies;
+	struct timeval tv0, tv1;
+
+	if (rio->nr_copies == 0)
+		return;
+
+	copies = restore_vma_io_copies(rio);
+	sys_gettimeofday(&tv0, NULL);
+	for (unsigned int i = 0; i < (unsigned int)rio->nr_copies; i++)
+		memcpy(copies[i].dst, copies[i].src, PAGE_SIZE);
+	sys_gettimeofday(&tv1, NULL);
+
+	*copy_us += (u64)(tv1.tv_sec - tv0.tv_sec) * 1000000ULL +
+		    (u64)(tv1.tv_usec - tv0.tv_usec);
+	*copy_restore_len += (size_t)rio->nr_copies * PAGE_SIZE;
+	*copy_ios += (unsigned int)rio->nr_copies;
+}
+
 static int restore_vma_ios_sync(int fd, struct restore_vma_io *rios, unsigned int n, bool auto_dedup)
 {
 	size_t zero_restore_len = 0;
 	size_t sync_restore_len = 0;
+	size_t copy_restore_len = 0;
 	unsigned int zero_ios = 0;
 	unsigned int sync_ios = 0;
+	unsigned int copy_ios = 0;
 	u64 zero_us = 0;
 	u64 sync_us = 0;
+	u64 copy_us = 0;
 	struct restore_vma_io *rio = rios;
 	unsigned int i;
 
@@ -1683,15 +1707,18 @@ static int restore_vma_ios_sync(int fd, struct restore_vma_io *rios, unsigned in
 			sync_us += (u64)(read1.tv_sec - read0.tv_sec) * 1000000ULL +
 				   (u64)(read1.tv_usec - read0.tv_usec);
 		}
+		restore_vma_io_apply_copies(rio, &copy_restore_len, &copy_ios, &copy_us);
 next_rio:
-		rio = (void *)rio + RIO_SIZE(rio->nr_iovs);
+		rio = (void *)rio + RIO_SIZE(rio->nr_iovs, rio->nr_copies);
 	}
 
-	pr_info("VMA restore zero-fill %lu ms (%zu MiB, %u ios) sync %lu ms (%zu MiB, %u ios)\n",
+	pr_info("VMA restore zero-fill %lu ms (%zu MiB, %u ios) sync %lu ms (%zu MiB, %u ios) copy %lu ms (%zu MiB, %u ios)\n",
 		(unsigned long)(zero_us / 1000ULL),
 		zero_restore_len / (1024 * 1024), zero_ios,
 		(unsigned long)(sync_us / 1000ULL),
-		sync_restore_len / (1024 * 1024), sync_ios);
+		sync_restore_len / (1024 * 1024), sync_ios,
+		(unsigned long)(copy_us / 1000ULL),
+		copy_restore_len / (1024 * 1024), copy_ios);
 
 	return 0;
 }
@@ -2016,6 +2043,7 @@ __visible long __export_restore_task(struct task_restore_args *args)
 	if (args->vma_ios_n > 0 && args->vma_ios_fd != -1) {
 		size_t vma_restore_len = 0;
 		size_t zero_restore_len = 0;
+		size_t copy_restore_len = 0;
 		struct timeval tv0, tv1, tv_fill0, tv_fill1;
 		unsigned int n = args->vma_ios_n;
 		int fd = args->vma_ios_fd;
@@ -2027,6 +2055,8 @@ __visible long __export_restore_task(struct task_restore_args *args)
 		struct io_event *events;
 		unsigned long alloc_sz;
 		unsigned int submitted = 0, completed = 0, aio_n = 0, zero_ios = 0;
+		unsigned int copy_ios = 0;
+		u64 copy_us = 0;
 		bool aio_ctx_ready = false;
 		bool iocbs_mapped = false;
 
@@ -2052,13 +2082,13 @@ __visible long __export_restore_task(struct task_restore_args *args)
 				aio_n++;
 			}
 
-			rio = (void *)rio + RIO_SIZE(rio->nr_iovs);
+			rio = (void *)rio + RIO_SIZE(rio->nr_iovs, rio->nr_copies);
 		}
 
 		sys_gettimeofday(&tv_fill1, NULL);
 
 		if (aio_n == 0) {
-			pr_info("VMA restore zero-fill %lu ms (%zu MiB, %u ios)\n",
+			pr_info("VMA restore zero-fill %lu ms (%zu MiB, %u ios) copy 0 ms (0 MiB, 0 ios)\n",
 				(unsigned long)((tv_fill1.tv_sec - tv_fill0.tv_sec) * 1000 +
 						(tv_fill1.tv_usec - tv_fill0.tv_usec) / 1000),
 				zero_restore_len / (1024 * 1024), zero_ios);
@@ -2115,7 +2145,7 @@ __visible long __export_restore_task(struct task_restore_args *args)
 				completed++;
 			}
 
-			rio = (void *)rio + RIO_SIZE(rio->nr_iovs);
+			rio = (void *)rio + RIO_SIZE(rio->nr_iovs, rio->nr_copies);
 		}
 		completed = 0;
 
@@ -2143,21 +2173,23 @@ __visible long __export_restore_task(struct task_restore_args *args)
 					goto aio_fallback;
 				}
 				for (long k = 0; k < aio_ret; k++) {
+					struct iocb *cb = (struct iocb *)(unsigned long)events[k].obj;
+					unsigned int idx = cb - iocbs;
+					struct restore_vma_io *r = rio_ptrs[idx];
+
 					if (events[k].res < 0) {
 						pr_warn("AIO read failed: %lld, falling back to buffered VMA restore\n",
 							events[k].res);
 						goto aio_fallback;
 					}
-					{
-						struct iocb *cb = (struct iocb *)(unsigned long)events[k].obj;
-						struct restore_vma_io *r = rio_ptrs[cb - iocbs];
 
-						if (args->auto_dedup && events[k].res > 0 && !compact_io_is_compact(r->off))
-							sys_fallocate(fd,
-								      FALLOC_FL_KEEP_SIZE | FALLOC_FL_PUNCH_HOLE,
-								      (off_t)cb->aio_offset, (off_t)events[k].res);
-					}
+					if (args->auto_dedup && events[k].res > 0 && !compact_io_is_compact(r->off))
+						sys_fallocate(fd,
+							      FALLOC_FL_KEEP_SIZE | FALLOC_FL_PUNCH_HOLE,
+							      (off_t)cb->aio_offset, (off_t)events[k].res);
+
 					if ((__u64)events[k].res == events[k].data) {
+						restore_vma_io_apply_copies(r, &copy_restore_len, &copy_ios, &copy_us);
 						completed++;
 						continue;
 					}
@@ -2168,15 +2200,12 @@ __visible long __export_restore_task(struct task_restore_args *args)
 						goto aio_fallback;
 					}
 					{
-						struct iocb *cb = (struct iocb *)(unsigned long)events[k].obj;
-						unsigned int idx = cb - iocbs;
-						struct restore_vma_io *r = rio_ptrs[idx];
 						struct iovec *iov_next;
 						unsigned int nr_next;
 
-						advance_vma_io_retry(r, events[k].res,
-								   &iov_next, &nr_next);
+						advance_vma_io_retry(r, events[k].res, &iov_next, &nr_next);
 						if (!iov_next || nr_next == 0) {
+							restore_vma_io_apply_copies(r, &copy_restore_len, &copy_ios, &copy_us);
 							completed++;
 							continue;
 						}
@@ -2212,12 +2241,14 @@ aio_fallback:
 		sys_io_destroy(aio_ctx);
 		sys_munmap(iocbs, alloc_sz);
 		sys_gettimeofday(&tv1, NULL);
-		pr_info("VMA restore zero-fill %lu ms (%zu MiB, %u ios) AIO %lu ms (%zu MiB, %u ios)\n",
+		pr_info("VMA restore zero-fill %lu ms (%zu MiB, %u ios) AIO %lu ms (%zu MiB, %u ios) copy %lu ms (%zu MiB, %u ios)\n",
 			(unsigned long)((tv_fill1.tv_sec - tv_fill0.tv_sec) * 1000 +
 					(tv_fill1.tv_usec - tv_fill0.tv_usec) / 1000),
 			zero_restore_len / (1024 * 1024), zero_ios,
 			(unsigned long)((tv1.tv_sec - tv0.tv_sec) * 1000 + (tv1.tv_usec - tv0.tv_usec) / 1000),
-			vma_restore_len / (1024 * 1024), aio_n);
+			vma_restore_len / (1024 * 1024), aio_n,
+			(unsigned long)(copy_us / 1000ULL),
+			copy_restore_len / (1024 * 1024), copy_ios);
 		sys_close(fd);
 		args->vma_ios_fd = -1;
 #undef AIO_BATCH
