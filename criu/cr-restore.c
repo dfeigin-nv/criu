@@ -1848,7 +1848,11 @@ static int restore_rseq_cs(void)
 static int catch_tasks(bool root_seized, struct catch_tasks_stats *stats)
 {
 	struct pstree_item *item;
-	bool nobp = fault_injected(FI_NO_BREAKPOINTS) || !kdat.has_breakpoints;
+	/*
+	 * Per-thread breakpoint arm+continue dominates the restore tail here.
+	 * Use syscall-stop mode for this final catch path instead.
+	 */
+	bool nobp = true;
 
 	for_each_pstree_item(item) {
 		int status, i, ret;
