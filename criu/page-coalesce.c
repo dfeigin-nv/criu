@@ -68,7 +68,7 @@ struct page_store {
 struct chunk_group_slot {
 	struct page_hash_key key;
 	unsigned int group_id;
-	bool used;
+	u32 generation;
 };
 
 struct hash_batch {
@@ -277,13 +277,14 @@ static int page_store_lookup_or_reserve(struct page_store *store, const struct p
 	return 0;
 }
 
-static int chunk_group_lookup_or_reserve(struct chunk_group_slot *slots, size_t cap, const struct page_hash_key *key,
-					 unsigned int new_group_id, unsigned int *group_id, bool *is_new)
+static int chunk_group_lookup_or_reserve(struct chunk_group_slot *slots, size_t cap, u32 generation,
+					 const struct page_hash_key *key, unsigned int new_group_id,
+					 unsigned int *group_id, bool *is_new)
 {
 	size_t idx;
 
 	idx = page_hash_key_slot(key) & (cap - 1);
-	while (slots[idx].used) {
+	while (slots[idx].generation == generation) {
 		if (page_hash_key_equal(&slots[idx].key, key)) {
 			*group_id = slots[idx].group_id;
 			*is_new = false;
@@ -292,7 +293,7 @@ static int chunk_group_lookup_or_reserve(struct chunk_group_slot *slots, size_t 
 		idx = (idx + 1) & (cap - 1);
 	}
 
-	slots[idx].used = true;
+	slots[idx].generation = generation;
 	slots[idx].key = *key;
 	slots[idx].group_id = new_group_id;
 	*group_id = new_group_id;
@@ -559,6 +560,7 @@ static int coalesce_one_pagemap(int dfd, struct hash_pool *pool, struct page_sto
 	u64 image_lookup_us = 0;
 	u64 image_blob_write_us = 0;
 	u64 image_index_write_us = 0;
+	u32 chunk_group_generation = 1;
 	int ret = -1;
 
 	meta = xmalloc(COALESCE_BATCH_PAGES * sizeof(*meta));
@@ -641,8 +643,10 @@ static int coalesce_one_pagemap(int dfd, struct hash_pool *pool, struct page_sto
 				goto out;
 
 			/* Collapse identical pages inside the chunk before hitting the global table. */
-			memset(chunk_groups, 0, chunk_groups_cap * sizeof(*chunk_groups));
-			memset(chunk_group_of_page, 0xff, chunk_pages * sizeof(*chunk_group_of_page));
+			if (!chunk_group_generation) {
+				memzero(chunk_groups, chunk_groups_cap * sizeof(*chunk_groups));
+				chunk_group_generation = 1;
+			}
 
 			for (j = 0; j < chunk_pages; j++) {
 				unsigned int group_id;
@@ -655,8 +659,8 @@ static int coalesce_one_pagemap(int dfd, struct hash_pool *pool, struct page_sto
 				}
 
 				chunk_nonzero_pages++;
-				if (chunk_group_lookup_or_reserve(chunk_groups, chunk_groups_cap, &meta[j].key, group_count, &group_id,
-								  &is_new))
+				if (chunk_group_lookup_or_reserve(chunk_groups, chunk_groups_cap, chunk_group_generation, &meta[j].key,
+								  group_count, &group_id, &is_new))
 					goto out;
 				chunk_group_of_page[j] = group_id;
 				if (is_new)
@@ -718,6 +722,7 @@ static int coalesce_one_pagemap(int dfd, struct hash_pool *pool, struct page_sto
 			image_present_pages += chunk_pages;
 			source_off += chunk_bytes;
 			i += chunk_pages;
+			chunk_group_generation++;
 		}
 
 		pagemap_entry__free_unpacked(pe, NULL);
