@@ -1674,24 +1674,6 @@ struct stop_on_syscall_stats {
 	unsigned int completed_tasks;
 };
 
-struct stop_on_syscall_task_state {
-	pid_t pid;
-	bool awaiting_exit;
-};
-
-static struct stop_on_syscall_task_state *find_stop_on_syscall_task_state(struct stop_on_syscall_task_state *states,
-									  unsigned int nr_states, pid_t pid)
-{
-	unsigned int i;
-
-	for (i = 0; i < nr_states; i++) {
-		if (states[i].pid == pid)
-			return &states[i];
-	}
-
-	return NULL;
-}
-
 /*
  * Trap tasks on the exit from the specified syscall
  *
@@ -1704,26 +1686,15 @@ int compel_stop_on_syscall(int tasks, const int sys_nr, const int sys_nr_compat)
 	struct stop_on_syscall_stats stats = {
 		.requested_tasks = tasks,
 	};
-	struct stop_on_syscall_task_state *states = NULL;
-	unsigned int nr_states = 0;
 	enum trace_flags trace = tasks > 1 ? TRACE_ALL : TRACE_ENTER;
 	user_regs_struct_t regs;
 	int status, ret = 0;
 	pid_t pid;
 	uint64_t start_us = stop_on_syscall_now_us();
 
-	if (tasks > 1) {
-		states = xzalloc(sizeof(*states) * tasks);
-		if (!states) {
-			ret = -1;
-			goto out;
-		}
-	}
-
 	/* Stop all threads on the enter point in sys_rt_sigreturn */
 	while (tasks) {
 		uint64_t step_start_us = stop_on_syscall_now_us();
-		struct stop_on_syscall_task_state *state;
 
 		pid = wait4(-1, &status, __WALL, NULL);
 		if (pid == -1) {
@@ -1741,20 +1712,6 @@ int compel_stop_on_syscall(int tasks, const int sys_nr, const int sys_nr_compat)
 
 		stats.trapped_stops++;
 		pr_debug("%d was trapped\n", pid);
-
-		state = find_stop_on_syscall_task_state(states, nr_states, pid);
-		if (state && state->awaiting_exit) {
-			if ((WSTOPSIG(status) & PTRACE_SYSCALL_TRAP) == 0) {
-				pr_err("Task %d hit unexpected stop while awaiting syscall exit\n", pid);
-				ret = -1;
-				goto out;
-			}
-			pr_debug("%d completed required syscall\n", pid);
-			state->awaiting_exit = false;
-			stats.completed_tasks++;
-			tasks--;
-			continue;
-		}
 
 		if ((WSTOPSIG(status) & PTRACE_SYSCALL_TRAP) == 0) {
 			/*
@@ -1792,24 +1749,10 @@ int compel_stop_on_syscall(int tasks, const int sys_nr, const int sys_nr_compat)
 
 		if (is_required_syscall(&regs, pid, sys_nr, sys_nr_compat)) {
 			/*
-			 * The process is going to execute the required syscall,
-			 * the next stop will be on the exit from this syscall
-			 */
-			stats.required_syscalls++;
-			if (states) {
-				if (!state) {
-					if (nr_states >= stats.requested_tasks) {
-						pr_err("Too many tracked stop-on-syscall tasks\n");
-						ret = -1;
-						goto out;
-					}
-					state = &states[nr_states++];
-					state->pid = pid;
-				}
-				state->awaiting_exit = true;
-				goto goon;
-			}
-
+		 * The process is going to execute the required syscall,
+		 * the next stop will be on the exit from this syscall
+		 */
+		stats.required_syscalls++;
 			step_start_us = stop_on_syscall_now_us();
 			ret = ptrace(PTRACE_SYSCALL, pid, NULL, NULL);
 			stats.ptrace_restart_us += stop_on_syscall_now_us() - step_start_us;
@@ -1840,7 +1783,7 @@ int compel_stop_on_syscall(int tasks, const int sys_nr, const int sys_nr_compat)
 			continue;
 		}
 		stats.mismatched_syscalls++;
-	goon:
+goon:
 		step_start_us = stop_on_syscall_now_us();
 		ret = ptrace(PTRACE_SYSCALL, pid, NULL, NULL);
 		stats.ptrace_restart_us += stop_on_syscall_now_us() - step_start_us;
@@ -1861,7 +1804,6 @@ out:
 		(unsigned long long)(stats.ptrace_restart_us / 1000ULL),
 		(unsigned long long)(stats.flush_breakpoint_us / 1000ULL),
 		(unsigned long long)(stats.total_us / 1000ULL), ret);
-	xfree(states);
 	return ret;
 }
 
