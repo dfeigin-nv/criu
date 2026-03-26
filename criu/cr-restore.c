@@ -169,6 +169,18 @@ struct catch_tasks_stats {
 	u64 stop_pie_us;
 };
 
+struct pre_attach_stats {
+	u64 stop_usernsd_us;
+	u64 stop_cgroupd_us;
+	u64 move_veth_us;
+	u64 prepare_cgroup_properties_us;
+	u64 post_restore_scripts_us;
+	u64 depopulate_roots_yard_us;
+	u64 write_restored_pid_us;
+	u64 network_unlock_us;
+	u64 ignore_kids_us;
+};
+
 struct restore_tail_stats {
 	u64 wait_sigchld_barrier_us;
 	u64 pre_attach_orchestration_us;
@@ -183,6 +195,7 @@ struct restore_tail_stats {
 	u64 finalize_detach_us;
 	u64 attach_to_tasks_us;
 	struct catch_tasks_stats catch_tasks;
+	struct pre_attach_stats pre_attach;
 };
 
 static inline int stage_current_participants(int next_stage)
@@ -1905,6 +1918,25 @@ static int restore_task_with_children(void *_arg)
 int __attribute((weak)) arch_ptrace_restore(int pid, struct pstree_item *item);
 int arch_ptrace_restore(int pid, struct pstree_item *item) { return 0; }
 
+struct attach_thread_entry {
+	pid_t pid;
+	struct pstree_item *item;
+	int thread_index;
+};
+
+static struct attach_thread_entry *find_attach_thread_entry(struct attach_thread_entry *entries,
+							    unsigned int nr_entries, pid_t pid)
+{
+	unsigned int i;
+
+	for (i = 0; i < nr_entries; i++) {
+		if (entries[i].pid == pid)
+			return &entries[i];
+	}
+
+	return NULL;
+}
+
 static int attach_to_tasks(bool root_seized)
 {
 	u64 total_start_us = restore_tail_now_us();
@@ -1918,10 +1950,16 @@ static int attach_to_tasks(bool root_seized)
 	u64 cont_us = 0;
 	u64 tasks = 0;
 	u64 threads = 0;
+	struct attach_thread_entry *entries;
+	unsigned int nr_entries = 0;
 	struct pstree_item *item;
 
+	entries = xmalloc(sizeof(*entries) * task_entries->nr_threads);
+	if (!entries)
+		return -1;
+
 	for_each_pstree_item(item) {
-		int status, i;
+		int i;
 		u64 step_start_us;
 
 		if (!task_alive(item))
@@ -1931,7 +1969,7 @@ static int attach_to_tasks(bool root_seized)
 		/* Parse threads for ptrace attach */
 		step_start_us = restore_tail_now_us();
 		if (parse_threads(item->pid->real, &item->threads, &item->nr_threads))
-			return -1;
+			goto err;
 		parse_threads_us += restore_tail_now_us() - step_start_us;
 
 		/*
@@ -1948,13 +1986,21 @@ static int attach_to_tasks(bool root_seized)
 			pid_t pid = item->threads[i].real;
 			u64 phase_start_us;
 
+			if (nr_entries >= task_entries->nr_threads) {
+				pr_err("Attach thread table overflow\n");
+				goto err;
+			}
+			entries[nr_entries].pid = pid;
+			entries[nr_entries].item = item;
+			entries[nr_entries].thread_index = i;
+			nr_entries++;
 			threads++;
 
 			phase_start_us = restore_tail_now_us();
-			if (item != root_item || !root_seized || i != 0) {
+			if (!(item == root_item && root_seized && i == 0)) {
 				if (ptrace(PTRACE_SEIZE, pid, 0, 0)) {
 					pr_perror("Can't attach to %d", pid);
-					return -1;
+					goto err;
 				}
 			}
 			seize_us += restore_tail_now_us() - phase_start_us;
@@ -1962,47 +2008,65 @@ static int attach_to_tasks(bool root_seized)
 			phase_start_us = restore_tail_now_us();
 			if (ptrace(PTRACE_INTERRUPT, pid, 0, 0)) {
 				pr_perror("Can't interrupt the %d task", pid);
-				return -1;
+				goto err;
 			}
 			interrupt_us += restore_tail_now_us() - phase_start_us;
-
-			phase_start_us = restore_tail_now_us();
-			if (wait4(pid, &status, __WALL, NULL) != pid) {
-				pr_perror("waitpid(%d) failed", pid);
-				return -1;
-			}
-			wait_us += restore_tail_now_us() - phase_start_us;
-
-			phase_start_us = restore_tail_now_us();
-			if (ptrace(PTRACE_SETOPTIONS, pid, NULL, PTRACE_O_TRACESYSGOOD)) {
-				pr_perror("Unable to set PTRACE_O_TRACESYSGOOD for %d", pid);
-				return -1;
-			}
-			setoptions_us += restore_tail_now_us() - phase_start_us;
-			/* Only restore regs for image threads; workers have no core */
-			phase_start_us = restore_tail_now_us();
-			if (i < item->nr_threads_image && arch_ptrace_restore(pid, item))
-				return -1;
-			restore_regs_us += restore_tail_now_us() - phase_start_us;
-			/*
-			 * Suspend seccomp if necessary. We need to do this because
-			 * although seccomp is restored at the very end of the
-			 * restorer blob (and the final sigreturn is ok), here we're
-			 * doing an munmap in the process, which may be blocked by
-			 * seccomp and cause the task to be killed.
-			 */
-			phase_start_us = restore_tail_now_us();
-			if (rsti(item)->has_seccomp && ptrace_suspend_seccomp(pid) < 0)
-				pr_err("failed to suspend seccomp, restore will probably fail...\n");
-			seccomp_us += restore_tail_now_us() - phase_start_us;
-
-			phase_start_us = restore_tail_now_us();
-			if (ptrace(PTRACE_CONT, pid, NULL, NULL)) {
-				pr_perror("Unable to resume %d", pid);
-				return -1;
-			}
-			cont_us += restore_tail_now_us() - phase_start_us;
 		}
+	}
+
+	while (nr_entries) {
+		struct attach_thread_entry *entry;
+		int status;
+		pid_t pid;
+		u64 phase_start_us;
+
+		phase_start_us = restore_tail_now_us();
+		pid = wait4(-1, &status, __WALL, NULL);
+		if (pid == -1) {
+			pr_perror("wait4 failed");
+			goto err;
+		}
+		wait_us += restore_tail_now_us() - phase_start_us;
+
+		entry = find_attach_thread_entry(entries, nr_entries, pid);
+		if (!entry) {
+			pr_err("Unexpected attach stop from %d\n", pid);
+			goto err;
+		}
+
+		phase_start_us = restore_tail_now_us();
+		if (ptrace(PTRACE_SETOPTIONS, pid, NULL, PTRACE_O_TRACESYSGOOD)) {
+			pr_perror("Unable to set PTRACE_O_TRACESYSGOOD for %d", pid);
+			goto err;
+		}
+		setoptions_us += restore_tail_now_us() - phase_start_us;
+		/* Only restore regs for image threads; workers have no core */
+		phase_start_us = restore_tail_now_us();
+		if (entry->thread_index < entry->item->nr_threads_image &&
+		    arch_ptrace_restore(pid, entry->item))
+			goto err;
+		restore_regs_us += restore_tail_now_us() - phase_start_us;
+		/*
+		 * Suspend seccomp if necessary. We need to do this because
+		 * although seccomp is restored at the very end of the
+		 * restorer blob (and the final sigreturn is ok), here we're
+		 * doing an munmap in the process, which may be blocked by
+		 * seccomp and cause the task to be killed.
+		 */
+		phase_start_us = restore_tail_now_us();
+		if (rsti(entry->item)->has_seccomp && ptrace_suspend_seccomp(pid) < 0)
+			pr_err("failed to suspend seccomp, restore will probably fail...\n");
+		seccomp_us += restore_tail_now_us() - phase_start_us;
+
+		phase_start_us = restore_tail_now_us();
+		if (ptrace(PTRACE_CONT, pid, NULL, NULL)) {
+			pr_perror("Unable to resume %d", pid);
+			goto err;
+		}
+		cont_us += restore_tail_now_us() - phase_start_us;
+
+		*entry = entries[nr_entries - 1];
+		nr_entries--;
 	}
 
 	pr_info("Restore attach summary tasks=%llu threads=%llu parse=%llu ms seize=%llu ms interrupt=%llu ms wait=%llu ms setopts=%llu ms restore-regs=%llu ms seccomp=%llu ms cont=%llu ms total=%llu ms\n",
@@ -2017,7 +2081,12 @@ static int attach_to_tasks(bool root_seized)
 		(unsigned long long)(seccomp_us / 1000ULL),
 		(unsigned long long)(cont_us / 1000ULL),
 		(unsigned long long)((restore_tail_now_us() - total_start_us) / 1000ULL));
+	xfree(entries);
 	return 0;
+
+err:
+	xfree(entries);
+	return -1;
 }
 
 static int restore_rseq_cs(void)
@@ -2303,6 +2372,7 @@ static int restore_root_task(struct pstree_item *init)
 	int root_seized = 0;
 	struct pstree_item *item;
 	struct restore_tail_stats tail_stats = {};
+	u64 pre_attach_start_us;
 	u64 step_start_us;
 
 	ret = run_scripts(ACT_PRE_RESTORE);
@@ -2464,27 +2534,37 @@ skip_ns_bouncing:
 	if (ret < 0)
 		goto out_kill;
 
+	pre_attach_start_us = restore_tail_now_us();
 	step_start_us = restore_tail_now_us();
 	ret = stop_usernsd();
+	tail_stats.pre_attach.stop_usernsd_us = restore_tail_now_us() - step_start_us;
 	if (ret < 0)
 		goto out_kill;
 
+	step_start_us = restore_tail_now_us();
 	ret = stop_cgroupd();
+	tail_stats.pre_attach.stop_cgroupd_us = restore_tail_now_us() - step_start_us;
 	if (ret < 0)
 		goto out_kill;
 
+	step_start_us = restore_tail_now_us();
 	ret = move_veth_to_bridge();
+	tail_stats.pre_attach.move_veth_us = restore_tail_now_us() - step_start_us;
 	if (ret < 0)
 		goto out_kill;
 
+	step_start_us = restore_tail_now_us();
 	ret = prepare_cgroup_properties();
+	tail_stats.pre_attach.prepare_cgroup_properties_us = restore_tail_now_us() - step_start_us;
 	if (ret < 0)
 		goto out_kill;
 
 	if (fault_injected(FI_POST_RESTORE))
 		goto out_kill;
 
+	step_start_us = restore_tail_now_us();
 	ret = run_scripts(ACT_POST_RESTORE);
+	tail_stats.pre_attach.post_restore_scripts_us = restore_tail_now_us() - step_start_us;
 	if (ret != 0) {
 		pr_err("Aborting restore due to post-restore script ret code %d\n", ret);
 		timing_stop(TIME_RESTORE);
@@ -2496,23 +2576,42 @@ skip_ns_bouncing:
 	 * There is no need to call try_clean_remaps() after this point,
 	 * as restore went OK and all ghosts were removed by the openers.
 	 */
+	step_start_us = restore_tail_now_us();
 	if (depopulate_roots_yard(mnt_ns_fd, false))
 		goto out_kill;
+	tail_stats.pre_attach.depopulate_roots_yard_us = restore_tail_now_us() - step_start_us;
 
 	close_safe(&mnt_ns_fd);
 
+	step_start_us = restore_tail_now_us();
 	if (write_restored_pid())
 		goto out_kill;
+	tail_stats.pre_attach.write_restored_pid_us = restore_tail_now_us() - step_start_us;
 
 	/* Unlock network before disabling repair mode on sockets */
+	step_start_us = restore_tail_now_us();
 	network_unlock();
+	tail_stats.pre_attach.network_unlock_us = restore_tail_now_us() - step_start_us;
 
 	/*
 	 * Stop getting sigchld, after we resume the tasks they
 	 * may start to exit poking criu in vain.
 	 */
+	step_start_us = restore_tail_now_us();
 	ignore_kids();
-	tail_stats.pre_attach_orchestration_us = restore_tail_now_us() - step_start_us;
+	tail_stats.pre_attach.ignore_kids_us = restore_tail_now_us() - step_start_us;
+	tail_stats.pre_attach_orchestration_us = restore_tail_now_us() - pre_attach_start_us;
+	pr_info("Restore pre-attach summary usernsd=%llu ms cgroupd=%llu ms move-veth=%llu ms prep-cgroup=%llu ms post-restore-scripts=%llu ms depopulate-roots=%llu ms write-pid=%llu ms network-unlock=%llu ms ignore-kids=%llu ms total=%llu ms\n",
+		(unsigned long long)(tail_stats.pre_attach.stop_usernsd_us / 1000ULL),
+		(unsigned long long)(tail_stats.pre_attach.stop_cgroupd_us / 1000ULL),
+		(unsigned long long)(tail_stats.pre_attach.move_veth_us / 1000ULL),
+		(unsigned long long)(tail_stats.pre_attach.prepare_cgroup_properties_us / 1000ULL),
+		(unsigned long long)(tail_stats.pre_attach.post_restore_scripts_us / 1000ULL),
+		(unsigned long long)(tail_stats.pre_attach.depopulate_roots_yard_us / 1000ULL),
+		(unsigned long long)(tail_stats.pre_attach.write_restored_pid_us / 1000ULL),
+		(unsigned long long)(tail_stats.pre_attach.network_unlock_us / 1000ULL),
+		(unsigned long long)(tail_stats.pre_attach.ignore_kids_us / 1000ULL),
+		(unsigned long long)(tail_stats.pre_attach_orchestration_us / 1000ULL));
 
 	/*
 	 * -------------------------------------------------------------
