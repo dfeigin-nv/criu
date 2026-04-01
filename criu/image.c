@@ -19,6 +19,11 @@
 #include "proc_parse.h"
 #include "img-streamer.h"
 #include "namespaces.h"
+#include "fs-magic.h"
+
+#define COMPACT_PAGES_COMMIT_FILE "pages-dedup.ready"
+#define CIFS_SUPER_MAGIC 0xFF534D42
+#define SMB2_SUPER_MAGIC 0x517B
 
 bool ns_per_id = false;
 bool img_common_magic = true;
@@ -599,14 +604,41 @@ static int userns_openat(void *arg, int dfd, int pid)
 	return ret;
 }
 
+static bool image_direct_io_should_fallback(int fd, const char *path)
+{
+	struct statfs st;
+
+	if (fstatfs(fd, &st) < 0)
+		return false;
+
+	switch ((unsigned long)st.f_type) {
+	case NFS_SUPER_MAGIC:
+	case CIFS_SUPER_MAGIC:
+	case SMB2_SUPER_MAGIC:
+		pr_info("O_DIRECT disabled for %s on remote fs type 0x%lx\n", path, (unsigned long)st.f_type);
+		return true;
+	default:
+		return false;
+	}
+}
+
 static int do_open_image(struct cr_img *img, int dfd, int type, unsigned long oflags, char *path)
 {
-	int ret, flags;
+	int ret, flags, open_flags;
+	bool try_direct_open;
 
-	flags = oflags & ~(O_NOBUF | O_SERVICE | O_FORCE_LOCAL);
+	flags = oflags & ~(O_NOBUF | O_SERVICE | O_FORCE_LOCAL | O_TRY_DIRECT_OPEN);
+	open_flags = flags;
+	try_direct_open = oflags & O_TRY_DIRECT_OPEN;
+	if (try_direct_open && (flags == O_RDONLY || flags == O_RDWR) && type == CR_FD_PAGES_BLOB) {
+		pr_info("O_DIRECT disabled for compact page blob %s\n", path);
+		try_direct_open = false;
+	}
+	if (try_direct_open && !opts.stream)
+		open_flags |= O_DIRECT;
 
 	if (opts.stream && !(oflags & O_FORCE_LOCAL)) {
-		ret = img_streamer_open(path, flags);
+		ret = img_streamer_open(path, open_flags);
 		errno = EIO; /* errno value is meaningless, only the ret value is meaningful */
 	} else if (root_ns_mask & CLONE_NEWUSER && type == CR_FD_PAGES && oflags & O_RDWR) {
 		/*
@@ -615,7 +647,7 @@ static int do_open_image(struct cr_img *img, int dfd, int type, unsigned long of
 		 * usernsd to do it for us
 		 */
 		struct openat_args pa = {
-			.flags = flags,
+			.flags = open_flags,
 			.err = 0,
 			.mode = CR_FD_PERM,
 		};
@@ -624,7 +656,29 @@ static int do_open_image(struct cr_img *img, int dfd, int type, unsigned long of
 		if (ret < 0)
 			errno = pa.err;
 	} else
-		ret = openat(dfd, path, flags, CR_FD_PERM);
+		ret = openat(dfd, path, open_flags, CR_FD_PERM);
+
+	if (ret < 0 && try_direct_open && !opts.stream &&
+	    (errno == EINVAL || errno == EOPNOTSUPP || errno == ENOTSUP || errno == EISDIR || errno == EPERM)) {
+		pr_info("O_DIRECT open rejected for %s, retrying buffered I/O\n", path);
+
+		if (opts.stream && !(oflags & O_FORCE_LOCAL)) {
+			ret = img_streamer_open(path, flags);
+			errno = EIO; /* errno value is meaningless, only the ret value is meaningful */
+		} else if (root_ns_mask & CLONE_NEWUSER && type == CR_FD_PAGES && oflags & O_RDWR) {
+			struct openat_args pa = {
+				.flags = flags,
+				.err = 0,
+				.mode = CR_FD_PERM,
+			};
+			snprintf(pa.path, PATH_MAX, "%s", path);
+			ret = userns_call(userns_openat, UNS_FDOUT, &pa, sizeof(struct openat_args), dfd);
+			if (ret < 0)
+				errno = pa.err;
+		} else {
+			ret = openat(dfd, path, flags, CR_FD_PERM);
+		}
+	}
 	if (ret < 0) {
 		if (!(flags & O_CREAT) && (errno == ENOENT || ret == -ENOENT)) {
 			pr_info("No %s image\n", path);
@@ -637,6 +691,17 @@ static int do_open_image(struct cr_img *img, int dfd, int type, unsigned long of
 	}
 
 	img->_x.fd = ret;
+	if (try_direct_open && !opts.stream && image_direct_io_should_fallback(img->_x.fd, path)) {
+		close(img->_x.fd);
+		img->_x.fd = -1;
+		try_direct_open = false;
+		ret = openat(dfd, path, flags, CR_FD_PERM);
+		if (ret < 0) {
+			pr_perror("Unable to reopen %s without O_DIRECT", path);
+			goto err;
+		}
+		img->_x.fd = ret;
+	}
 	if (oflags & O_NOBUF)
 		bfd_setraw(&img->_x);
 	else {
@@ -804,20 +869,136 @@ void up_page_ids_base(void)
 	page_ids += 0x10000;
 }
 
-struct cr_img *open_pages_image_at(int dfd, unsigned long flags, struct cr_img *pmi, u32 *id)
+static bool page_index_exists(int dfd, u32 pages_id)
 {
-	if (flags == O_RDONLY || flags == O_RDWR) {
+	bool exists;
+	struct cr_img *index = open_image_at(dfd, CR_FD_PAGE_INDEX, O_RSTR, pages_id);
+
+	if (!index)
+		return false;
+
+	exists = !empty_image(index);
+	close_image(index);
+	return exists;
+}
+
+static bool raw_pages_exist(int dfd, u32 pages_id)
+{
+	bool exists;
+	struct cr_img *pages = open_image_at(dfd, CR_FD_PAGES, O_RSTR, pages_id);
+
+	if (!pages)
+		return false;
+
+	exists = !empty_image(pages);
+	close_image(pages);
+	return exists;
+}
+
+static bool pages_blob_exists(int dfd)
+{
+	bool exists;
+	struct cr_img *blob = open_image_at(dfd, CR_FD_PAGES_BLOB, O_RSTR);
+
+	if (!blob)
+		return false;
+
+	exists = !empty_image(blob);
+	close_image(blob);
+	return exists;
+}
+
+bool compact_pages_committed(int dfd, u32 pages_id)
+{
+	struct stat st;
+
+	if (fstatat(dfd, COMPACT_PAGES_COMMIT_FILE, &st, 0)) {
+		if (errno != ENOENT)
+			pr_perror("Can't stat compact pages commit marker");
+		return false;
+	}
+
+	return page_index_exists(dfd, pages_id) && pages_blob_exists(dfd);
+}
+
+bool compact_pages_ready(int dfd, u32 pages_id)
+{
+	return compact_pages_committed(dfd, pages_id) && !raw_pages_exist(dfd, pages_id);
+}
+
+int clear_compact_pages_commit(int dfd)
+{
+	if (!unlinkat(dfd, COMPACT_PAGES_COMMIT_FILE, 0))
+		return 0;
+	if (errno == ENOENT)
+		return 0;
+
+	pr_perror("Can't remove compact pages commit marker");
+	return -1;
+}
+
+int mark_compact_pages_commit(int dfd)
+{
+	int fd = openat(dfd, COMPACT_PAGES_COMMIT_FILE, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+
+	if (fd < 0) {
+		pr_perror("Can't create compact pages commit marker");
+		return -1;
+	}
+
+	if (write(fd, "1\n", 2) != 2) {
+		pr_perror("Can't write compact pages commit marker");
+		close(fd);
+		return -1;
+	}
+
+	if (close(fd)) {
+		pr_perror("Can't close compact pages commit marker");
+		return -1;
+	}
+
+	return 0;
+}
+
+static int open_pages_image_id(unsigned long flags, struct cr_img *pmi, u32 *id)
+{
+	unsigned long io_flags = flags & ~O_TRY_DIRECT_OPEN;
+
+	if (io_flags == O_RDONLY || io_flags == O_RDWR) {
 		PagemapHead *h;
+
 		if (pb_read_one(pmi, &h, PB_PAGEMAP_HEAD) < 0)
-			return NULL;
+			return -1;
 		*id = h->pages_id;
 		pagemap_head__free_unpacked(h, NULL);
 	} else {
 		PagemapHead h = PAGEMAP_HEAD__INIT;
+
 		*id = h.pages_id = page_ids++;
 		if (pb_write_one(pmi, &h, PB_PAGEMAP_HEAD) < 0)
-			return NULL;
+			return -1;
 	}
+
+	return 0;
+}
+
+struct cr_img *open_raw_pages_image_at(int dfd, unsigned long flags, struct cr_img *pmi, u32 *id)
+{
+	if (open_pages_image_id(flags, pmi, id))
+		return NULL;
+
+	return open_image_at(dfd, CR_FD_PAGES, flags, *id);
+}
+
+struct cr_img *open_pages_image_at(int dfd, unsigned long flags, struct cr_img *pmi, u32 *id)
+{
+	unsigned long io_flags = flags & ~O_TRY_DIRECT_OPEN;
+
+	if (open_pages_image_id(flags, pmi, id))
+		return NULL;
+
+	if ((io_flags == O_RDONLY || io_flags == O_RDWR) && compact_pages_ready(dfd, *id))
+		return open_image_at(dfd, CR_FD_PAGES_BLOB, O_RSTR | (flags & O_TRY_DIRECT_OPEN));
 
 	return open_image_at(dfd, CR_FD_PAGES, flags, *id);
 }

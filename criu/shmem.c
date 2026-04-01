@@ -1,8 +1,10 @@
 #include <unistd.h>
 #include <sys/mman.h>
+#include <sys/time.h>
 #include <stdlib.h>
 #include <fcntl.h>
 #include <stdbool.h>
+#include <errno.h>
 
 #include "common/config.h"
 #include "common/list.h"
@@ -472,6 +474,11 @@ static int shmem_wait_and_open(struct shmem_info *si, VmaEntry *vi)
 static int shmem_restore_async(struct page_read *pr, void *addr, unsigned long size)
 {
 	int ret = 0;
+	unsigned long pagemap_entries = 0;
+	unsigned long restored_pages = 0;
+	struct timeval tv0, tv1, tv2;
+
+	gettimeofday(&tv0, NULL);
 
 	while (1) {
 		unsigned long vaddr;
@@ -490,6 +497,8 @@ static int shmem_restore_async(struct page_read *pr, void *addr, unsigned long s
 			return -1;
 		}
 
+		pagemap_entries++;
+		restored_pages += nr_pages;
 		ret = pr->read_pages(pr, vaddr, nr_pages, addr + vaddr, PR_ASYNC);
 		if (ret < 0) {
 			pr->sync(pr); /* drain async queue before close */
@@ -502,7 +511,14 @@ static int shmem_restore_async(struct page_read *pr, void *addr, unsigned long s
 		return -1;
 	}
 
-	return pr->sync(pr);
+	gettimeofday(&tv1, NULL);
+	ret = pr->sync(pr);
+	gettimeofday(&tv2, NULL);
+	pr_info("shmem async restore entries=%lu pages=%lu queue=%lu ms sync=%lu ms\n",
+		pagemap_entries, restored_pages,
+		(unsigned long)((tv1.tv_sec - tv0.tv_sec) * 1000 + (tv1.tv_usec - tv0.tv_usec) / 1000),
+		(unsigned long)((tv2.tv_sec - tv1.tv_sec) * 1000 + (tv2.tv_usec - tv1.tv_usec) / 1000));
+	return ret;
 }
 
 static int do_restore_shmem_content_ex(void *addr, unsigned long size, unsigned long shmid)
@@ -516,6 +532,11 @@ static int do_restore_shmem_content_ex(void *addr, unsigned long size, unsigned 
 	if (!ret)
 		return 0;
 
+	/*
+	 * SysV/memfd restore recreates a fresh zeroed backing object before replay.
+	 * Keep compact zero pages demand-zero instead of materializing them here.
+	 */
+	pr.zero_skip = true;
 	ret = shmem_restore_async(&pr, addr, size);
 	pr.close(&pr);
 	return ret;
@@ -527,10 +548,12 @@ static int restore_memfd_shmem_content_ex(int fd, unsigned long shmid, unsigned 
 	unsigned long aligned_size = round_up(size, PAGE_SIZE);
 	int ret = 0;
 	struct page_read pr;
+	struct timeval tv0, tv1;
 
 	if (!size)
 		return 0;
 
+	gettimeofday(&tv0, NULL);
 	ret = open_page_read(shmid, &pr, PR_SHMEM);
 	if (ret < 0)
 		return -1;
@@ -550,11 +573,20 @@ static int restore_memfd_shmem_content_ex(int fd, unsigned long shmid, unsigned 
 		return -1;
 	}
 
+	/*
+	 * This mapping is backed by a freshly created/truncated memfd, so skipped
+	 * zero pages retain the correct zero contents.
+	 */
+	pr.zero_skip = true;
 	ret = shmem_restore_async(&pr, addr, aligned_size);
 	pr.close(&pr);
 
 	if (munmap(addr, size))
 		pr_perror("munmap failed for shmem 0x%lx", shmid);
+
+	gettimeofday(&tv1, NULL);
+	pr_info("memfd shmem restore 0x%lx size=%lu took %lu ms\n", shmid, size,
+		(unsigned long)((tv1.tv_sec - tv0.tv_sec) * 1000 + (tv1.tv_usec - tv0.tv_usec) / 1000));
 
 	return ret;
 }

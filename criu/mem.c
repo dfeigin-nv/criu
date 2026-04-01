@@ -1,6 +1,8 @@
 #include <unistd.h>
 #include <stdio.h>
+#include <pthread.h>
 #include <sys/mman.h>
+#include <sys/time.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <sys/syscall.h>
@@ -37,6 +39,12 @@
 
 #include "protobuf.h"
 #include "images/pagemap.pb-c.h"
+
+/*
+ * Batch inherited COW page reads so compact restore can amortize indexed
+ * lookup and preadv overhead.
+ */
+#define COW_COMPARE_BATCH_PAGES 1024
 
 static int task_reset_dirty_track(int pid)
 {
@@ -373,6 +381,193 @@ static int xfer_pages(struct page_pipe *pp, struct page_xfer *xfer)
 	return ret;
 }
 
+struct dump_xfer_pipeline {
+	struct page_pipe *pp;
+	struct page_xfer *xfer;
+	pthread_t thread;
+	pthread_mutex_t lock;
+	pthread_cond_t ready;
+	pthread_cond_t space;
+	struct page_pipe_buf *queue[NR_PIPES_PER_CHUNK];
+	unsigned int cur_hole;
+	unsigned int head;
+	unsigned int tail;
+	unsigned int nr_ready;
+	bool stop;
+	bool failed;
+	u64 start_us;
+	u64 drain_us;
+	u64 enqueue_wait_us;
+	u64 consumer_wait_us;
+	u64 xfer_us;
+};
+
+static u64 mem_now_us(void)
+{
+	struct timeval tv;
+
+	gettimeofday(&tv, NULL);
+	return (u64)tv.tv_sec * 1000000ULL + (u64)tv.tv_usec;
+}
+
+static void *dump_xfer_pipeline_main(void *arg)
+{
+	struct dump_xfer_pipeline *pipe = arg;
+
+	for (;;) {
+		struct page_pipe_buf *ppb;
+		u64 step_start_us;
+
+		step_start_us = mem_now_us();
+		pthread_mutex_lock(&pipe->lock);
+		while (pipe->nr_ready == 0 && !pipe->stop && !pipe->failed)
+			pthread_cond_wait(&pipe->ready, &pipe->lock);
+		pipe->consumer_wait_us += mem_now_us() - step_start_us;
+
+		if (pipe->failed || (pipe->stop && pipe->nr_ready == 0)) {
+			pthread_mutex_unlock(&pipe->lock);
+			break;
+		}
+
+		ppb = pipe->queue[pipe->head];
+		pipe->head = (pipe->head + 1) % NR_PIPES_PER_CHUNK;
+		pipe->nr_ready--;
+		pthread_cond_signal(&pipe->space);
+		pthread_mutex_unlock(&pipe->lock);
+
+		step_start_us = mem_now_us();
+		if (page_xfer_dump_pages_ppb(pipe->xfer, pipe->pp, ppb, &pipe->cur_hole)) {
+			pthread_mutex_lock(&pipe->lock);
+			pipe->failed = true;
+			pthread_cond_broadcast(&pipe->space);
+			pthread_cond_broadcast(&pipe->ready);
+			pthread_mutex_unlock(&pipe->lock);
+			return NULL;
+		}
+		pipe->xfer_us += mem_now_us() - step_start_us;
+	}
+
+	if (!pipe->failed) {
+		u64 step_start_us = mem_now_us();
+
+		if (page_xfer_dump_pages_finish(pipe->xfer, pipe->pp, &pipe->cur_hole)) {
+			pthread_mutex_lock(&pipe->lock);
+			pipe->failed = true;
+			pthread_mutex_unlock(&pipe->lock);
+			return NULL;
+		}
+		pipe->xfer_us += mem_now_us() - step_start_us;
+	}
+
+	return NULL;
+}
+
+static int drain_xfer_pages_pipelined(struct page_pipe *pp, struct parasite_ctl *ctl, struct parasite_dump_pages_args *args,
+				      struct page_xfer *xfer)
+{
+	struct dump_xfer_pipeline pipe = {
+		.pp = pp,
+		.xfer = xfer,
+		.start_us = mem_now_us(),
+	};
+	struct page_pipe_buf *ppb;
+	int ret = -1;
+
+	pthread_mutex_init(&pipe.lock, NULL);
+	pthread_cond_init(&pipe.ready, NULL);
+	pthread_cond_init(&pipe.space, NULL);
+
+	if (pthread_create(&pipe.thread, NULL, dump_xfer_pipeline_main, &pipe) != 0) {
+		pr_err("pthread_create failed for dump xfer pipeline\n");
+		goto out_sync;
+	}
+
+	timing_start(TIME_MEMWRITE);
+	list_for_each_entry(ppb, &pp->bufs, l) {
+		u64 drain_start_us;
+		u64 step_start_us = mem_now_us();
+
+		args->nr_segs = ppb->nr_segs;
+		args->nr_pages = ppb->pages_in;
+		pr_debug("PPB: %ld pages %d segs %u pipe %d off\n", args->nr_pages, args->nr_segs, ppb->pipe_size, args->off);
+
+		pthread_mutex_lock(&pipe.lock);
+		while (pipe.nr_ready == NR_PIPES_PER_CHUNK && !pipe.failed)
+			pthread_cond_wait(&pipe.space, &pipe.lock);
+		pipe.enqueue_wait_us += mem_now_us() - step_start_us;
+		if (pipe.failed) {
+			pthread_mutex_unlock(&pipe.lock);
+			goto out_thread;
+		}
+		pthread_mutex_unlock(&pipe.lock);
+
+		drain_start_us = mem_now_us();
+		if (compel_rpc_call(PARASITE_CMD_DUMPPAGES, ctl) < 0)
+			goto out_thread;
+		if (compel_util_send_fd(ctl, ppb->p[1]))
+			goto out_thread;
+
+		/*
+		 * Publish the buffer before waiting for the parasite sync so the
+		 * xfer thread can start consuming the same ppb while the parasite
+		 * finishes dumping it.
+		 */
+		pthread_mutex_lock(&pipe.lock);
+		if (pipe.failed) {
+			pthread_mutex_unlock(&pipe.lock);
+			goto out_thread;
+		}
+		pipe.queue[pipe.tail] = ppb;
+		pipe.tail = (pipe.tail + 1) % NR_PIPES_PER_CHUNK;
+		pipe.nr_ready++;
+		pthread_cond_signal(&pipe.ready);
+		pthread_mutex_unlock(&pipe.lock);
+
+		if (compel_rpc_sync(PARASITE_CMD_DUMPPAGES, ctl) < 0)
+			goto out_thread;
+		pthread_mutex_lock(&pipe.lock);
+		if (pipe.failed) {
+			pthread_mutex_unlock(&pipe.lock);
+			goto out_thread;
+		}
+		pthread_mutex_unlock(&pipe.lock);
+		pipe.drain_us += mem_now_us() - drain_start_us;
+		args->off += args->nr_segs;
+	}
+
+	ret = 0;
+
+out_thread:
+	pthread_mutex_lock(&pipe.lock);
+	pipe.stop = true;
+	if (ret)
+		pipe.failed = true;
+	pthread_cond_broadcast(&pipe.ready);
+	pthread_cond_broadcast(&pipe.space);
+	pthread_mutex_unlock(&pipe.lock);
+
+	pthread_join(pipe.thread, NULL);
+	timing_stop(TIME_MEMWRITE);
+	if (ret == 0 && pipe.failed)
+		ret = -1;
+
+	if (ret == 0) {
+		u64 wall_us = mem_now_us() - pipe.start_us;
+
+		pr_info("Dump xfer pipeline: wall=%llu ms drain=%llu ms enqueue_wait=%llu ms consumer_wait=%llu ms xfer=%llu ms bufs=%u compact=1\n",
+			(unsigned long long)(wall_us / 1000ULL), (unsigned long long)(pipe.drain_us / 1000ULL),
+			(unsigned long long)(pipe.enqueue_wait_us / 1000ULL),
+			(unsigned long long)(pipe.consumer_wait_us / 1000ULL),
+			(unsigned long long)(pipe.xfer_us / 1000ULL), pp->nr_pipes);
+	}
+
+out_sync:
+	pthread_cond_destroy(&pipe.space);
+	pthread_cond_destroy(&pipe.ready);
+	pthread_mutex_destroy(&pipe.lock);
+	return ret;
+}
+
 static int detect_pid_reuse(struct pstree_item *item, struct proc_pid_stat *pps, InventoryEntry *parent_ie)
 {
 	unsigned long long dump_ticks;
@@ -621,10 +816,12 @@ static int __parasite_dump_pages_seized(struct pstree_item *item, struct parasit
 	 */
 	if (mdc->pre_dump && opts.pre_dump_mode == PRE_DUMP_READ)
 		ret = 0;
+	else if (!mdc->pre_dump && xfer.compact && (pp->flags & PP_CHUNK_MODE))
+		ret = drain_xfer_pages_pipelined(pp, ctl, args, &xfer);
 	else
 		ret = drain_pages(pp, ctl, args);
 
-	if (!ret && !mdc->pre_dump)
+	if (!ret && !mdc->pre_dump && !xfer.compact)
 		ret = xfer_pages(pp, &xfer);
 	if (ret)
 		goto out_xfer;
@@ -791,8 +988,6 @@ int prepare_mm_pid(struct pstree_item *i)
 				ri->vmas.rst_priv_size += PAGE_SIZE;
 		}
 
-		pr_info("vma 0x%" PRIx64 " 0x%" PRIx64 "\n", vma->e->start, vma->e->end);
-
 		if (vma_area_is(vma, VMA_ANON_SHARED))
 			ret = collect_shmem(pid, vma);
 		else if (vma_area_is(vma, VMA_FILE_PRIVATE) || vma_area_is(vma, VMA_FILE_SHARED))
@@ -838,13 +1033,17 @@ static inline bool check_cow_vmas(struct vma_area *vma, struct vma_area *pvma)
 	if (!(vma->e->flags & MAP_ANONYMOUS) && vma->e->shmid != pvma->e->shmid)
 		return false;
 
-	pr_debug("Found two COW VMAs @0x%" PRIx64 "-0x%" PRIx64 "\n", vma->e->start, pvma->e->end);
 	return true;
 }
 
 static inline bool vma_inherited(struct vma_area *vma)
 {
 	return (vma->pvma != NULL && vma->pvma != VMA_COW_ROOT);
+}
+
+static inline bool vma_zero_skip_restore(struct vma_area *vma)
+{
+	return vma_area_is(vma, VMA_ANON_PRIVATE) && !vma_inherited(vma);
 }
 
 static void prepare_cow_vmas_for(struct vm_area_list *vmas, struct vm_area_list *pvmas)
@@ -1124,6 +1323,7 @@ static int restore_priv_vma_content(struct pstree_item *t, struct page_read *pr)
 	int ret = 0;
 	struct list_head *vmas = &rsti(t)->vmas.h;
 	struct list_head *vma_io = &rsti(t)->vma_io;
+	unsigned char *cow_buf = xmalloc(COW_COMPARE_BATCH_PAGES * PAGE_SIZE);
 
 	unsigned int nr_restored = 0;
 	unsigned int nr_shared = 0;
@@ -1131,8 +1331,14 @@ static int restore_priv_vma_content(struct pstree_item *t, struct page_read *pr)
 	unsigned int nr_compared = 0;
 	unsigned int nr_enqueued = 0;
 	unsigned int nr_lazy = 0;
+	unsigned int nr_cow_batches = 0;
 	unsigned long va;
+	struct timeval cow_tv0, cow_tv1;
 
+	if (!cow_buf)
+		return -1;
+
+	gettimeofday(&cow_tv0, NULL);
 	vma = list_first_entry(vmas, struct vma_area, list);
 	rsti(t)->pages_img_id = pr->pages_img_id;
 
@@ -1161,7 +1367,6 @@ static int restore_priv_vma_content(struct pstree_item *t, struct page_read *pr)
 		}
 
 		for (i = 0; i < nr_pages; i++) {
-			unsigned char buf[PAGE_SIZE];
 			void *p;
 
 			/*
@@ -1196,10 +1401,12 @@ static int restore_priv_vma_content(struct pstree_item *t, struct page_read *pr)
 					BUG();
 				}
 
+				pr->zero_skip = vma_zero_skip_restore(vma);
 				if (pagemap_enqueue_iovec(pr, (void *)va, len, vma_io))
 					return -1;
 
 				pr->skip_pages(pr, len);
+				pr->zero_skip = false;
 
 				va += len;
 				len >>= PAGE_SHIFT;
@@ -1219,22 +1426,36 @@ static int restore_priv_vma_content(struct pstree_item *t, struct page_read *pr)
 
 			set_bit(off, vma->page_bitmap);
 			if (vma_inherited(vma)) {
+				unsigned long batch = min_t(unsigned long, nr_pages - i, COW_COMPARE_BATCH_PAGES);
+				unsigned long j;
+
+				batch = min_t(unsigned long, batch, (vma->e->end - va) / PAGE_SIZE);
 				clear_bit(off, vma->pvma->page_bitmap);
 
-				ret = pr->read_pages(pr, va, 1, buf, 0);
+				ret = pr->read_pages(pr, va, batch, cow_buf, 0);
 				if (ret < 0)
 					goto err_read;
 
-				va += PAGE_SIZE;
-				nr_compared++;
+				nr_cow_batches++;
+				for (j = 0; j < batch; j++) {
+					void *curr_p = decode_pointer((off + j) * PAGE_SIZE + vma->premmaped_addr);
+					void *curr_buf = cow_buf + j * PAGE_SIZE;
 
-				if (memcmp(p, buf, PAGE_SIZE) == 0) {
-					nr_shared++; /* the page is cowed */
-					continue;
+					set_bit(off + j, vma->page_bitmap);
+					clear_bit(off + j, vma->pvma->page_bitmap);
+					nr_compared++;
+
+					if (memcmp(curr_p, curr_buf, PAGE_SIZE) == 0) {
+						nr_shared++; /* the page is cowed */
+						continue;
+					}
+
+					nr_restored++;
+					memcpy(curr_p, curr_buf, PAGE_SIZE);
 				}
 
-				nr_restored++;
-				memcpy(p, buf, PAGE_SIZE);
+				va += batch * PAGE_SIZE;
+				i += batch - 1;
 			} else {
 				int nr;
 
@@ -1249,7 +1470,9 @@ static int restore_priv_vma_content(struct pstree_item *t, struct page_read *pr)
 
 				nr = min_t(int, nr_pages - i, (vma->e->end - va) / PAGE_SIZE);
 
+				pr->zero_skip = vma_zero_skip_restore(vma);
 				ret = pr->read_pages(pr, va, nr, p, PR_ASYNC);
+				pr->zero_skip = false;
 				if (ret < 0)
 					goto err_read;
 
@@ -1263,12 +1486,14 @@ static int restore_priv_vma_content(struct pstree_item *t, struct page_read *pr)
 	}
 
 err_read:
-	if (pr->sync(pr))
-		return -1;
+	if (pr->sync(pr)) {
+		ret = -1;
+		goto out;
+	}
 
 	pr->close(pr);
 	if (ret < 0)
-		return ret;
+		goto out;
 
 	/* Remove pages, which were not shared with a child */
 	list_for_each_entry(vma, vmas, list) {
@@ -1308,12 +1533,19 @@ err_read:
 	pr_info("nr_dropped_pages:  %d\n", nr_dropped);
 	pr_info("nr_enqueued:       %d\n", nr_enqueued);
 	pr_info("nr_lazy:           %d\n", nr_lazy);
+	gettimeofday(&cow_tv1, NULL);
+	pr_info("restore_priv_vma_content %lu ms (%u compared, %u shared, %u restored, %u cow batches)\n",
+		(unsigned long)((cow_tv1.tv_sec - cow_tv0.tv_sec) * 1000 + (cow_tv1.tv_usec - cow_tv0.tv_usec) / 1000),
+		nr_compared, nr_shared, nr_restored, nr_cow_batches);
 
-	return 0;
+out:
+	xfree(cow_buf);
+	return ret;
 
 err_addr:
 	pr_err("Page entry address %lx outside of VMA %lx-%lx\n", va, (long)vma->e->start, (long)vma->e->end);
-	return -1;
+	ret = -1;
+	goto err_read;
 }
 
 static int maybe_disable_thp(struct pstree_item *t, struct page_read *pr)
@@ -1461,7 +1693,7 @@ struct open_vma_unique {
 	bool is_memfd;
 };
 
-#define OPEN_VMAS_MEMFD_WORKERS_MAX 8
+#define OPEN_VMAS_MEMFD_WORKERS_MAX 32
 
 struct memfd_open_plan {
 	struct open_vma_unique **jobs;
@@ -1555,13 +1787,16 @@ static int memfd_open_parallel(struct open_vma_unique *unique, int nr_unique)
 	pthread_t workers[OPEN_VMAS_MEMFD_WORKERS_MAX];
 	long cpus;
 	int nr_jobs, nr_workers, i;
+	struct timeval tv0, tv1;
 
 	nr_jobs = memfd_open_jobs_collect(unique, nr_unique, &jobs);
 	if (nr_jobs < 0)
 		return -1;
 	if (nr_jobs <= 1) {
 		int ret = 0;
+		struct timeval tv0, tv1;
 
+		gettimeofday(&tv0, NULL);
 		if (nr_jobs == 1) {
 			int fd;
 
@@ -1574,6 +1809,10 @@ static int memfd_open_parallel(struct open_vma_unique *unique, int nr_unique)
 		}
 
 		xfree(jobs);
+		gettimeofday(&tv1, NULL);
+		if (nr_jobs == 1)
+			pr_info("open_vmas: restored %d unique memfd inode with 1 worker in %lu ms\n", nr_jobs,
+				(unsigned long)((tv1.tv_sec - tv0.tv_sec) * 1000 + (tv1.tv_usec - tv0.tv_usec) / 1000));
 		return ret;
 	}
 
@@ -1584,7 +1823,9 @@ static int memfd_open_parallel(struct open_vma_unique *unique, int nr_unique)
 	nr_workers = min_t(int, nr_workers, OPEN_VMAS_MEMFD_WORKERS_MAX);
 	if (nr_workers < 2) {
 		int ret = 0;
+		struct timeval tv0, tv1;
 
+		gettimeofday(&tv0, NULL);
 		for (i = 0; i < nr_jobs; i++) {
 			int fd;
 
@@ -1598,9 +1839,13 @@ static int memfd_open_parallel(struct open_vma_unique *unique, int nr_unique)
 		}
 
 		xfree(jobs);
+		gettimeofday(&tv1, NULL);
+		pr_info("open_vmas: restored %d unique memfd inodes with 1 worker in %lu ms\n", nr_jobs,
+			(unsigned long)((tv1.tv_sec - tv0.tv_sec) * 1000 + (tv1.tv_usec - tv0.tv_usec) / 1000));
 		return ret;
 	}
 
+	gettimeofday(&tv0, NULL);
 	memzero(&plan, sizeof(plan));
 	plan.jobs = jobs;
 	plan.nr_jobs = nr_jobs;
@@ -1641,6 +1886,9 @@ static int memfd_open_parallel(struct open_vma_unique *unique, int nr_unique)
 
 	pthread_mutex_destroy(&plan.lock);
 	xfree(jobs);
+	gettimeofday(&tv1, NULL);
+	pr_info("open_vmas: restored %d unique memfd inodes with %d workers in %lu ms\n", nr_jobs, nr_workers,
+		(unsigned long)((tv1.tv_sec - tv0.tv_sec) * 1000 + (tv1.tv_usec - tv0.tv_usec) / 1000));
 	return plan.ret;
 }
 
@@ -1695,14 +1943,17 @@ int open_vmas(struct pstree_item *t)
 	} *last_per_fd = NULL;
 	int nr_last = 0, cap_last = 0;
 	int i, ret = -1;
+	struct timeval tv0, tv1;
+	unsigned long collect_ms = 0;
+	unsigned long unique_open_ms = 0;
+	unsigned long assign_ms = 0;
+
+	gettimeofday(&tv0, NULL);
 
 	/* Phase 1: non-filemap VMAs (shmem, socket) + plugin; collect filemap + memfd for parallel open */
 	list_for_each_entry(vma, &vmas->h, list) {
 		if (!vma_area_is(vma, VMA_AREA_REGULAR) || !vma->vm_open)
 			continue;
-
-		pr_info("Opening %#016" PRIx64 "-%#016" PRIx64 " %#016" PRIx64 " (%x) vma\n", vma->e->start,
-			vma->e->end, vma->e->pgoff, vma->e->status);
 
 		if (vma_area_is(vma, VMA_FILE_PRIVATE) || vma_area_is(vma, VMA_FILE_SHARED)) {
 			bool is_plugin = !!(vma->e->status & VMA_EXT_PLUGIN);
@@ -1757,17 +2008,23 @@ int open_vmas(struct pstree_item *t)
 				vma->e->status |= VMA_CLOSE;
 		}
 	}
+	gettimeofday(&tv1, NULL);
+	collect_ms = (unsigned long)((tv1.tv_sec - tv0.tv_sec) * 1000 + (tv1.tv_usec - tv0.tv_usec) / 1000);
 
 	/* Phase 2: open unique files (AIO used for reads in restorer) */
 	if (nr_unique > 0)
 		pr_info("open_vmas: %d unique files, %d file-backed VMAs\n",
 			nr_unique, nr_parallel);
+	gettimeofday(&tv0, NULL);
 	if (open_vmas_unique_open(unique, nr_unique) < 0) {
 		pr_err("Open VMAs failed\n");
 		goto out;
 	}
+	gettimeofday(&tv1, NULL);
+	unique_open_ms = (unsigned long)((tv1.tv_sec - tv0.tv_sec) * 1000 + (tv1.tv_usec - tv0.tv_usec) / 1000);
 
 	/* Phase 3: assign fds to VMAs */
+	gettimeofday(&tv0, NULL);
 	for (i = 0; i < nr_parallel; i++) {
 		int j, fd;
 
@@ -1780,6 +2037,8 @@ int open_vmas(struct pstree_item *t)
 		fd = unique[j].fd;
 		vma->e->fd = fd;
 	}
+	gettimeofday(&tv1, NULL);
+	assign_ms = (unsigned long)((tv1.tv_sec - tv0.tv_sec) * 1000 + (tv1.tv_usec - tv0.tv_usec) / 1000);
 
 	/* Phase 4: in list order, track last VMA per fd; then set VMA_CLOSE on each */
 	list_for_each_entry(vma, &vmas->h, list) {
@@ -1813,6 +2072,9 @@ int open_vmas(struct pstree_item *t)
 	for (i = 0; i < nr_last; i++)
 		last_per_fd[i].vma->e->status |= VMA_CLOSE;
 
+	pr_info("open_vmas summary collect=%lu ms unique-open=%lu ms assign=%lu ms total=%lu ms\n",
+		collect_ms, unique_open_ms, assign_ms, collect_ms + unique_open_ms + assign_ms);
+
 	ret = 0;
 out:
 	xfree(unique);
@@ -1824,6 +2086,9 @@ out:
 static int prepare_vma_ios(struct pstree_item *t, struct task_restore_args *ta)
 {
 	struct cr_img *pages;
+	struct cr_img *index;
+	bool compact;
+	bool try_direct_open = true;
 
 	/*
 	 * We optimize the case when rsti(t)->vma_io is empty.
@@ -1839,49 +2104,50 @@ static int prepare_vma_ios(struct pstree_item *t, struct task_restore_args *ta)
 		return 0;
 	}
 
+	index = open_image(CR_FD_PAGE_INDEX, O_RSTR, rsti(t)->pages_img_id);
+	if (!index)
+		return -1;
+
+	compact = !empty_image(index);
+	close_image(index);
+
+reopen_pages:
 	/*
 	 * If auto-dedup is on we need RDWR mode to be able to punch holes in
 	 * the input files (in restorer.c)
 	 */
-	pages = open_image(CR_FD_PAGES, opts.auto_dedup ? O_RDWR : O_RSTR, rsti(t)->pages_img_id);
+	if (compact)
+		pages = open_image(CR_FD_PAGES_BLOB, O_RSTR | (try_direct_open ? O_TRY_DIRECT_OPEN : 0));
+	else
+		pages = open_image(CR_FD_PAGES,
+				   (opts.auto_dedup ? O_RDWR : O_RSTR) | (try_direct_open ? O_TRY_DIRECT_OPEN : 0),
+				   rsti(t)->pages_img_id);
 	if (!pages)
 		return -1;
+	if (empty_image(pages)) {
+		pr_err("No pages image available for pages_id %u%s\n", rsti(t)->pages_img_id,
+		       compact ? " (expected compact blob)" : "");
+		close_image(pages);
+		return -1;
+	}
 
 	ta->vma_ios_fd = img_raw_fd(pages);
 	if (ta->vma_ios_fd >= 0) {
 		int fl = fcntl(ta->vma_ios_fd, F_GETFL);
-		if (fl >= 0) {
-			int ret = fcntl(ta->vma_ios_fd, F_SETFL, fl | O_DIRECT);
-			if (ret < 0) {
-				pr_warn("Failed to set O_DIRECT on pages fd: %s\n", strerror(errno));
-			} else {
-				/*
-				 * Probe: some NFS servers (e.g. Azure) accept O_DIRECT via
-				 * fcntl but reject it at pread time with EINVAL. Fall back
-				 * to buffered I/O in that case.
-				 */
-				char probe[4096] __attribute__((aligned(4096)));
-				if (pread(ta->vma_ios_fd, probe, sizeof(probe), 0) < 0 && errno == EINVAL) {
-					pr_info("O_DIRECT rejected at read time on pages fd %d (NFS?), using buffered I/O\n",
-						ta->vma_ios_fd);
-					if (fcntl(ta->vma_ios_fd, F_SETFL, fl) < 0) {
-						pr_err("Failed to clear O_DIRECT on pages fd %d: %s"
-						      " -- all subsequent reads will fail with EINVAL\n",
-						      ta->vma_ios_fd, strerror(errno));
-						return -1;
-					}
-					/*
-					 * Hint the kernel to use large sequential read-ahead.
-					 * Linux 5.4+ reduced the default NFS read_ahead_kb from
-					 * ~15 MB to 128 KB, which severely hurts sequential
-					 * throughput on Azure NFS. POSIX_FADV_SEQUENTIAL asks
-					 * the kernel to double the read-ahead window automatically.
-					 */
-					posix_fadvise(ta->vma_ios_fd, 0, 0, POSIX_FADV_SEQUENTIAL);
-				} else {
-					pr_info("O_DIRECT enabled on pages fd %d\n", ta->vma_ios_fd);
-				}
+		if (fl >= 0 && (fl & O_DIRECT)) {
+			char probe[4096] __attribute__((aligned(4096)));
+
+			if (pread(ta->vma_ios_fd, probe, sizeof(probe), 0) < 0 && errno == EINVAL) {
+				pr_info("O_DIRECT rejected at read time on pages fd %d, reopening buffered I/O\n",
+					ta->vma_ios_fd);
+				close_image(pages);
+				pages = NULL;
+				try_direct_open = false;
+				goto reopen_pages;
 			}
+			pr_info("O_DIRECT enabled on pages fd %d at open time\n", ta->vma_ios_fd);
+		} else {
+			posix_fadvise(ta->vma_ios_fd, 0, 0, POSIX_FADV_SEQUENTIAL);
 		}
 	}
 	return pagemap_render_iovec(&rsti(t)->vma_io, ta);

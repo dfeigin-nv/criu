@@ -897,14 +897,6 @@ static unsigned long restore_mapping(VmaEntry *vma_entry)
 	if ((vma_entry->fd == -1 || !(vma_entry->flags & MAP_SHARED)) && !(vma_entry->status & VMA_NO_PROT_WRITE))
 		prot |= PROT_WRITE;
 
-	/* TODO: Drop MAP_LOCKED bit and restore it after reading memory.
-	 *
-	 * Code below tries to limit memory usage by running fallocate()
-	 * after each preadv() to avoid doubling memory usage (once in
-	 * image files, once in process). Unfortunately, MAP_LOCKED defeats
-	 * that mechanism as it causes the process to be charged for memory
-	 * immediately upon mmap, not later upon preadv().
-	 */
 	pr_debug("\tmmap(%" PRIx64 " -> %" PRIx64 ", %x %x %d)\n", vma_entry->start, vma_entry->end, prot, flags,
 		 (int)vma_entry->fd);
 	/*
@@ -1109,8 +1101,6 @@ static int vma_remap(VmaEntry *vma_entry, int uffd)
 	unsigned long dst = vma_entry->start;
 	unsigned long len = vma_entry_len(vma_entry);
 	unsigned long guard = 0, tmp;
-
-	pr_info("Remap %lx->%lx len %lx\n", src, dst, len);
 
 	/*
 	 * SHSTK VMAs are a bit special, in fact we create shstk vma right in the
@@ -1601,6 +1591,181 @@ static void advance_vma_io_retry(struct restore_vma_io *rio, ssize_t res,
 	*iov_out = (j < (unsigned int)rio->nr_iovs) ? &rio->iovs[j] : NULL;
 }
 
+static inline bool compact_io_is_zero(loff_t off);
+static inline bool compact_io_is_zero_skip(loff_t off);
+static inline bool compact_io_is_compact(loff_t off);
+static inline loff_t compact_io_decode(loff_t off);
+
+static inline u64 timeval_delta_us(const struct timeval *start, const struct timeval *end)
+{
+	return (u64)(end->tv_sec - start->tv_sec) * 1000000ULL + (u64)(end->tv_usec - start->tv_usec);
+}
+
+static void restore_vma_io_apply_copies(struct restore_vma_io *rio, size_t *copy_restore_len,
+					 unsigned int *copy_ios, u64 *copy_us)
+{
+	struct restore_vma_copy *copies;
+	struct timeval tv0, tv1;
+
+	if (rio->nr_copies == 0)
+		return;
+
+	copies = restore_vma_io_copies(rio);
+	sys_gettimeofday(&tv0, NULL);
+	for (unsigned int i = 0; i < (unsigned int)rio->nr_copies; i++)
+		memcpy(copies[i].dst, copies[i].src, PAGE_SIZE);
+	sys_gettimeofday(&tv1, NULL);
+
+	*copy_us += (u64)(tv1.tv_sec - tv0.tv_sec) * 1000000ULL +
+		    (u64)(tv1.tv_usec - tv0.tv_usec);
+	*copy_restore_len += (size_t)rio->nr_copies * PAGE_SIZE;
+	*copy_ios += (unsigned int)rio->nr_copies;
+}
+
+static int restore_vma_ios_sync(int fd, struct restore_vma_io *rios, unsigned int n, bool auto_dedup)
+{
+	size_t zero_skip_len = 0;
+	size_t zero_restore_len = 0;
+	size_t sync_restore_len = 0;
+	size_t copy_restore_len = 0;
+	unsigned int zero_skip_ios = 0;
+	unsigned int zero_ios = 0;
+	unsigned int sync_ios = 0;
+	unsigned int copy_ios = 0;
+	unsigned int short_reads = 0;
+	unsigned int max_iovs = 0;
+	unsigned int max_copies = 0;
+	u64 zero_skip_us = 0;
+	u64 zero_us = 0;
+	u64 sync_us = 0;
+	u64 copy_us = 0;
+	struct restore_vma_io *rio = rios;
+	unsigned int i;
+
+	for (i = 0; i < n; i++) {
+		size_t rio_len = 0;
+
+		for (unsigned int j = 0; j < (unsigned int)rio->nr_iovs; j++)
+			rio_len += (size_t)rio->iovs[j].iov_len;
+		if ((unsigned int)rio->nr_iovs > max_iovs)
+			max_iovs = (unsigned int)rio->nr_iovs;
+		if ((unsigned int)rio->nr_copies > max_copies)
+			max_copies = (unsigned int)rio->nr_copies;
+
+		if (compact_io_is_zero(rio->off)) {
+			struct timeval zero0, zero1;
+
+			sys_gettimeofday(&zero0, NULL);
+			if (compact_io_is_zero_skip(rio->off)) {
+				zero_skip_len += rio_len;
+				zero_skip_ios++;
+			} else {
+				for (unsigned int j = 0; j < (unsigned int)rio->nr_iovs; j++)
+					memset(rio->iovs[j].iov_base, 0, rio->iovs[j].iov_len);
+				zero_restore_len += rio_len;
+				zero_ios++;
+			}
+			sys_gettimeofday(&zero1, NULL);
+			if (compact_io_is_zero_skip(rio->off))
+				zero_skip_us += timeval_delta_us(&zero0, &zero1);
+			else
+				zero_us += timeval_delta_us(&zero0, &zero1);
+			goto next_rio;
+		}
+
+		sync_restore_len += rio_len;
+		sync_ios++;
+		{
+			struct timeval read0, read1;
+			off_t off;
+			size_t remaining;
+			struct iovec *iov;
+			unsigned int nr;
+
+			sys_gettimeofday(&read0, NULL);
+
+			off = compact_io_decode(rio->off);
+			remaining = rio_len;
+			iov = rio->iovs;
+			nr = rio->nr_iovs;
+
+			while (remaining > 0) {
+				long bytes = sys_preadv(fd, iov, nr, off);
+
+				if (bytes <= 0) {
+					pr_err("Buffered VMA restore failed: %ld (off %lld, nr %u)\n",
+					       bytes, (long long)off, nr);
+					return -1;
+				}
+
+				if (auto_dedup && !compact_io_is_compact(rio->off))
+					sys_fallocate(fd, FALLOC_FL_KEEP_SIZE | FALLOC_FL_PUNCH_HOLE, off, bytes);
+
+				if ((size_t)bytes == remaining)
+					break;
+
+				if ((size_t)bytes > remaining) {
+					pr_err("Buffered VMA restore over-read %ld bytes for %zu-byte request\n",
+					       bytes, remaining);
+					return -1;
+				}
+
+				short_reads++;
+				advance_vma_io_retry(rio, bytes, &iov, &nr);
+				off += bytes;
+				remaining -= bytes;
+			}
+
+			sys_gettimeofday(&read1, NULL);
+			sync_us += (u64)(read1.tv_sec - read0.tv_sec) * 1000000ULL +
+				   (u64)(read1.tv_usec - read0.tv_usec);
+		}
+		restore_vma_io_apply_copies(rio, &copy_restore_len, &copy_ios, &copy_us);
+next_rio:
+		rio = (void *)rio + RIO_SIZE(rio->nr_iovs, rio->nr_copies);
+	}
+
+	pr_info("VMA restore zero-skip %lu ms (%zu MiB, %u ios) zero-fill %lu ms (%zu MiB, %u ios) sync %lu ms (%zu MiB, %u ios) copy %lu ms (%zu MiB, %u ios)\n",
+		(unsigned long)(zero_skip_us / 1000ULL),
+		zero_skip_len / (1024 * 1024), zero_skip_ios,
+		(unsigned long)(zero_us / 1000ULL),
+		zero_restore_len / (1024 * 1024), zero_ios,
+		(unsigned long)(sync_us / 1000ULL),
+		sync_restore_len / (1024 * 1024), sync_ios,
+		(unsigned long)(copy_us / 1000ULL),
+		copy_restore_len / (1024 * 1024), copy_ios);
+	pr_info("VMA restore profile jobs %u zero-skip %u zero %u short %u max %u iovs max %u copies\n",
+		sync_ios + zero_ios + zero_skip_ios, zero_skip_ios, zero_ios, short_reads, max_iovs, max_copies);
+
+	return 0;
+}
+
+#define COMPACT_IO_RUN_FLAG       ((__u64)1 << 62)
+#define COMPACT_IO_ZERO_FLAG      ((__u64)1 << 61)
+#define COMPACT_IO_ZERO_SKIP_FLAG ((__u64)1 << 60)
+#define COMPACT_IO_FLAG_MASK      (COMPACT_IO_RUN_FLAG | COMPACT_IO_ZERO_FLAG | COMPACT_IO_ZERO_SKIP_FLAG)
+
+static inline bool compact_io_is_zero(loff_t off)
+{
+	return (((__u64)off) & COMPACT_IO_ZERO_FLAG) != 0;
+}
+
+static inline bool compact_io_is_zero_skip(loff_t off)
+{
+	return ((((u64)off) & (COMPACT_IO_ZERO_FLAG | COMPACT_IO_ZERO_SKIP_FLAG)) ==
+		(COMPACT_IO_ZERO_FLAG | COMPACT_IO_ZERO_SKIP_FLAG));
+}
+
+static inline bool compact_io_is_compact(loff_t off)
+{
+	return (((__u64)off) & COMPACT_IO_FLAG_MASK) != 0;
+}
+
+static inline loff_t compact_io_decode(loff_t off)
+{
+	return (loff_t)(((__u64)off) & ~COMPACT_IO_FLAG_MASK);
+}
+
 /*
  * In the worst case buf size should be:
  *   sizeof(struct inotify_event) * 2 + PATH_MAX
@@ -1730,6 +1895,25 @@ __visible long __export_restore_task(struct task_restore_args *args)
 	pid_t my_pid = sys_getpid();
 	rt_sigaction_t act;
 	bool has_vdso_proxy;
+	struct timeval vma_map_tv0, vma_map_tv1;
+	u64 vma_shift_us = 0;
+	u64 vma_map_us = 0;
+	u64 vma_io_us = 0;
+	u64 mprotect_us = 0;
+	u64 aio_ring_us = 0;
+	u64 madvise_us = 0;
+	u64 guard_us = 0;
+	u64 threads_us = 0;
+	u64 timers_us = 0;
+	u64 seccomp_us = 0;
+	u64 creds_us = 0;
+	u64 restore_stage_wait_us = 0;
+	u64 helpers_wait_us = 0;
+	u64 zombies_wait_us = 0;
+	u64 sigmask_us = 0;
+	u64 sigrestore_us = 0;
+	u64 sigchld_stage_wait_us = 0;
+	u64 tcp_restore_us = 0;
 
 	bootstrap_start = args->bootstrap_start;
 	bootstrap_len = args->bootstrap_len;
@@ -1818,6 +2002,7 @@ __visible long __export_restore_task(struct task_restore_args *args)
 	vdso_update_gtod_addr(&args->vdso_maps_rt);
 
 	/* Shift private vma-s to the left */
+	sys_gettimeofday(&vma_map_tv0, NULL);
 	for (i = 0; i < args->vmas_n; i++) {
 		vma_entry = args->vmas + i;
 
@@ -1850,6 +2035,8 @@ __visible long __export_restore_task(struct task_restore_args *args)
 		if (vma_remap(vma_entry, args->uffd))
 			goto core_restore_end;
 	}
+	sys_gettimeofday(&vma_map_tv1, NULL);
+	vma_shift_us = timeval_delta_us(&vma_map_tv0, &vma_map_tv1);
 
 	ret = sys_prctl(PR_SET_THP_DISABLE, args->thp_disabled, 0, 0, 0);
 	if (ret) {
@@ -1870,6 +2057,7 @@ __visible long __export_restore_task(struct task_restore_args *args)
 	/*
 	 * OK, lets try to map new one.
 	 */
+	sys_gettimeofday(&vma_map_tv0, NULL);
 	for (i = 0; i < args->vmas_n; i++) {
 		vma_entry = args->vmas + i;
 
@@ -1886,6 +2074,15 @@ __visible long __export_restore_task(struct task_restore_args *args)
 			goto core_restore_end;
 		}
 	}
+	sys_gettimeofday(&vma_map_tv1, NULL);
+	vma_map_us = timeval_delta_us(&vma_map_tv0, &vma_map_tv1);
+	pr_info("VMA restore map %lu ms (%u vmas)\n",
+		(unsigned long)(vma_map_us / 1000ULL),
+		args->vmas_n);
+	pr_info("Restorer pre-page-replay summary shift %lu ms map %lu ms total %lu ms\n",
+		(unsigned long)(vma_shift_us / 1000ULL),
+		(unsigned long)(vma_map_us / 1000ULL),
+		(unsigned long)((vma_shift_us + vma_map_us) / 1000ULL));
 
 	/*
 	 * Now read the contents (if any).
@@ -1893,8 +2090,12 @@ __visible long __export_restore_task(struct task_restore_args *args)
 	 * Handles short reads (MAX_RW_COUNT 0x7FFFF000) by advancing and resubmitting.
 	 */
 	if (args->vma_ios_n > 0 && args->vma_ios_fd != -1) {
+		struct timeval vma_io_tv0, vma_io_tv1;
 		size_t vma_restore_len = 0;
-		struct timeval tv0, tv1;
+		size_t zero_skip_len = 0;
+		size_t zero_restore_len = 0;
+		size_t copy_restore_len = 0;
+		struct timeval aio_tv0, aio_tv1, tv_fill0, tv_fill1, stamp0, stamp1;
 		unsigned int n = args->vma_ios_n;
 		int fd = args->vma_ios_fd;
 		aio_context_t aio_ctx = 0;
@@ -1904,168 +2105,269 @@ __visible long __export_restore_task(struct task_restore_args *args)
 		struct restore_vma_io **rio_ptrs;
 		struct io_event *events;
 		unsigned long alloc_sz;
-		unsigned int submitted = 0, completed = 0;
+		unsigned int submitted = 0, completed = 0, aio_n = 0, zero_skip_ios = 0, zero_ios = 0;
+		unsigned int copy_ios = 0;
+		unsigned int aio_submit_calls = 0;
+		unsigned int aio_getevents_calls = 0;
+		unsigned int aio_short_reads = 0;
+		unsigned int aio_retry_submits = 0;
+		unsigned int max_inflight = 0;
+		unsigned int max_iovs = 0;
+		unsigned int max_copies = 0;
+		u64 vma_scan_us = 0;
+		u64 zero_skip_us = 0;
+		u64 zero_us = 0;
+		u64 copy_us = 0;
+		u64 aio_submit_us = 0;
+		u64 aio_wait_us = 0;
+		bool aio_ctx_ready = false;
+		bool iocbs_mapped = false;
 
-#define AIO_BATCH 128
+#define AIO_BATCH 256
 
-		sys_gettimeofday(&tv0, NULL);
+		sys_gettimeofday(&vma_io_tv0, NULL);
+		sys_gettimeofday(&tv_fill0, NULL);
 
-		/* Compute total range for logging */
-		{
-			struct restore_vma_io *r = args->vma_ios;
-			unsigned int k;
-			off_t first_off = r->off, last_end = r->off;
+		rio = args->vma_ios;
+		for (i = 0; i < (int)n; i++) {
+			size_t rio_len = 0;
 
-			for (k = 0; k < n; k++) {
-				size_t rio_len = 0;
-				for (int j = 0; j < r->nr_iovs; j++)
-					rio_len += (size_t)r->iovs[j].iov_len;
-				if (r->off < first_off)
-					first_off = r->off;
-				if ((off_t)(r->off + (off_t)rio_len) > last_end)
-					last_end = (off_t)(r->off + (off_t)rio_len);
-				r = (struct restore_vma_io *)((void *)r + RIO_SIZE(r->nr_iovs));
+			for (int j = 0; j < rio->nr_iovs; j++)
+				rio_len += (size_t)rio->iovs[j].iov_len;
+			if ((unsigned int)rio->nr_iovs > max_iovs)
+				max_iovs = (unsigned int)rio->nr_iovs;
+			if ((unsigned int)rio->nr_copies > max_copies)
+				max_copies = (unsigned int)rio->nr_copies;
+
+			if (compact_io_is_zero(rio->off)) {
+				struct timeval zero0, zero1;
+
+				sys_gettimeofday(&zero0, NULL);
+				if (compact_io_is_zero_skip(rio->off)) {
+					zero_skip_len += rio_len;
+					zero_skip_ios++;
+				} else {
+					for (int j = 0; j < rio->nr_iovs; j++)
+						memset(rio->iovs[j].iov_base, 0, rio->iovs[j].iov_len);
+					zero_restore_len += rio_len;
+					zero_ios++;
+				}
+				sys_gettimeofday(&zero1, NULL);
+				if (compact_io_is_zero_skip(rio->off))
+					zero_skip_us += timeval_delta_us(&zero0, &zero1);
+				else
+					zero_us += timeval_delta_us(&zero0, &zero1);
+			} else {
+				vma_restore_len += rio_len;
+				aio_n++;
 			}
-			vma_restore_len = (size_t)(last_end - first_off);
+
+			rio = (void *)rio + RIO_SIZE(rio->nr_iovs, rio->nr_copies);
 		}
 
+		sys_gettimeofday(&tv_fill1, NULL);
+		vma_scan_us = timeval_delta_us(&tv_fill0, &tv_fill1);
+
+		if (aio_n == 0) {
+			pr_info("VMA restore scan %lu ms zero-skip %lu ms (%zu MiB, %u ios) zero-fill %lu ms (%zu MiB, %u ios) copy 0 ms (0 MiB, 0 ios)\n",
+				(unsigned long)(vma_scan_us / 1000ULL),
+				(unsigned long)(zero_skip_us / 1000ULL),
+				zero_skip_len / (1024 * 1024), zero_skip_ios,
+				(unsigned long)(zero_us / 1000ULL),
+				zero_restore_len / (1024 * 1024), zero_ios);
+			sys_close(fd);
+			args->vma_ios_fd = -1;
+			sys_gettimeofday(&vma_io_tv1, NULL);
+			vma_io_us = timeval_delta_us(&vma_io_tv0, &vma_io_tv1);
+			goto vma_restore_done;
+		}
+
+		sys_gettimeofday(&aio_tv0, NULL);
 		aio_ret = sys_io_setup(AIO_BATCH, &aio_ctx);
 		if (aio_ret < 0) {
-			pr_err("io_setup(%d) failed: %ld\n", AIO_BATCH, aio_ret);
-			goto core_restore_end;
+			pr_warn("io_setup(%d) failed: %ld, falling back to buffered VMA restore\n",
+				AIO_BATCH, aio_ret);
+			goto aio_fallback;
 		}
+		aio_ctx_ready = true;
 
-		alloc_sz = n * sizeof(struct iocb)
-			 + n * sizeof(struct iocb *)
-			 + n * sizeof(struct restore_vma_io *)
+		alloc_sz = aio_n * sizeof(struct iocb)
+			 + aio_n * sizeof(struct iocb *)
+			 + aio_n * sizeof(struct restore_vma_io *)
 			 + AIO_BATCH * sizeof(struct io_event);
 		iocbs = (void *)sys_mmap(NULL, alloc_sz, PROT_READ | PROT_WRITE,
 					 MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
 		if (IS_ERR(iocbs)) {
-			pr_err("Can't mmap AIO buffers: %ld\n", PTR_ERR(iocbs));
-			sys_io_destroy(aio_ctx);
-			goto core_restore_end;
+			pr_warn("Can't mmap AIO buffers: %ld, falling back to buffered VMA restore\n",
+				PTR_ERR(iocbs));
+			goto aio_fallback;
 		}
-		iocbps = (struct iocb **)((void *)iocbs + n * sizeof(struct iocb));
-		rio_ptrs = (struct restore_vma_io **)((void *)iocbps + n * sizeof(struct iocb *));
-		events = (struct io_event *)((void *)rio_ptrs + n * sizeof(struct restore_vma_io *));
+		iocbs_mapped = true;
+		iocbps = (struct iocb **)((void *)iocbs + aio_n * sizeof(struct iocb));
+		rio_ptrs = (struct restore_vma_io **)((void *)iocbps + aio_n * sizeof(struct iocb *));
+		events = (struct io_event *)((void *)rio_ptrs + aio_n * sizeof(struct restore_vma_io *));
 
-		/* Build all iocbs from vma_ios */
+		/* Build AIO jobs from the non-zero vma_ios */
 		rio = args->vma_ios;
 		for (i = 0; i < (int)n; i++) {
-			struct iocb *cb = &iocbs[i];
 			size_t expected = 0;
 
-			for (int j = 0; j < rio->nr_iovs; j++)
-				expected += rio->iovs[j].iov_len;
+			if (!compact_io_is_zero(rio->off)) {
+				struct iocb *cb = &iocbs[completed];
 
-			memset(cb, 0, sizeof(*cb));
-			cb->aio_fildes = fd;
-			cb->aio_lio_opcode = IOCB_CMD_PREADV;
-			cb->aio_buf = (unsigned long)rio->iovs;
-			cb->aio_nbytes = rio->nr_iovs;
-			cb->aio_offset = rio->off;
-			cb->aio_data = expected;
-			iocbps[i] = cb;
-			rio_ptrs[i] = rio;
+				for (int j = 0; j < rio->nr_iovs; j++)
+					expected += rio->iovs[j].iov_len;
 
-			rio = (void *)rio + RIO_SIZE(rio->nr_iovs);
-		}
-
-		/* Submit and reap in batches */
-		while (submitted < n || completed < n) {
-			while (submitted < n && (submitted - completed) < AIO_BATCH) {
-				unsigned int batch = n - submitted;
-				if (batch > AIO_BATCH - (submitted - completed))
-					batch = AIO_BATCH - (submitted - completed);
-				aio_ret = sys_io_submit(aio_ctx, batch, &iocbps[submitted]);
-				if (aio_ret <= 0) {
-					pr_err("io_submit failed: %ld (submitted %u/%u)\n",
-					       aio_ret, submitted, n);
-					goto aio_error;
-				}
-				submitted += aio_ret;
+				memset(cb, 0, sizeof(*cb));
+				cb->aio_fildes = fd;
+				cb->aio_lio_opcode = IOCB_CMD_PREADV;
+				cb->aio_buf = (unsigned long)rio->iovs;
+				cb->aio_nbytes = rio->nr_iovs;
+				cb->aio_offset = compact_io_decode(rio->off);
+				cb->aio_data = expected;
+				iocbps[completed] = cb;
+				rio_ptrs[completed] = rio;
+				completed++;
 			}
 
-			if (completed < n) {
-				/* min_nr=1 to block until at least one event; nr=AIO_BATCH to reap all (incl. retries) */
-				aio_ret = sys_io_getevents(aio_ctx, 1, AIO_BATCH, events, NULL);
+			rio = (void *)rio + RIO_SIZE(rio->nr_iovs, rio->nr_copies);
+		}
+		completed = 0;
+
+		/* Submit and reap in batches */
+		while (submitted < aio_n || completed < aio_n) {
+			while (submitted < aio_n && (submitted - completed) < AIO_BATCH) {
+				unsigned int batch = aio_n - submitted;
+				if (batch > AIO_BATCH - (submitted - completed))
+					batch = AIO_BATCH - (submitted - completed);
+				sys_gettimeofday(&stamp0, NULL);
+				aio_ret = sys_io_submit(aio_ctx, batch, &iocbps[submitted]);
+				sys_gettimeofday(&stamp1, NULL);
+				aio_submit_us += timeval_delta_us(&stamp0, &stamp1);
 				if (aio_ret <= 0) {
-					pr_err("io_getevents failed: %ld\n", aio_ret);
-					goto aio_error;
+					pr_warn("io_submit failed: %ld (submitted %u/%u), falling back to buffered VMA restore\n",
+						aio_ret, submitted, aio_n);
+					goto aio_fallback;
 				}
+				aio_submit_calls++;
+				submitted += aio_ret;
+				if (submitted - completed > max_inflight)
+					max_inflight = submitted - completed;
+			}
+
+			if (completed < aio_n) {
+				/* min_nr=1 to block until at least one event; nr=AIO_BATCH to reap all (incl. retries) */
+				sys_gettimeofday(&stamp0, NULL);
+				aio_ret = sys_io_getevents(aio_ctx, 1, AIO_BATCH, events, NULL);
+				sys_gettimeofday(&stamp1, NULL);
+				aio_wait_us += timeval_delta_us(&stamp0, &stamp1);
+				if (aio_ret <= 0) {
+					pr_warn("io_getevents failed: %ld, falling back to buffered VMA restore\n",
+						aio_ret);
+					goto aio_fallback;
+				}
+				aio_getevents_calls++;
 				for (long k = 0; k < aio_ret; k++) {
+					struct iocb *cb = (struct iocb *)(unsigned long)events[k].obj;
+					unsigned int idx = cb - iocbs;
+					struct restore_vma_io *r = rio_ptrs[idx];
+
 					if (events[k].res < 0) {
-						pr_err("AIO read failed: %lld\n",
-						       events[k].res);
-						goto aio_error;
+						pr_warn("AIO read failed: %lld, falling back to buffered VMA restore\n",
+							events[k].res);
+						goto aio_fallback;
 					}
-					{
-						struct iocb *cb = (struct iocb *)(unsigned long)events[k].obj;
 
-						if (args->auto_dedup && events[k].res > 0)
+						if (args->auto_dedup && events[k].res > 0 && !compact_io_is_compact(r->off))
 							sys_fallocate(fd,
-								      FALLOC_FL_KEEP_SIZE | FALLOC_FL_PUNCH_HOLE,
-								      (off_t)cb->aio_offset, (off_t)events[k].res);
-					}
-					if ((__u64)events[k].res == events[k].data) {
-						completed++;
-						continue;
-					}
-					/* Short read (e.g. MAX_RW_COUNT 0x7FFFF000): advance and retry */
-					if (events[k].res == 0) {
-						pr_err("AIO zero read (expected %llu)\n",
-						       events[k].data);
-						goto aio_error;
-					}
-					{
-						struct iocb *cb = (struct iocb *)(unsigned long)events[k].obj;
-						unsigned int idx = cb - iocbs;
-						struct restore_vma_io *r = rio_ptrs[idx];
-						struct iovec *iov_next;
-						unsigned int nr_next;
+							      FALLOC_FL_KEEP_SIZE | FALLOC_FL_PUNCH_HOLE,
+							      (off_t)cb->aio_offset, (off_t)events[k].res);
 
-						advance_vma_io_retry(r, events[k].res,
-								   &iov_next, &nr_next);
-						if (!iov_next || nr_next == 0) {
+						if ((__u64)events[k].res == events[k].data) {
+							restore_vma_io_apply_copies(r, &copy_restore_len, &copy_ios, &copy_us);
 							completed++;
 							continue;
 						}
-						cb->aio_buf = (unsigned long)iov_next;
-						cb->aio_nbytes = nr_next;
-						cb->aio_offset = r->off;
-						cb->aio_data -= (__u64)events[k].res;
+						/* Short read (e.g. MAX_RW_COUNT 0x7FFFF000): advance and retry */
+						if (events[k].res == 0) {
+							pr_warn("AIO zero read (expected %llu), falling back to buffered VMA restore\n",
+								events[k].data);
+							goto aio_fallback;
+						}
 						{
-							long ret2 = sys_io_submit(aio_ctx, 1, &cb);
-							if (ret2 != 1) {
-								pr_err("AIO retry submit failed: %ld\n",
-								       ret2);
-								goto aio_error;
+							struct iovec *iov_next;
+							unsigned int nr_next;
+
+							aio_short_reads++;
+							advance_vma_io_retry(r, events[k].res, &iov_next, &nr_next);
+							if (!iov_next || nr_next == 0) {
+								restore_vma_io_apply_copies(r, &copy_restore_len, &copy_ios, &copy_us);
+								completed++;
+								continue;
 							}
+							cb->aio_buf = (unsigned long)iov_next;
+							cb->aio_nbytes = nr_next;
+							cb->aio_offset = compact_io_decode(r->off);
+							cb->aio_data -= (__u64)events[k].res;
+							{
+								struct timeval submit0, submit1;
+								long ret2;
+
+								sys_gettimeofday(&submit0, NULL);
+								ret2 = sys_io_submit(aio_ctx, 1, &cb);
+								sys_gettimeofday(&submit1, NULL);
+								aio_submit_us += timeval_delta_us(&submit0, &submit1);
+								if (ret2 != 1) {
+									pr_warn("AIO retry submit failed: %ld, falling back to buffered VMA restore\n",
+										ret2);
+									goto aio_fallback;
+								}
+							}
+							aio_submit_calls++;
+							aio_retry_submits++;
 						}
 					}
 				}
-			}
 		}
 
 		goto aio_done;
-	aio_error:
-		sys_io_destroy(aio_ctx);
-		sys_munmap(iocbs, alloc_sz);
+aio_fallback:
+		if (iocbs_mapped)
+			sys_munmap(iocbs, alloc_sz);
+		if (aio_ctx_ready)
+			sys_io_destroy(aio_ctx);
+		if (restore_vma_ios_sync(fd, args->vma_ios, n, args->auto_dedup))
+			goto core_restore_end;
 		sys_close(fd);
 		args->vma_ios_fd = -1;
-		goto core_restore_end;
+		sys_gettimeofday(&vma_io_tv1, NULL);
+		vma_io_us = timeval_delta_us(&vma_io_tv0, &vma_io_tv1);
+		goto vma_restore_done;
 	aio_done:
 		sys_io_destroy(aio_ctx);
 		sys_munmap(iocbs, alloc_sz);
-		sys_gettimeofday(&tv1, NULL);
-		pr_info("VMA restore AIO %lu ms (range %zu MiB, %u ios)\n",
-			(unsigned long)((tv1.tv_sec - tv0.tv_sec) * 1000 + (tv1.tv_usec - tv0.tv_usec) / 1000),
-			vma_restore_len / (1024 * 1024), n);
+		sys_gettimeofday(&aio_tv1, NULL);
+		pr_info("VMA restore scan %lu ms zero-skip %lu ms (%zu MiB, %u ios) zero-fill %lu ms (%zu MiB, %u ios) AIO %lu ms (submit %lu ms wait %lu ms, %zu MiB, %u ios) copy %lu ms (%zu MiB, %u ios)\n",
+			(unsigned long)(vma_scan_us / 1000ULL),
+			(unsigned long)(zero_skip_us / 1000ULL),
+			zero_skip_len / (1024 * 1024), zero_skip_ios,
+			(unsigned long)(zero_us / 1000ULL),
+			zero_restore_len / (1024 * 1024), zero_ios,
+			(unsigned long)(timeval_delta_us(&aio_tv0, &aio_tv1) / 1000ULL),
+			(unsigned long)(aio_submit_us / 1000ULL),
+			(unsigned long)(aio_wait_us / 1000ULL),
+			vma_restore_len / (1024 * 1024), aio_n,
+			(unsigned long)(copy_us / 1000ULL),
+			copy_restore_len / (1024 * 1024), copy_ios);
+		pr_info("VMA restore profile jobs %u aio %u zero-skip %u zero %u submit %u getevents %u short %u resubmit %u max inflight %u max %u iovs max %u copies\n",
+			aio_n + zero_skip_ios + zero_ios, aio_n, zero_skip_ios, zero_ios, aio_submit_calls, aio_getevents_calls,
+			aio_short_reads, aio_retry_submits, max_inflight, max_iovs, max_copies);
 		sys_close(fd);
 		args->vma_ios_fd = -1;
+		vma_io_us = timeval_delta_us(&vma_io_tv0, &aio_tv1);
 #undef AIO_BATCH
 	}
+vma_restore_done:
 
 	/*
 	 * Proxify vDSO.
@@ -2082,6 +2384,7 @@ __visible long __export_restore_task(struct task_restore_args *args)
 	 * Walk though all VMAs again to drop PROT_WRITE
 	 * if it was not there.
 	 */
+	sys_gettimeofday(&vma_map_tv0, NULL);
 	for (i = 0; i < args->vmas_n; i++) {
 		vma_entry = args->vmas + i;
 
@@ -2093,19 +2396,25 @@ __visible long __export_restore_task(struct task_restore_args *args)
 
 		sys_mprotect(decode_pointer(vma_entry->start), vma_entry_len(vma_entry), vma_entry->prot);
 	}
+	sys_gettimeofday(&vma_map_tv1, NULL);
+	mprotect_us = timeval_delta_us(&vma_map_tv0, &vma_map_tv1);
 
 	/*
 	 * Now when all VMAs are in their places time to set
 	 * up AIO rings.
 	 */
 
+	sys_gettimeofday(&vma_map_tv0, NULL);
 	for (i = 0; i < args->rings_n; i++)
 		if (restore_aio_ring(&args->rings[i]) < 0)
 			goto core_restore_end;
+	sys_gettimeofday(&vma_map_tv1, NULL);
+	aio_ring_us = timeval_delta_us(&vma_map_tv0, &vma_map_tv1);
 
 	/*
 	 * Finally restore madivse() bits
 	 */
+	sys_gettimeofday(&vma_map_tv0, NULL);
 	for (i = 0; i < args->vmas_n; i++) {
 		unsigned long m;
 
@@ -2125,13 +2434,18 @@ __visible long __export_restore_task(struct task_restore_args *args)
 			}
 		}
 	}
+	sys_gettimeofday(&vma_map_tv1, NULL);
+	madvise_us = timeval_delta_us(&vma_map_tv0, &vma_map_tv1);
 
 	/*
 	 * Restore madvise(MADV_GUARD_INSTALL)
 	 */
+	sys_gettimeofday(&vma_map_tv0, NULL);
 	ret = restore_madv_guard_regions(args);
 	if (ret)
 		goto core_restore_end;
+	sys_gettimeofday(&vma_map_tv1, NULL);
+	guard_us = timeval_delta_us(&vma_map_tv0, &vma_map_tv1);
 
 	/*
 	 * Tune up the task fields.
@@ -2264,6 +2578,7 @@ __visible long __export_restore_task(struct task_restore_args *args)
 		}
 		mutex_lock(&task_entries_local->last_pid_mutex);
 
+		sys_gettimeofday(&vma_map_tv0, NULL);
 		for (i = 0; i < args->nr_threads; i++) {
 			char last_pid_buf[16], *s;
 
@@ -2318,10 +2633,13 @@ __visible long __export_restore_task(struct task_restore_args *args)
 		mutex_unlock(&task_entries_local->last_pid_mutex);
 		if (fd >= 0)
 			sys_close(fd);
+		sys_gettimeofday(&vma_map_tv1, NULL);
+		threads_us = timeval_delta_us(&vma_map_tv0, &vma_map_tv1);
 	}
 
 	restore_rlims(args);
 
+	sys_gettimeofday(&vma_map_tv0, NULL);
 	ret = create_posix_timers(args);
 	if (ret < 0) {
 		pr_err("Can't restore posix timers %ld\n", ret);
@@ -2336,26 +2654,42 @@ __visible long __export_restore_task(struct task_restore_args *args)
 
 	if (restore_membarrier_registrations(args->membarrier_registration_mask) < 0)
 		goto core_restore_end;
+	sys_gettimeofday(&vma_map_tv1, NULL);
+	timers_us = timeval_delta_us(&vma_map_tv0, &vma_map_tv1);
 
 	pr_info("%ld: Restored\n", sys_getpid());
 
+	sys_gettimeofday(&vma_map_tv0, NULL);
 	restore_finish_stage(task_entries_local, CR_STATE_RESTORE);
+	sys_gettimeofday(&vma_map_tv1, NULL);
+	restore_stage_wait_us = timeval_delta_us(&vma_map_tv0, &vma_map_tv1);
 
+	sys_gettimeofday(&vma_map_tv0, NULL);
 	if (wait_helpers(args) < 0)
 		goto core_restore_end;
+	sys_gettimeofday(&vma_map_tv1, NULL);
+	helpers_wait_us = timeval_delta_us(&vma_map_tv0, &vma_map_tv1);
+
+	sys_gettimeofday(&vma_map_tv0, NULL);
 	if (wait_zombies(args) < 0)
 		goto core_restore_end;
+	sys_gettimeofday(&vma_map_tv1, NULL);
+	zombies_wait_us = timeval_delta_us(&vma_map_tv0, &vma_map_tv1);
 
 	ksigfillset(&to_block);
+	sys_gettimeofday(&vma_map_tv0, NULL);
 	ret = sys_sigprocmask(SIG_SETMASK, &to_block, NULL, sizeof(k_rtsigset_t));
 	if (ret) {
 		pr_err("Unable to block signals %ld\n", ret);
 		goto core_restore_end;
 	}
+	sys_gettimeofday(&vma_map_tv1, NULL);
+	sigmask_us = timeval_delta_us(&vma_map_tv0, &vma_map_tv1);
 
 	if (cleanup_current_inotify_events(args))
 		goto core_restore_end;
 
+	sys_gettimeofday(&vma_map_tv0, NULL);
 	if (!args->compatible_mode) {
 		ret = sys_sigaction(SIGCHLD, &args->sigchld_act, NULL, sizeof(k_rtsigset_t));
 	} else {
@@ -2380,27 +2714,65 @@ __visible long __export_restore_task(struct task_restore_args *args)
 	ret = restore_signals(args->t->siginfo, args->t->siginfo_n, false);
 	if (ret)
 		goto core_restore_end;
+	sys_gettimeofday(&vma_map_tv1, NULL);
+	sigrestore_us = timeval_delta_us(&vma_map_tv0, &vma_map_tv1);
 
+	sys_gettimeofday(&vma_map_tv0, NULL);
 	restore_finish_stage(task_entries_local, CR_STATE_RESTORE_SIGCHLD);
+	sys_gettimeofday(&vma_map_tv1, NULL);
+	sigchld_stage_wait_us = timeval_delta_us(&vma_map_tv0, &vma_map_tv1);
 
+	sys_gettimeofday(&vma_map_tv0, NULL);
 	rst_tcp_socks_all(args);
+	sys_gettimeofday(&vma_map_tv1, NULL);
+	tcp_restore_us = timeval_delta_us(&vma_map_tv0, &vma_map_tv1);
 
 	/*
 	 * Make sure it's before creds, since it's privileged
 	 * operation bound to uid 0 in current user ns.
 	 */
+	sys_gettimeofday(&vma_map_tv0, NULL);
 	if (restore_seccomp(args->t))
 		goto core_restore_end;
+	sys_gettimeofday(&vma_map_tv1, NULL);
+	seccomp_us = timeval_delta_us(&vma_map_tv0, &vma_map_tv1);
 
 	/*
 	 * Writing to last-pid is CAP_SYS_ADMIN protected,
 	 * turning off TCP repair is CAP_SYS_NED_ADMIN protected,
 	 * thus restore* creds _after_ all of the above.
 	 */
+	sys_gettimeofday(&vma_map_tv0, NULL);
 	ret = restore_creds(args->t->creds_args, args->proc_fd, args->lsm_type, args->uid);
 	ret = ret || restore_dumpable_flag(&args->mm);
 	ret = ret || restore_pdeath_sig(args->t);
 	ret = ret || restore_child_subreaper(args->child_subreaper);
+	sys_gettimeofday(&vma_map_tv1, NULL);
+	creds_us = timeval_delta_us(&vma_map_tv0, &vma_map_tv1);
+
+	pr_info("Restorer post-page-replay summary restore-wait %lu ms helpers %lu ms zombies %lu ms sigmask %lu ms sigrestore %lu ms sigchld-wait %lu ms tcp %lu ms total %lu ms\n",
+		(unsigned long)(restore_stage_wait_us / 1000ULL),
+		(unsigned long)(helpers_wait_us / 1000ULL),
+		(unsigned long)(zombies_wait_us / 1000ULL),
+		(unsigned long)(sigmask_us / 1000ULL),
+		(unsigned long)(sigrestore_us / 1000ULL),
+		(unsigned long)(sigchld_stage_wait_us / 1000ULL),
+		(unsigned long)(tcp_restore_us / 1000ULL),
+		(unsigned long)((restore_stage_wait_us + helpers_wait_us + zombies_wait_us + sigmask_us +
+				 sigrestore_us + sigchld_stage_wait_us + tcp_restore_us) / 1000ULL));
+
+	pr_info("Restorer phase summary shift %lu ms map %lu ms page-io %lu ms mprotect %lu ms aio-rings %lu ms madvise %lu ms guard %lu ms threads %lu ms timers %lu ms seccomp %lu ms creds %lu ms\n",
+		(unsigned long)(vma_shift_us / 1000ULL),
+		(unsigned long)(vma_map_us / 1000ULL),
+		(unsigned long)(vma_io_us / 1000ULL),
+		(unsigned long)(mprotect_us / 1000ULL),
+		(unsigned long)(aio_ring_us / 1000ULL),
+		(unsigned long)(madvise_us / 1000ULL),
+		(unsigned long)(guard_us / 1000ULL),
+		(unsigned long)(threads_us / 1000ULL),
+		(unsigned long)(timers_us / 1000ULL),
+		(unsigned long)(seccomp_us / 1000ULL),
+		(unsigned long)(creds_us / 1000ULL));
 
 	futex_set_and_wake(&thread_inprogress, args->nr_threads);
 

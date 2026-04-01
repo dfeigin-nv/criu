@@ -8,6 +8,7 @@
 #include <sys/wait.h>
 #include <sys/stat.h>
 #include <sys/mman.h>
+#include <limits.h>
 
 #undef LOG_PREFIX
 #define LOG_PREFIX "page-xfer: "
@@ -17,6 +18,7 @@
 #include "servicefd.h"
 #include "image.h"
 #include "page-xfer.h"
+#include "page-coalesce.h"
 #include "page-pipe.h"
 #include "util.h"
 #include "protobuf.h"
@@ -257,6 +259,9 @@ static int write_pages_loc(struct page_xfer *xfer, int p, unsigned long len)
 	ssize_t ret;
 	ssize_t curr = 0;
 
+	if (xfer->compact)
+		return coalesce_checkpoint_pages_write_stream(xfer->compact, p, len);
+
 	while (1) {
 		ret = splice(p, NULL, img_raw_fd(xfer->pi), NULL, len - curr, SPLICE_F_MOVE);
 		if (ret == -1) {
@@ -273,6 +278,22 @@ static int write_pages_loc(struct page_xfer *xfer, int p, unsigned long len)
 	}
 
 	return 0;
+}
+
+static int unlink_raw_pages_image(u32 pages_id)
+{
+	char path[PATH_MAX];
+	int dfd = get_service_fd(IMG_FD_OFF);
+
+	if (dfd < 0)
+		return -1;
+
+	snprintf(path, sizeof(path), imgset_template[CR_FD_PAGES].fmt, pages_id);
+	if (!unlinkat(dfd, path, 0) || errno == ENOENT)
+		return 0;
+
+	pr_perror("Can't remove raw pages image %s", path);
+	return -1;
 }
 
 static int check_pagehole_in_parent(struct page_read *p, struct iovec *iov)
@@ -356,13 +377,28 @@ static int write_pagemap_loc(struct page_xfer *xfer, struct iovec *iov, u32 flag
 
 static void close_page_xfer(struct page_xfer *xfer)
 {
+	int fd_type = xfer->fd_type;
+	unsigned long img_id = xfer->img_id;
+	bool had_compact = xfer->compact != NULL;
+
 	if (xfer->parent != NULL) {
 		xfer->parent->close(xfer->parent);
 		xfree(xfer->parent);
 		xfer->parent = NULL;
 	}
-	close_image(xfer->pi);
+	if (xfer->compact) {
+		if (coalesce_checkpoint_pages_close_stream(xfer->compact))
+			pr_err("Can't finalize compact page stream for %d/%lu\n", fd_type, img_id);
+		xfer->compact = NULL;
+	} else if (xfer->pi) {
+		close_image(xfer->pi);
+	}
 	close_image(xfer->pmi);
+
+	if (!had_compact && !opts.use_page_server && opts.auto_dedup) {
+		if (coalesce_checkpoint_pages_enqueue(fd_type, img_id))
+			pr_err("Can't enqueue pagemap %d/%lu for online coalescing\n", fd_type, img_id);
+	}
 }
 
 static int open_page_local_xfer(struct page_xfer *xfer, int fd_type, unsigned long img_id)
@@ -376,6 +412,7 @@ static int open_page_local_xfer(struct page_xfer *xfer, int fd_type, unsigned lo
 	xfer->pi = open_pages_image(O_DUMP, xfer->pmi, &pages_id);
 	if (!xfer->pi)
 		goto err_pmi;
+	xfer->compact = NULL;
 
 	/*
 	 * Open page-read for parent images (if it exists). It will
@@ -417,13 +454,31 @@ static int open_page_local_xfer(struct page_xfer *xfer, int fd_type, unsigned lo
 	}
 
 out:
+	if (!opts.use_page_server && opts.auto_dedup) {
+		if (coalesce_checkpoint_pages_open_stream(pages_id, &xfer->compact))
+			goto err_pi;
+		if (xfer->compact) {
+			close_image(xfer->pi);
+			xfer->pi = NULL;
+			if (unlink_raw_pages_image(pages_id))
+				goto err_pi;
+		}
+	}
+
+	xfer->fd_type = fd_type;
+	xfer->img_id = img_id;
 	xfer->write_pagemap = write_pagemap_loc;
 	xfer->write_pages = write_pages_loc;
 	xfer->close = close_page_xfer;
 	return 0;
 
 err_pi:
-	close_image(xfer->pi);
+	if (xfer->compact) {
+		coalesce_checkpoint_pages_discard_stream(xfer->compact);
+		xfer->compact = NULL;
+	}
+	if (xfer->pi)
+		close_image(xfer->pi);
 err_pmi:
 	close_image(xfer->pmi);
 	return -1;
@@ -433,6 +488,11 @@ int open_page_xfer(struct page_xfer *xfer, int fd_type, unsigned long img_id)
 {
 	xfer->offset = 0;
 	xfer->transfer_lazy = true;
+
+	if (!opts.use_page_server && opts.auto_dedup) {
+		if (coalesce_checkpoint_pages_start())
+			return -1;
+	}
 
 	if (opts.use_page_server)
 		return open_page_server_xfer(xfer, fd_type, img_id);
@@ -879,39 +939,49 @@ err:
 
 int page_xfer_dump_pages(struct page_xfer *xfer, struct page_pipe *pp)
 {
-	struct page_pipe_buf *ppb;
 	unsigned int cur_hole = 0;
-	int ret;
+	struct page_pipe_buf *ppb;
 
 	pr_debug("Transferring pages:\n");
 
 	list_for_each_entry(ppb, &pp->bufs, l) {
-		unsigned int i;
-
-		pr_debug("\tbuf %lx/%d\n", ppb->pages_in, ppb->nr_segs);
-
-		for (i = 0; i < ppb->nr_segs; i++) {
-			struct iovec iov = ppb->iov[i];
-			u32 flags;
-
-			ret = dump_holes(xfer, pp, &cur_hole, iov.iov_base);
-			if (ret)
-				return ret;
-
-			BUG_ON(iov.iov_base < (void *)xfer->offset);
-			iov.iov_base -= xfer->offset;
-			pr_debug("\tp %p - %p\n", iov.iov_base, iov.iov_base + iov.iov_len);
-
-			flags = ppb_xfer_flags(xfer, ppb);
-
-			if (xfer->write_pagemap(xfer, &iov, flags))
-				return -1;
-			if ((flags & PE_PRESENT) && xfer->write_pages(xfer, ppb->p[0], iov.iov_len))
-				return -1;
-		}
+		if (page_xfer_dump_pages_ppb(xfer, pp, ppb, &cur_hole))
+			return -1;
 	}
 
-	return dump_holes(xfer, pp, &cur_hole, NULL);
+	return page_xfer_dump_pages_finish(xfer, pp, &cur_hole);
+}
+
+int page_xfer_dump_pages_ppb(struct page_xfer *xfer, struct page_pipe *pp, struct page_pipe_buf *ppb, unsigned int *cur_hole)
+{
+	unsigned int i;
+
+	pr_debug("\tbuf %lx/%d\n", ppb->pages_in, ppb->nr_segs);
+
+	for (i = 0; i < ppb->nr_segs; i++) {
+		struct iovec iov = ppb->iov[i];
+		u32 flags;
+
+		if (dump_holes(xfer, pp, cur_hole, iov.iov_base))
+			return -1;
+
+		BUG_ON(iov.iov_base < (void *)xfer->offset);
+		iov.iov_base -= xfer->offset;
+		pr_debug("\tp %p - %p\n", iov.iov_base, iov.iov_base + iov.iov_len);
+
+		flags = ppb_xfer_flags(xfer, ppb);
+		if (xfer->write_pagemap(xfer, &iov, flags))
+			return -1;
+		if ((flags & PE_PRESENT) && xfer->write_pages(xfer, ppb->p[0], iov.iov_len))
+			return -1;
+	}
+
+	return 0;
+}
+
+int page_xfer_dump_pages_finish(struct page_xfer *xfer, struct page_pipe *pp, unsigned int *cur_hole)
+{
+	return dump_holes(xfer, pp, cur_hole, NULL);
 }
 
 /*
