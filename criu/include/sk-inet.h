@@ -50,11 +50,19 @@ struct inet_sk_desc {
 };
 
 struct inet_port;
+enum tcp_socket_restore_mode {
+	TCP_SOCKET_RESTORE_NONE,
+	TCP_SOCKET_RESTORE_REPAIR,
+	TCP_SOCKET_RESTORE_CLOSED,
+	TCP_SOCKET_RESTORE_UNSUPPORTED,
+};
+
 struct inet_sk_info {
 	InetSkEntry *ie;
 	struct file_desc d;
 	struct inet_port *port;
 	struct list_head port_list;
+	enum tcp_socket_restore_mode restore_mode;
 	/*
 	 * This is an fd by which the socket is opened.
 	 * It will be carried down to restorer code to
@@ -86,6 +94,8 @@ extern void cpt_unlock_tcp_connections(void);
 
 extern int dump_one_tcp(int sk, struct inet_sk_desc *sd, SkOptsEntry *soe);
 extern int restore_one_tcp(int sk, struct inet_sk_info *si);
+extern bool tcp_sk_desc_should_restore_closed(const struct inet_sk_desc *sk);
+extern enum tcp_socket_restore_mode tcp_sk_entry_restore_mode(const InetSkEntry *ie);
 
 extern int dump_tcp_opts(int sk, TcpOptsEntry *toe);
 extern int restore_tcp_opts(int sk, TcpOptsEntry *toe);

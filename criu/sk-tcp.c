@@ -1,4 +1,5 @@
 #include <netinet/tcp.h>
+#include <stdbool.h>
 #include <unistd.h>
 #include <stdlib.h>
 #include <sys/mman.h>
@@ -32,6 +33,92 @@
 
 static LIST_HEAD(cpt_tcp_repair_sockets);
 static LIST_HEAD(rst_tcp_repair_sockets);
+
+static bool is_loopback_addr(int family, const u32 *addr)
+{
+	const struct in_addr *addr4 = (const struct in_addr *)addr;
+	const struct in6_addr *addr6 = (const struct in6_addr *)addr;
+
+	if (family == AF_INET)
+		return IN_LOOPBACK(ntohl(addr4->s_addr));
+
+	if (family == AF_INET6) {
+		if (IN6_IS_ADDR_LOOPBACK(addr6))
+			return true;
+
+		if (IN6_IS_ADDR_V4MAPPED(addr6))
+			return IN_LOOPBACK(ntohl(addr6->s6_addr32[3]));
+	}
+
+	return false;
+}
+
+static bool tcp_connection_is_nonloopback(int family, const u32 *src_addr, const u32 *dst_addr)
+{
+	return !is_loopback_addr(family, src_addr) || !is_loopback_addr(family, dst_addr);
+}
+
+static bool tcp_sk_entry_has_addr(const InetSkEntry *ie, size_t n_addr, const u32 *addr)
+{
+	if (!addr)
+		return false;
+
+	if (ie->family == AF_INET)
+		return n_addr >= 1;
+
+	if (ie->family == AF_INET6)
+		return n_addr >= 4;
+
+	return false;
+}
+
+/*
+ * Decide whether a connected socket should be restored as closed rather
+ * than repaired.  --tcp-close always wins; otherwise --tcp-established
+ * closes non-loopback connections while preserving loopback ones.
+ */
+bool tcp_sk_desc_should_restore_closed(const struct inet_sk_desc *sk)
+{
+	if (sk->type != SOCK_STREAM || sk->dst_port == 0)
+		return false;
+
+	if (opts.tcp_close)
+		return true;
+
+	if (!opts.tcp_established_ok)
+		return false;
+
+	return tcp_connection_is_nonloopback(sk->sd.family, sk->src_addr, sk->dst_addr);
+}
+
+/*
+ * Determine how a connected TCP socket should be restored:
+ *   - tcp_close always wins → CLOSED
+ *   - tcp_established + non-loopback → CLOSED
+ *   - tcp_established + loopback → REPAIR
+ *   - neither flag → UNSUPPORTED (CRIU should have refused to dump)
+ */
+enum tcp_socket_restore_mode tcp_sk_entry_restore_mode(const InetSkEntry *ie)
+{
+	if (ie->proto != IPPROTO_TCP || ie->dst_port == 0)
+		return TCP_SOCKET_RESTORE_NONE;
+
+	if (!tcp_sk_entry_has_addr(ie, ie->n_src_addr, ie->src_addr) ||
+	    !tcp_sk_entry_has_addr(ie, ie->n_dst_addr, ie->dst_addr))
+		return TCP_SOCKET_RESTORE_UNSUPPORTED;
+
+	if (opts.tcp_close)
+		return TCP_SOCKET_RESTORE_CLOSED;
+
+	if (opts.tcp_established_ok &&
+	    tcp_connection_is_nonloopback(ie->family, ie->src_addr, ie->dst_addr))
+		return TCP_SOCKET_RESTORE_CLOSED;
+
+	if (opts.tcp_established_ok)
+		return TCP_SOCKET_RESTORE_REPAIR;
+
+	return TCP_SOCKET_RESTORE_UNSUPPORTED;
+}
 
 static int lock_connection(struct inet_sk_desc *sk)
 {
@@ -247,9 +334,13 @@ int dump_one_tcp(int fd, struct inet_sk_desc *sk, SkOptsEntry *soe)
 	if (sk->dst_port == 0)
 		return 0;
 
-	if (opts.tcp_close) {
+	if (tcp_sk_desc_should_restore_closed(sk)) {
+		pr_info("Skipping TCP stream dump for socket %x; it will be restored closed\n", sk->sd.ino);
 		return 0;
 	}
+
+	if (opts.tcp_close)
+		return 0;
 
 	pr_info("Dumping TCP connection\n");
 
@@ -461,11 +552,18 @@ int restore_one_tcp(int fd, struct inet_sk_info *ii)
 
 	pr_info("Restoring TCP connection\n");
 
-	if (opts.tcp_close) {
-		if (shutdown(fd, SHUT_RDWR) && errno != ENOTCONN) {
+	if (ii->restore_mode == TCP_SOCKET_RESTORE_CLOSED) {
+		if (!opts.tcp_close)
+			pr_info("Restoring non-loopback TCP socket id %x ino %x as closed\n", ii->ie->id, ii->ie->ino);
+		if (shutdown(fd, SHUT_RDWR) && errno != ENOTCONN)
 			pr_perror("Unable to shutdown the socket id %x ino %x", ii->ie->id, ii->ie->ino);
-		}
 		return 0;
+	}
+
+	if (ii->restore_mode != TCP_SOCKET_RESTORE_REPAIR) {
+		pr_err("Unexpected TCP restore mode %d for socket id %x ino %x\n", ii->restore_mode, ii->ie->id,
+		       ii->ie->ino);
+		return -1;
 	}
 
 	sk = libsoccr_pause(fd);

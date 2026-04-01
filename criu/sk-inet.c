@@ -197,7 +197,8 @@ static int can_dump_inet_sk(const struct inet_sk_desc *sk)
 	case TCP_CLOSING:
 	case TCP_SYN_SENT:
 		if (!opts.tcp_established_ok && !opts.tcp_close) {
-			pr_err("Connected TCP socket, consider using --%s option.\n", SK_EST_PARAM);
+			pr_err("Connected TCP socket, consider using --%s or --%s.\n",
+			       SK_EST_PARAM, SK_CLOSE_PARAM);
 			return 0;
 		}
 		break;
@@ -709,7 +710,8 @@ static int collect_one_inetsk(void *o, ProtobufCMessage *base, struct cr_img *i)
 	struct inet_sk_info *ii = o;
 
 	ii->ie = pb_msg(base, InetSkEntry);
-	if (tcp_connection(ii->ie))
+	ii->restore_mode = tcp_sk_entry_restore_mode(ii->ie);
+	if (ii->restore_mode == TCP_SOCKET_RESTORE_REPAIR)
 		tcp_locked_conn_add(ii);
 
 	/*
@@ -908,7 +910,7 @@ static int open_inet_sk(struct file_desc *d, int *new_fd)
 		goto err;
 
 	if (tcp_connection(ie)) {
-		if (!opts.tcp_established_ok && !opts.tcp_close) {
+		if (ii->restore_mode == TCP_SOCKET_RESTORE_UNSUPPORTED) {
 			pr_err("Connected TCP socket in image\n");
 			goto err;
 		}
