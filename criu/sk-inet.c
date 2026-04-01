@@ -770,10 +770,14 @@ static int post_open_inet_sk(struct file_desc *d, int sk)
 	ii = container_of(d, struct inet_sk_info, d);
 
 	/*
-	 * TCP sockets are handled at the last moment
-	 * after unlocking connections.
+	 * TCP sockets in REPAIR mode are handled at the last moment
+	 * after unlocking connections.  Sockets restored as CLOSED
+	 * were already shut down in restore_one_tcp and must not be
+	 * scheduled for repair-off.
 	 */
 	if (tcp_connection(ii->ie)) {
+		if (ii->restore_mode != TCP_SOCKET_RESTORE_REPAIR)
+			return 0;
 		pr_debug("Schedule %d socket for repair off\n", sk);
 		BUG_ON(ii->sk_fd != -1);
 		ii->sk_fd = sk;
