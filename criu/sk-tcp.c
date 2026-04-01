@@ -7,6 +7,11 @@
 #include <sched.h>
 #include <netinet/in.h>
 
+/* IN_LOOPBACK lives in <linux/in.h> which conflicts with <netinet/in.h>. */
+#ifndef IN_LOOPBACK
+#define IN_LOOPBACK(a) ((((long int)(a)) & 0xff000000) == 0x7f000000)
+#endif
+
 #include "../soccr/soccr.h"
 
 #include "common/config.h"
