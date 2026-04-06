@@ -45,6 +45,7 @@ struct page_read_iov {
 	size_t n_compressed_size; /* Number of compressed blocks (pages or regions) */
 	uint32_t *compressed_size; /* Per-block compressed sizes */
 	uint64_t total_compressed_size; /* Sum of all compressed sizes */
+	unsigned long n_pages; /* Total uncompressed pages in this batch (cap input) */
 	/*
 	 * Region size in pages when this iov holds region-compressed data.
 	 * 0 means per-page compression (or no compression).
@@ -426,6 +427,7 @@ static int enqueue_async_iov(struct page_read *pr, void *buf, unsigned long len,
 
 	pr_iov->to = iov;
 	pr_iov->nr = 1;
+	pr_iov->n_pages = len / PAGE_SIZE;
 
 	/*
 	 * For uncompressed entries, the end offset is simply
@@ -647,6 +649,37 @@ int pagemap_enqueue_iovec(struct page_read *pr, void *buf, unsigned long len, st
 		return enqueue_async_iov(pr, buf, len, to);
 
 	/*
+	 * Don't merge a compressed read with an uncompressed one (or vice
+	 * versa). process_async_reads() decodes a batch as a whole: a
+	 * compressed batch reads only total_compressed_size bytes and walks
+	 * compressed_size[] block by block, so an uncompressed entry appended
+	 * to it would never have its destination iovecs filled (and the
+	 * reverse would over-read). A single pagemap may legitimately mix the
+	 * two (the compressed reader falls back per-entry), so split here.
+	 */
+	if (!!cur_async->n_compressed_size !=
+	    !!(pr->pe && pr->pe->n_compressed_size))
+		return enqueue_async_iov(pr, buf, len, to);
+
+	/*
+	 * Cap a compressed async batch by its UNCOMPRESSED page count.
+	 * On restore the whole batch is staged in one buffer:
+	 * process_async_reads() reads all compressed bytes at once, and the
+	 * restorer's decompression daemon mmaps a decompressed buffer of
+	 * n_pages * PAGE_SIZE. Bounding pages bounds both (compressed size
+	 * <= uncompressed size). A compressed-byte cap would not bound the
+	 * decompressed buffer -- for highly compressible data (or all-zero
+	 * pages, whose compressed size is 0 and never trips a byte cap) a
+	 * batch could grow to many GiB uncompressed and exhaust host RAM.
+	 * The check is gated on compression; uncompressed async reads go
+	 * straight into their destination iovecs and need no cap.
+	 */
+#define ASYNC_BATCH_MAX_PAGES (1UL << 18) /* 256K pages == 1 GiB */
+	if (pr->pe && pr->pe->n_compressed_size &&
+	    cur_async->n_pages + len / PAGE_SIZE > ASYNC_BATCH_MAX_PAGES)
+		return enqueue_async_iov(pr, buf, len, to);
+
+	/*
 	 * This read is pure continuation of the previous one. Let's
 	 * just add another IOV (or extend one of the existing).
 	 */
@@ -673,6 +706,14 @@ int pagemap_enqueue_iovec(struct page_read *pr, void *buf, unsigned long len, st
 
 		cur_async->nr = n_iovs;
 	}
+
+	/*
+	 * Count the pages only once the read is actually appended to this
+	 * batch -- after the IOV_MAX spill (which redirects to a fresh
+	 * piov) so the cap input is not inflated by pages that landed
+	 * elsewhere.
+	 */
+	cur_async->n_pages += len / PAGE_SIZE;
 
 	/* Extend the end offset. For compressed entries, append
 	 * per-block sizes and advance by compressed bytes. */
