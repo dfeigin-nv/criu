@@ -3,6 +3,7 @@
 #include <sys/mman.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <string.h>
 #include <sys/syscall.h>
 #include <sys/prctl.h>
 
@@ -1509,6 +1510,56 @@ static int prepare_vma_ios(struct pstree_item *t, struct task_restore_args *ta)
 		return -1;
 
 	ta->vma_ios_fd = img_raw_fd(pages);
+	if (ta->vma_ios_fd >= 0) {
+		int fl = fcntl(ta->vma_ios_fd, F_GETFL);
+		if (fl >= 0) {
+			int ret = fcntl(ta->vma_ios_fd, F_SETFL, fl | O_DIRECT);
+			if (ret < 0) {
+				pr_warn("Failed to set O_DIRECT on pages fd: %s\n", strerror(errno));
+			} else {
+				/*
+				 * Probe that O_DIRECT reads actually work. Some
+				 * filesystems accept O_DIRECT via fcntl but reject
+				 * aligned reads with EINVAL.
+				 *
+				 * PAGE_SIZE is not a compile-time constant on
+				 * aarch64, so the probe buffer is allocated via
+				 * posix_memalign() instead of a stack array with
+				 * __attribute__((aligned)).
+				 */
+				void *probe = NULL;
+				ssize_t probe_ret;
+				int memerr = posix_memalign(&probe, PAGE_SIZE, PAGE_SIZE);
+
+				if (memerr) {
+					pr_err("O_DIRECT probe alloc failed on pages fd %d: %s\n",
+					       ta->vma_ios_fd, strerror(memerr));
+					close_image(pages);
+					return -1;
+				}
+
+				probe_ret = pread(ta->vma_ios_fd, probe, PAGE_SIZE, 0);
+				xfree(probe);
+				if (probe_ret < 0) {
+					if (errno != EINVAL) {
+						pr_perror("O_DIRECT probe failed on pages fd %d", ta->vma_ios_fd);
+						close_image(pages);
+						return -1;
+					}
+					pr_info("O_DIRECT rejected at read time on pages fd %d, using buffered I/O\n",
+						ta->vma_ios_fd);
+					if (fcntl(ta->vma_ios_fd, F_SETFL, fl) < 0) {
+						pr_perror("Failed to clear O_DIRECT on pages fd %d", ta->vma_ios_fd);
+						close_image(pages);
+						return -1;
+					}
+					/* Hint the kernel that fallback buffered reads will mostly
+					 * advance through the pages file in offset order. */
+					posix_fadvise(ta->vma_ios_fd, 0, 0, POSIX_FADV_SEQUENTIAL);
+				}
+			}
+		}
+	}
 	return pagemap_render_iovec(&rsti(t)->vma_io, ta);
 }
 

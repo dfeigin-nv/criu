@@ -1,6 +1,8 @@
 #include <fcntl.h>
 #include <stdio.h>
 #include <unistd.h>
+#include <errno.h>
+#include <string.h>
 #include <linux/falloc.h>
 #include <sys/uio.h>
 #include <limits.h>
@@ -236,6 +238,8 @@ static int read_local_page(struct page_read *pr, unsigned long vaddr, unsigned l
 	int fd;
 	ssize_t ret;
 	size_t curr = 0;
+	void *aligned_buf = NULL;
+	void *read_buf = buf;
 
 	fd = img_raw_fd(pr->pi);
 	if (fd < 0) {
@@ -249,16 +253,36 @@ static int read_local_page(struct page_read *pr, unsigned long vaddr, unsigned l
 	if (pr->sync(pr))
 		return -1;
 
+	if (pr->use_direct) {
+		if (((unsigned long)buf & (PAGE_SIZE - 1)) || (len & (PAGE_SIZE - 1)) ||
+		    (pr->pi_off & (PAGE_SIZE - 1))) {
+			int err;
+
+			err = posix_memalign(&aligned_buf, PAGE_SIZE, len);
+			if (err) {
+				pr_err("Can't allocate aligned buffer for direct read (%lu bytes, err=%d)\n", len, err);
+				return -1;
+			}
+			read_buf = aligned_buf;
+		}
+	}
+
 	pr_debug("\tpr%lu-%u Read page from self %lx/%" PRIx64 "\n", pr->img_id, pr->id, pr->cvaddr, pr->pi_off);
 	while (1) {
-		ret = pread(fd, buf + curr, len - curr, pr->pi_off + curr);
+		ret = pread(fd, read_buf + curr, len - curr, pr->pi_off + curr);
 		if (ret < 1) {
 			pr_perror("Can't read mapping page %zd", ret);
+			xfree(aligned_buf);
 			return -1;
 		}
 		curr += ret;
 		if (curr == len)
 			break;
+	}
+
+	if (aligned_buf) {
+		memcpy(buf, aligned_buf, len);
+		xfree(aligned_buf);
 	}
 
 	if (opts.auto_dedup && !pr->disable_dedup) {
@@ -802,6 +826,7 @@ int open_page_read_at(int dfd, unsigned long img_id, struct page_read *pr, int p
 	pr->pmes = NULL;
 	pr->pieok = false;
 	pr->disable_dedup = false;
+	pr->use_direct = false;
 
 	pr->pmi = open_image_at(dfd, i_typ, O_RSTR, img_id);
 	if (!pr->pmi)
@@ -821,6 +846,65 @@ int open_page_read_at(int dfd, unsigned long img_id, struct page_read *pr, int p
 	if (!pr->pi) {
 		close_page_read(pr);
 		return -1;
+	}
+
+	{
+		int pfd = img_raw_fd(pr->pi);
+
+		if (pfd >= 0 && !opts.stream) {
+			int fl = fcntl(pfd, F_GETFL);
+
+			if (fl >= 0) {
+				int ret = fcntl(pfd, F_SETFL, fl | O_DIRECT);
+
+				if (ret < 0) {
+					pr_warn("Failed to set O_DIRECT on pages fd %d: %s\n", pfd, strerror(errno));
+				} else {
+					/*
+					 * PAGE_SIZE is not a compile-time constant on
+					 * aarch64, so the probe buffer is allocated via
+					 * posix_memalign() instead of a stack array with
+					 * __attribute__((aligned)).
+					 */
+					void *probe = NULL;
+					ssize_t probe_ret;
+					int memerr;
+
+					memerr = posix_memalign(&probe, PAGE_SIZE, PAGE_SIZE);
+					if (memerr) {
+						pr_err("O_DIRECT probe alloc failed on pages fd %d: %s\n",
+						       pfd, strerror(memerr));
+						close_page_read(pr);
+						return -1;
+					}
+
+					probe_ret = pread(pfd, probe, PAGE_SIZE, 0);
+					xfree(probe);
+					if (probe_ret < 0) {
+						if (errno != EINVAL) {
+							pr_perror("O_DIRECT probe failed on pages fd %d", pfd);
+							close_page_read(pr);
+							return -1;
+						}
+
+						pr_info("O_DIRECT rejected at read time on pages fd %d, using buffered I/O\n",
+							pfd);
+						if (fcntl(pfd, F_SETFL, fl) < 0) {
+							pr_perror("Failed to clear O_DIRECT on pages fd %d", pfd);
+							close_page_read(pr);
+							return -1;
+						}
+
+						/* Hint the kernel that fallback buffered reads will mostly
+						 * advance through the pages file in offset order. */
+						posix_fadvise(pfd, 0, 0, POSIX_FADV_SEQUENTIAL);
+					} else {
+						pr_debug("O_DIRECT enabled on pages fd %d\n", pfd);
+						pr->use_direct = true;
+					}
+				}
+			}
+		}
 	}
 
 	if (init_pagemaps(pr)) {
