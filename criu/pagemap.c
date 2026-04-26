@@ -28,6 +28,9 @@
 
 #define MAX_BUNCH_SIZE 256
 
+#define OFF_MAX (sizeof(off_t) == sizeof(long long) ? LLONG_MAX : sizeof(off_t) == sizeof(int) ? INT_MAX : -999999)
+#define OFF_MIN (sizeof(off_t) == sizeof(long long) ? LLONG_MIN : sizeof(off_t) == sizeof(int) ? INT_MIN : -999999)
+
 /*
  * One "job" for the preadv() syscall in pagemap.c
  */
@@ -529,12 +532,42 @@ static void advance_piov(struct page_read_iov *piov, ssize_t len)
 	pr_debug("Advanced iov %zu bytes, %d->%d iovs, %zu tail\n", olen, onr, piov->nr, len);
 }
 
+/*
+ * Drain (free without reading) all async entries in pr and its parent chain.
+ * Called on error paths to satisfy BUG_ON(!list_empty(&pr->async)) in
+ * close_page_read().
+ */
+static void drain_async_queue(struct page_read *pr)
+{
+	struct page_read_iov *piov, *n;
+
+	list_for_each_entry_safe(piov, n, &pr->async, l) {
+		list_del(&piov->l);
+		xfree(piov->to);
+		xfree(piov);
+	}
+	if (pr->parent)
+		drain_async_queue(pr->parent);
+}
+
 static int process_async_reads(struct page_read *pr)
 {
 	int fd, ret = 0;
 	struct page_read_iov *piov, *n;
+	off_t first_off = OFF_MAX, last_end = OFF_MIN;
 
 	fd = img_raw_fd(pr->pi);
+	if (!pr->use_direct) {
+		list_for_each_entry(piov, &pr->async, l) {
+			first_off = min(piov->from, first_off);
+			last_end = max(piov->end, last_end);
+		}
+		if (last_end > first_off) {
+			if (posix_fadvise(fd, first_off, (off_t)(last_end - first_off), POSIX_FADV_WILLNEED) != 0)
+				pr_debug("posix_fadvise(WILLNEED) failed for async range\n");
+		}
+	}
+
 	list_for_each_entry_safe(piov, n, &pr->async, l) {
 		ssize_t ret;
 		struct iovec *iovs = piov->to;
@@ -549,26 +582,27 @@ static int process_async_reads(struct page_read *pr)
 			 * purposes let's try to force the advance_piov()
 			 * and re-read tail.
 			 */
-			if (ret > 0 && piov->nr >= 2) {
+			if (ret >= 2 * PAGE_SIZE) {
 				pr_debug("`- trim preadv %zu\n", ret);
 				ret /= 2;
+				ret &= PAGE_MASK;
 			}
 		}
 
 		if (ret < 0) {
 			pr_err("Can't read async pr bytes (%zd / %ju read, %ju off, %d iovs)\n", ret,
 			       piov->end - piov->from, piov->from, piov->nr);
-			return -1;
+			goto err;
 		}
 
 		if (ret == 0 && piov->end != piov->from) {
 			pr_err("Unexpected EOF reading pages: expected %ju more bytes at offset %ju\n",
 			       piov->end - piov->from, piov->from);
-			return -1;
+			goto err;
 		}
 
 		if (opts.auto_dedup && punch_hole(pr, piov->from, ret, false))
-			return -1;
+			goto err;
 
 		if (ret != piov->end - piov->from) {
 			/*
@@ -585,7 +619,6 @@ static int process_async_reads(struct page_read *pr)
 		}
 
 		BUG_ON(pr->io_complete); /* FIXME -- implement once needed */
-
 		list_del(&piov->l);
 		xfree(iovs);
 		xfree(piov);
@@ -595,6 +628,9 @@ static int process_async_reads(struct page_read *pr)
 		ret = process_async_reads(pr->parent);
 
 	return ret;
+err:
+	drain_async_queue(pr);
+	return -1;
 }
 
 static void close_page_read(struct page_read *pr)
