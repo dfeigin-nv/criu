@@ -1607,37 +1607,52 @@ static int fd_poll(int inotify_fd)
 }
 
 /*
- * Call preadv() but limit size of the read. Zero `max_to_read` skips the limit.
+ * Advance restore_vma_io by 'res' bytes consumed. Updates rio in place.
+ * Returns the new (iov_ptr, nr_iovs) for resubmission, or 0 if fully done.
+ * Used when AIO returns a short read (kernel MAX_RW_COUNT = 0x7FFFF000 limit).
  */
-static ssize_t preadv_limited(int fd, struct iovec *iovs, int nr, off_t offs, size_t max_to_read)
+static void advance_vma_io_retry(struct restore_vma_io *rio, ssize_t res,
+				 struct iovec **iov_out, unsigned int *nr_out)
 {
-	size_t saved_last_iov_len = 0;
-	ssize_t ret;
+	size_t remaining;
+	unsigned int j = 0;
 
-	if (max_to_read) {
-		for (int i = 0; i < nr; ++i) {
-			if (iovs[i].iov_len <= max_to_read) {
-				max_to_read -= iovs[i].iov_len;
-				continue;
-			}
+	/*
+	 * AIO fd is O_DIRECT (or buffered fallback that tolerates alignment).
+	 * Mask to PAGE_SIZE so resubmits stay alignment-legal.
+	 */
+	res &= ~(PAGE_SIZE - 1);
+	if (res == 0) {
+		*iov_out = NULL;
+		*nr_out = 0;
+		return;
+	}
 
-			if (!max_to_read) {
-				nr = i;
-				break;
-			}
+	remaining = (size_t)res;
+	rio->off += (off_t)res;
 
-			saved_last_iov_len = iovs[i].iov_len;
-			iovs[i].iov_len = max_to_read;
-			nr = i + 1;
+	while (j < (unsigned int)rio->nr_iovs && remaining > 0) {
+		size_t len = (size_t)rio->iovs[j].iov_len;
+		if (len <= remaining) {
+			remaining -= len;
+			rio->iovs[j].iov_len = 0;
+			j++;
+		} else {
+			rio->iovs[j].iov_base = (char *)rio->iovs[j].iov_base + remaining;
+			rio->iovs[j].iov_len = len - remaining;
+			remaining = 0;
 			break;
 		}
 	}
-
-	ret = sys_preadv(fd, iovs, nr, offs);
-	if (saved_last_iov_len)
-		iovs[nr - 1].iov_len = saved_last_iov_len;
-
-	return ret;
+	while (j < (unsigned int)rio->nr_iovs && rio->iovs[j].iov_len == 0)
+		j++;
+	if (j == (unsigned int)rio->nr_iovs) {
+		*iov_out = NULL;
+		*nr_out = 0;
+	} else {
+		*iov_out = &rio->iovs[j];
+		*nr_out = (unsigned int)rio->nr_iovs - j;
+	}
 }
 
 /*
@@ -1927,66 +1942,171 @@ __visible long __export_restore_task(struct task_restore_args *args)
 	}
 
 	/*
-	 * Now read the contents (if any)
+	 * Now read the contents (if any).
+	 * Use Native AIO (io_submit + O_DIRECT) for high-throughput page reads.
+	 * Handles short reads (MAX_RW_COUNT 0x7FFFF000) by advancing and resubmitting.
 	 */
+	if (args->vma_ios_n > 0 && args->vma_ios_fd != -1) {
+		unsigned int n = args->vma_ios_n;
+		int fd = args->vma_ios_fd;
+		aio_context_t aio_ctx = 0;
+		long aio_ret;
+		struct iocb *iocbs;
+		struct iocb **iocbps;
+		struct restore_vma_io **rio_ptrs;
+		struct io_event *events;
+		unsigned long alloc_sz;
+		unsigned int submitted = 0, completed = 0;
 
-	rio = args->vma_ios;
-	for (i = 0; i < args->vma_ios_n; i++) {
-		struct iovec *iovs = rio->iovs;
-		int nr = rio->nr_iovs;
-		ssize_t r;
+#define AIO_BATCH 128
 
-		while (nr) {
-			pr_debug("Preadv %lx:%d... (%d iovs)\n", (unsigned long)iovs->iov_base, (int)iovs->iov_len, nr);
-			/*
-			 * If we're requested to punch holes in the file after reading we do
-			 * it to save memory. Limit the reads then to an arbitrary block size.
-			 */
-			r = preadv_limited(args->vma_ios_fd, iovs, nr, rio->off,
-					   args->auto_dedup ? AUTO_DEDUP_OVERHEAD_BYTES : 0);
-			if (r < 0) {
-				pr_err("Can't read pages data (%d)\n", (int)r);
-				goto core_restore_end;
-			}
-
-			if (r == 0) {
-				pr_err("Unexpected EOF reading pages data at offset %ld (%d iovs remaining)\n",
-				       (long)rio->off, nr);
-				goto core_restore_end;
-			}
-
-			pr_debug("`- returned %ld\n", (long)r);
-			/* If the file is open for writing, then it means we should punch holes
-			 * in it. */
-			if (r > 0 && args->auto_dedup) {
-				int fr = sys_fallocate(args->vma_ios_fd, FALLOC_FL_KEEP_SIZE | FALLOC_FL_PUNCH_HOLE,
-						       rio->off, r);
-				if (fr < 0) {
-					pr_debug("Failed to punch holes with fallocate: %d\n", fr);
-				}
-			}
-			rio->off += r;
-			/* Advance the iovecs */
-			do {
-				if (iovs->iov_len <= r) {
-					pr_debug("   `- skip pagemap\n");
-					r -= iovs->iov_len;
-					iovs++;
-					nr--;
-					continue;
-				}
-
-				iovs->iov_base += r;
-				iovs->iov_len -= r;
-				break;
-			} while (nr > 0);
+		aio_ret = sys_io_setup(AIO_BATCH, &aio_ctx);
+		if (aio_ret < 0) {
+			pr_err("io_setup(%d) failed: %ld\n", AIO_BATCH, aio_ret);
+			goto core_restore_end;
 		}
 
-		rio = ((void *)rio) + RIO_SIZE(rio->nr_iovs);
-	}
+		alloc_sz = n * sizeof(struct iocb) + n * sizeof(struct iocb *) + n * sizeof(struct restore_vma_io *) + AIO_BATCH * sizeof(struct io_event);
+		iocbs = (void *)sys_mmap(NULL, alloc_sz, PROT_READ | PROT_WRITE,
+					 MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+		if (IS_ERR(iocbs)) {
+			pr_err("Can't mmap AIO buffers: %ld\n", PTR_ERR(iocbs));
+			sys_io_destroy(aio_ctx);
+			goto core_restore_end;
+		}
+		iocbps = (struct iocb **)((void *)iocbs + n * sizeof(struct iocb));
+		rio_ptrs = (struct restore_vma_io **)((void *)iocbps + n * sizeof(struct iocb *));
+		events = (struct io_event *)((void *)rio_ptrs + n * sizeof(struct restore_vma_io *));
 
-	if (args->vma_ios_fd != -1)
-		sys_close(args->vma_ios_fd);
+		/* Build all iocbs from vma_ios */
+		rio = args->vma_ios;
+		for (i = 0; i < (int)n; i++) {
+			struct iocb *cb = &iocbs[i];
+			size_t expected = 0;
+
+			for (int j = 0; j < rio->nr_iovs; j++)
+				expected += rio->iovs[j].iov_len;
+
+			memset(cb, 0, sizeof(*cb));
+			cb->aio_fildes = fd;
+			cb->aio_lio_opcode = IOCB_CMD_PREADV;
+			cb->aio_buf = (unsigned long)rio->iovs;
+			cb->aio_nbytes = rio->nr_iovs;
+			cb->aio_offset = rio->off;
+			/* io_getevents() returns this as event.data for short-read checks. */
+			cb->aio_data = expected;
+			iocbps[i] = cb;
+			rio_ptrs[i] = rio;
+
+			rio = (void *)rio + RIO_SIZE(rio->nr_iovs);
+		}
+
+		/* Submit and reap in batches */
+		while (submitted < n || completed < n) {
+			while (submitted < n && (submitted - completed) < AIO_BATCH) {
+				unsigned int batch = n - submitted;
+				if (batch > AIO_BATCH - (submitted - completed))
+					batch = AIO_BATCH - (submitted - completed);
+				aio_ret = sys_io_submit(aio_ctx, batch, &iocbps[submitted]);
+				if (aio_ret <= 0) {
+					pr_err("io_submit failed: %ld (submitted %u/%u)\n",
+					       aio_ret, submitted, n);
+					goto aio_error;
+				}
+				submitted += aio_ret;
+			}
+
+			if (completed < n) {
+				/* min_nr=1 to block until at least one event; nr=AIO_BATCH to reap all (incl. retries) */
+				aio_ret = sys_io_getevents(aio_ctx, 1, AIO_BATCH, events, NULL);
+				if (aio_ret <= 0) {
+					pr_err("io_getevents failed: %ld\n", aio_ret);
+					goto aio_error;
+				}
+				for (long k = 0; k < aio_ret; k++) {
+					ssize_t res = events[k].res;
+					struct iocb *cb;
+
+					if (res < 0) {
+						pr_err("AIO read failed: %lld\n", events[k].res);
+						goto aio_error;
+					}
+					if (res == 0) {
+						pr_err("AIO zero read (expected %llu)\n",
+						       events[k].data);
+						goto aio_error;
+					}
+
+					cb = (struct iocb *)(unsigned long)events[k].obj;
+
+					/*
+					 * Short read (e.g. MAX_RW_COUNT 0x7FFFF000):
+					 * mask to page-aligned so retry submit and the
+					 * auto-dedup punch agree on the consumed range.
+					 * A sub-page residual is unrecoverable on O_DIRECT.
+					 */
+					if ((__u64)res != events[k].data) {
+						res &= ~(PAGE_SIZE - 1);
+						if (res == 0) {
+							pr_err("AIO sub-page short read: %lld of %llu\n",
+							       events[k].res, events[k].data);
+							goto aio_error;
+						}
+					}
+
+					if (args->auto_dedup)
+						sys_fallocate(fd,
+							      FALLOC_FL_KEEP_SIZE | FALLOC_FL_PUNCH_HOLE,
+							      (off_t)cb->aio_offset, (off_t)res);
+
+					if ((__u64)res == events[k].data) {
+						completed++;
+						continue;
+					}
+
+					{
+						unsigned int idx = cb - iocbs;
+						struct restore_vma_io *r = rio_ptrs[idx];
+						struct iovec *iov_next;
+						unsigned int nr_next;
+						long ret2;
+
+						advance_vma_io_retry(r, res, &iov_next, &nr_next);
+						if (!iov_next || nr_next == 0) {
+							pr_err("AIO retry advance produced no work after %zd bytes\n",
+							       res);
+							goto aio_error;
+						}
+						cb->aio_buf = (unsigned long)iov_next;
+						cb->aio_nbytes = nr_next;
+						cb->aio_offset = r->off;
+						cb->aio_data -= (__u64)res;
+						ret2 = sys_io_submit(aio_ctx, 1, &cb);
+						if (ret2 != 1) {
+							pr_err("AIO retry submit failed: %ld\n", ret2);
+							goto aio_error;
+						}
+					}
+				}
+			}
+		}
+
+		goto aio_done;
+		/* aio_error is reached only after io_setup() and AIO buffer mmap()
+		 * succeed. */
+aio_error:
+		sys_io_destroy(aio_ctx);
+		sys_munmap(iocbs, alloc_sz);
+		sys_close(fd);
+		args->vma_ios_fd = -1;
+		goto core_restore_end;
+aio_done:
+		sys_io_destroy(aio_ctx);
+		sys_munmap(iocbs, alloc_sz);
+		sys_close(fd);
+		args->vma_ios_fd = -1;
+#undef AIO_BATCH
+	}
 
 	/*
 	 * Proxify vDSO.
