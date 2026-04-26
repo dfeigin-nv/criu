@@ -3,8 +3,10 @@
 #include <sys/mman.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <string.h>
 #include <sys/syscall.h>
 #include <sys/prctl.h>
+#include <stdlib.h>
 
 #include "types.h"
 #include "cr_options.h"
@@ -27,6 +29,7 @@
 #include "bitmap.h"
 #include "sk-packet.h"
 #include "files-reg.h"
+#include "pagemap.h"
 #include "pagemap-cache.h"
 #include "fault-injection.h"
 #include "prctl.h"
@@ -1130,6 +1133,7 @@ static int restore_priv_vma_content(struct pstree_item *t, struct page_read *pr)
 {
 	struct vma_area *vma;
 	int ret = 0;
+	int exit_code = -1;
 	struct list_head *vmas = &rsti(t)->vmas.h;
 	struct list_head *vma_io = &rsti(t)->vma_io;
 
@@ -1140,9 +1144,18 @@ static int restore_priv_vma_content(struct pstree_item *t, struct page_read *pr)
 	unsigned int nr_enqueued = 0;
 	unsigned int nr_lazy = 0;
 	unsigned long va;
+	void *buf = NULL;
+	int memerr;
 
 	vma = list_first_entry(vmas, struct vma_area, list);
 	rsti(t)->pages_img_id = pr->pages_img_id;
+
+	/* O_DIRECT may require the buffer to be aligned. */
+	memerr = posix_memalign(&buf, PAGE_SIZE, PAGE_SIZE);
+	if (memerr) {
+		pr_err("Can't allocate COW buffer: %s\n", strerror(memerr));
+		return -1;
+	}
 
 	/*
 	 * Read page contents.
@@ -1169,7 +1182,6 @@ static int restore_priv_vma_content(struct pstree_item *t, struct page_read *pr)
 		}
 
 		for (i = 0; i < nr_pages; i++) {
-			unsigned char buf[PAGE_SIZE];
 			void *p;
 
 			/*
@@ -1205,7 +1217,7 @@ static int restore_priv_vma_content(struct pstree_item *t, struct page_read *pr)
 				}
 
 				if (pagemap_enqueue_iovec(pr, (void *)va, len, vma_io))
-					return -1;
+					goto out;
 
 				pr->skip_pages(pr, len);
 
@@ -1272,11 +1284,13 @@ static int restore_priv_vma_content(struct pstree_item *t, struct page_read *pr)
 
 err_read:
 	if (pr->sync(pr))
-		return -1;
+		goto out;
 
 	pr->close(pr);
-	if (ret < 0)
-		return ret;
+	if (ret < 0) {
+		exit_code = ret;
+		goto out;
+	}
 
 	/* Remove pages, which were not shared with a child */
 	list_for_each_entry(vma, vmas, list) {
@@ -1300,7 +1314,7 @@ err_read:
 			ret = madvise(addr + PAGE_SIZE * i, PAGE_SIZE, MADV_DONTNEED);
 			if (ret < 0) {
 				pr_perror("madvise failed");
-				return -1;
+				goto out;
 			}
 			i++;
 			nr_dropped++;
@@ -1317,11 +1331,14 @@ err_read:
 	pr_info("nr_enqueued:       %d\n", nr_enqueued);
 	pr_info("nr_lazy:           %d\n", nr_lazy);
 
-	return 0;
+	exit_code = 0;
+	goto out;
 
 err_addr:
 	pr_err("Page entry address %lx outside of VMA %lx-%lx\n", va, (long)vma->e->start, (long)vma->e->end);
-	return -1;
+out:
+	xfree(buf);
+	return exit_code;
 }
 
 static int maybe_disable_thp(struct pstree_item *t, struct page_read *pr)
@@ -1507,6 +1524,7 @@ static int prepare_vma_ios(struct pstree_item *t, struct task_restore_args *ta)
 		ta->vma_ios = NULL;
 		ta->vma_ios_n = 0;
 		ta->vma_ios_fd = -1;
+		ta->vma_ios_use_direct = false;
 		return 0;
 	}
 
@@ -1519,6 +1537,14 @@ static int prepare_vma_ios(struct pstree_item *t, struct task_restore_args *ta)
 		return -1;
 
 	ta->vma_ios_fd = img_raw_fd(pages);
+	if (ta->vma_ios_fd >= 0) {
+		int direct = probe_pages_o_direct(ta->vma_ios_fd);
+		if (direct < 0) {
+			close_image(pages);
+			return -1;
+		}
+		ta->vma_ios_use_direct = (direct == 1);
+	}
 	return pagemap_render_iovec(&rsti(t)->vma_io, ta);
 }
 
