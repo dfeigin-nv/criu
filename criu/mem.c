@@ -1673,67 +1673,75 @@ int open_vmas(struct pstree_item *t)
  */
 /*
  * Pipeline C wire protocol on the per-task private-pages socket:
- *   1) streamer -> CRIU: SCM_RIGHTS carrying [pages_memfd, futex_memfd]
- *                        in a single sendmsg, no payload bytes.
+ *   1) streamer -> CRIU: SCM_RIGHTS carrying [pages_memfd] in one
+ *                        sendmsg, no payload bytes.
+ *   2) streamer -> CRIU: 1 plain byte ('A') after the streamer finishes
+ *                        writing all private-VMA bytes to the memfd.
+ *                        CRIU blocks reading this byte before letting
+ *                        PIE run, so the memfd content is complete by
+ *                        the time PIE's io_submit reads it.
  *
- * The pages_memfd is the streamer-filled scratch image read by PIE's
- * io_submit. The futex_memfd is sized vma_ios_n * sizeof(uint32) and
- * mmap'd MAP_SHARED on both sides so the streamer can write the per-
- * range ready word and FUTEX_WAKE the PIE restorer once the matching
- * range has landed.
+ * Cross-process futex signalling (the original two-fd design with a
+ * separate futex_memfd) was rejected because the streamer-mmap'd
+ * region is in the criu restore process address space, but PIE's
+ * unmap_old_vmas nukes everything outside the bootstrap + premapped
+ * regions. The shmalloc-backed PIE futex array (alloc_streamer_futex
+ * _array) IS preserved across unmap; we keep it for forward-compat
+ * with the async streamer, but mem.c pre-fills the words to 1 right
+ * after the ack so PIE never has to wait.
  */
-static int recv_streamer_private_fds(int *out_pages_fd, int *out_futex_fd)
+static int recv_streamer_private_fd(int *out_pages_fd)
 {
-	int sock, fds[2];
+	int sock, fd;
+	char ack = 0;
 
-	/*
-	 * The streamer sock was installed as a service fd in
-	 * cr_restore_tasks() so it survives close_old_fds() in each
-	 * forked task. Pull it back out here.
-	 */
 	sock = get_service_fd(STREAM_PRIVATE_SK_OFF);
 	if (sock < 0) {
 		pr_err("--stream-restore set but STREAM_PRIVATE_SK_OFF service fd is missing\n");
 		return -1;
 	}
-	if (recv_fds(sock, fds, 2, NULL, 0) < 0) {
-		pr_perror("Failed to receive streamer private fds on sock %d", sock);
+	if (recv_fds(sock, &fd, 1, NULL, 0) < 0) {
+		pr_perror("Failed to receive streamer private memfd on sock %d", sock);
 		return -1;
 	}
-	*out_pages_fd = fds[0];
-	*out_futex_fd = fds[1];
+	if (read(sock, &ack, 1) != 1 || ack != 'A') {
+		pr_perror("Failed to receive streamer fill-done ack (got 0x%02x)",
+			  (unsigned)ack);
+		close(fd);
+		return -1;
+	}
+	*out_pages_fd = fd;
 	return 0;
 }
 
 /*
- * Map the streamer-created futex memfd into this process. Same memfd is
- * mmap'd MAP_SHARED by the streamer; fork() carries the mapping into
- * the PIE restorer, so PIE can FUTEX_WAIT on the words the streamer
- * FUTEX_WAKEs as each range's bytes land.
+ * Allocate the per-vma_io readiness futex array in shmalloc'd memory so
+ * the words survive fork() AND unmap_old_vmas() into the PIE restorer.
+ * shmalloc'd memory is in the rst-malloc MAP_SHARED|MAP_ANONYMOUS pool
+ * mapped at restorer-fixed addresses preserved across unmap.
  *
- * Replaces the earlier shmalloc-only path because the streamer is a
- * separate process and shmalloc's MAP_ANONYMOUS|MAP_SHARED region is
- * not addressable from outside the criu process group.
+ * Pre-filled to 1 by the caller right after the streamer ack: in the
+ * synchronous local-files smoke + first-cut S3 paths the streamer is
+ * fully done by the time PIE runs, so PIE's futex_wait loop short-
+ * circuits on the first check. Async overlap can later replace the
+ * ack with per-range eventfd notifications + a helper that writes
+ * shmalloc'd words + FUTEX_WAKE.
  */
-static unsigned int *map_streamer_futex_array(int futex_fd, unsigned int n)
+static unsigned int *alloc_streamer_futex_array(unsigned int n)
 {
+	unsigned int *fut;
 	size_t bytes;
-	void *p;
 
 	if (n == 0)
 		return NULL;
 	bytes = (size_t)n * sizeof(unsigned int);
-
-	if (ftruncate(futex_fd, bytes) < 0) {
-		pr_perror("Failed to ftruncate streamer futex memfd to %zu", bytes);
+	fut = shmalloc(bytes);
+	if (!fut) {
+		pr_err("Failed to shmalloc %u-entry streamer futex array\n", n);
 		return NULL;
 	}
-	p = mmap(NULL, bytes, PROT_READ | PROT_WRITE, MAP_SHARED, futex_fd, 0);
-	if (p == MAP_FAILED) {
-		pr_perror("Failed to mmap streamer futex memfd (%u entries)", n);
-		return NULL;
-	}
-	return (unsigned int *)p;
+	memset(fut, 0, bytes);
+	return fut;
 }
 
 static int prepare_vma_ios(struct pstree_item *t, struct task_restore_args *ta)
@@ -1760,9 +1768,10 @@ static int prepare_vma_ios(struct pstree_item *t, struct task_restore_args *ta)
 	}
 
 	if (opts.stream_restore) {
-		int pages_fd = -1, futex_fd = -1;
+		int pages_fd = -1;
+		unsigned int i;
 
-		if (recv_streamer_private_fds(&pages_fd, &futex_fd) < 0)
+		if (recv_streamer_private_fd(&pages_fd) < 0)
 			return -1;
 
 		ta->vma_ios_fd = pages_fd;
@@ -1773,16 +1782,22 @@ static int prepare_vma_ios(struct pstree_item *t, struct task_restore_args *ta)
 		 */
 		ta->vma_ios_use_direct = false;
 
-		if (pagemap_render_iovec(&rsti(t)->vma_io, ta) < 0) {
-			close(futex_fd);
+		if (pagemap_render_iovec(&rsti(t)->vma_io, ta) < 0)
 			return -1;
-		}
 
-		ta->streamer_private_ready_futex = map_streamer_futex_array(futex_fd, ta->vma_ios_n);
-		close(futex_fd);
+		ta->streamer_private_ready_futex = alloc_streamer_futex_array(ta->vma_ios_n);
 		if (ta->vma_ios_n && !ta->streamer_private_ready_futex)
 			return -1;
 		ta->streamer_private_ready_futex_n = ta->vma_ios_n;
+
+		/*
+		 * The streamer already acked all ranges before we got here,
+		 * so the memfd content is complete. Mark every futex word
+		 * ready so PIE's wait-loop in restorer.c:1895 / 2050 falls
+		 * through on the first atomic load.
+		 */
+		for (i = 0; i < ta->streamer_private_ready_futex_n; i++)
+			ta->streamer_private_ready_futex[i] = 1;
 		return 0;
 	}
 
