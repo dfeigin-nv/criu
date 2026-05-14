@@ -1069,7 +1069,8 @@ static void rst_tcp_socks_all(struct task_restore_args *ta)
 		rst_tcp_repair_off(&ta->tcp_socks[i]);
 }
 
-static int enable_uffd(int uffd, unsigned long addr, unsigned long len)
+static int enable_uffd(int uffd, unsigned long addr, unsigned long len,
+		       unsigned long mode)
 {
 	int rc;
 	struct uffdio_register uffdio_register;
@@ -1084,9 +1085,9 @@ static int enable_uffd(int uffd, unsigned long addr, unsigned long len)
 
 	uffdio_register.range.start = addr;
 	uffdio_register.range.len = len;
-	uffdio_register.mode = UFFDIO_REGISTER_MODE_MISSING;
+	uffdio_register.mode = mode;
 
-	pr_info("lazy-pages: register: %lx, len %lx\n", addr, len);
+	pr_info("lazy-pages: register: %lx, len %lx, mode %lx\n", addr, len, mode);
 
 	rc = sys_ioctl(uffd, UFFDIO_REGISTER, (unsigned long)&uffdio_register);
 	if (rc != 0) {
@@ -1094,10 +1095,21 @@ static int enable_uffd(int uffd, unsigned long addr, unsigned long len)
 		return -1;
 	}
 
-	expected_ioctls = (1 << _UFFDIO_WAKE) | (1 << _UFFDIO_COPY) | (1 << _UFFDIO_ZEROPAGE);
+	/*
+	 * Expected ioctls depend on the registration mode. MISSING-mode
+	 * faults are serviced via UFFDIO_COPY/UFFDIO_ZEROPAGE; MINOR-mode
+	 * faults are serviced via UFFDIO_CONTINUE (Pipeline C). In either
+	 * case UFFDIO_WAKE must be supported on the range.
+	 */
+	if (mode & UFFDIO_REGISTER_MODE_MINOR)
+		expected_ioctls = (1 << _UFFDIO_WAKE) | (1 << _UFFDIO_CONTINUE);
+	else
+		expected_ioctls = (1 << _UFFDIO_WAKE) | (1 << _UFFDIO_COPY) |
+				  (1 << _UFFDIO_ZEROPAGE);
 
 	if ((uffdio_register.ioctls & expected_ioctls) != expected_ioctls) {
-		pr_err("lazy-pages: unexpected missing uffd ioctl for anon memory\n");
+		pr_err("lazy-pages: unexpected missing uffd ioctl for range %lx (mode %lx)\n",
+		       addr, mode);
 	}
 
 	return 0;
@@ -1202,7 +1214,7 @@ static int vma_remap(VmaEntry *vma_entry, int uffd)
 	 * injected via userfaultfd.
 	 */
 	if (vma_entry_can_be_lazy(vma_entry))
-		if (enable_uffd(uffd, dst, len) != 0)
+		if (enable_uffd(uffd, dst, len, UFFDIO_REGISTER_MODE_MISSING) != 0)
 			return -1;
 
 	return 0;
@@ -1855,6 +1867,49 @@ __visible long __export_restore_task(struct task_restore_args *args)
 	if (ret) {
 		pr_err("Cannot restore THP_DISABLE=%d flag: %ld\n", args->thp_disabled, ret);
 		goto core_restore_end;
+	}
+
+	/*
+	 * Pipeline C (stream-restore): before the uffd is closed below,
+	 * walk the VMA table and UFFDIO_REGISTER each memfd-backed shmem
+	 * mapping with MODE_MINOR. This lets the daemon (criu/uffd.c)
+	 * install streamer-filled bytes via UFFDIO_CONTINUE when the
+	 * restored process touches the page.
+	 *
+	 * Predicate: VMA_ANON_SHARED && fd != -1 — matches the existing
+	 * line-889 test in restore_mapping() that drops MAP_ANONYMOUS for
+	 * file-backed shared mappings, i.e. the exact set whose backing
+	 * memfd is created+ftruncated by CRIU before PIE runs and (in
+	 * stream mode, per commit 3) left unfilled for the streamer to
+	 * fill asynchronously.
+	 *
+	 * VMA_FILE_SHARED (real file-backed) deliberately NOT included —
+	 * those have a different fill path and would mis-route their
+	 * faults to the daemon. If P4c smoke surfaces over- or
+	 * under-classification (e.g. SysV shmem leaking into this
+	 * branch), tighten the predicate or add a capture-side flag.
+	 *
+	 * Gate: args->streamer_private_ready_futex — same single-source
+	 * runtime gate as commit 7. Default path stays byte-equivalent.
+	 */
+	if (args->streamer_private_ready_futex && args->uffd > -1) {
+		for (i = 0; i < args->vmas_n; i++) {
+			VmaEntry *e = args->vmas + i;
+			unsigned long len;
+
+			if (!vma_entry_is(e, VMA_ANON_SHARED))
+				continue;
+			if (e->fd == -1UL)
+				continue;
+
+			len = vma_entry_len(e);
+			if (enable_uffd(args->uffd, e->start, len,
+					UFFDIO_REGISTER_MODE_MINOR) != 0) {
+				pr_err("stream: MINOR register %"PRIx64" len %lx failed\n",
+				       e->start, len);
+				goto core_restore_end;
+			}
+		}
 	}
 
 	if (args->uffd > -1) {
