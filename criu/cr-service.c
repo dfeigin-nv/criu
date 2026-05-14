@@ -522,6 +522,10 @@ static int setup_opts_from_req(int sk, CriuOpts *req)
 		opts.lazy_pages = req->lazy_pages;
 	}
 
+	if (req->has_stream_restore) {
+		opts.stream_restore = req->stream_restore;
+	}
+
 	if (req->has_pre_dump_mode) {
 		switch (req->pre_dump_mode) {
 		case CRIU_PRE_DUMP_MODE__SPLICE:
