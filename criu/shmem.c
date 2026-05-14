@@ -550,6 +550,20 @@ static int restore_memfd_shmem_content_ex(int fd, unsigned long shmid, unsigned 
 		return -1;
 	}
 
+	if (opts.stream_restore) {
+		/*
+		 * Pipeline C: the streamer fills this memfd asynchronously
+		 * after CRIU returns from open_vmas. The memfd is already
+		 * sized via ftruncate(fd, size) above; bytes arrive later.
+		 * The lazy-pages daemon UFFDIO_CONTINUE-installs them into
+		 * the restored process's VMAs as each memfd becomes ready.
+		 */
+		if (munmap(addr, size))
+			pr_perror("munmap failed for shmem 0x%lx", shmid);
+		pr.close(&pr);
+		return 0;
+	}
+
 	ret = shmem_restore_async(&pr, addr, aligned_size);
 	pr.close(&pr);
 
