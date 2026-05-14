@@ -168,6 +168,18 @@ struct task_restore_args {
 	struct restore_vma_io *vma_ios;
 	unsigned int vma_ios_n;
 
+	/*
+	 * Stream-mode (Pipeline C) fields. When stream_restore is off,
+	 * streamer_private_pages_fd is -1 and the PIE restorer falls back
+	 * to the existing pages-{N}.img + AIO path via vma_ios_fd. When set,
+	 * it points at a scratch memfd that the streamer fills in parallel
+	 * with PIE setup; PIE must futex_wait on streamer_private_ready_futex
+	 * before consuming each vma_ios[i].
+	 */
+	int streamer_private_pages_fd;
+	unsigned int *streamer_private_ready_futex;
+	unsigned int streamer_private_ready_futex_n;
+
 	struct restore_posix_timer *posix_timers;
 	unsigned int posix_timers_n;
 	bool posix_timer_cr_ids;
