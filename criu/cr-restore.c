@@ -2445,6 +2445,25 @@ int cr_restore_tasks(void)
 	if (init_service_fd())
 		return 1;
 
+	/*
+	 * Pipeline C: the agent passes an inherited Unix-socket fd via
+	 * CRIU_STREAMER_PRIVATE_SOCK. Move it into the service-fd slot so
+	 * close_old_fds() (called per-task after fork) leaves it alone;
+	 * mem.c:recv_streamer_private_fds will retrieve it from the slot.
+	 */
+	if (opts.stream_restore) {
+		const char *env = getenv("CRIU_STREAMER_PRIVATE_SOCK");
+		if (env) {
+			int fd = atoi(env);
+			if (fd >= 0) {
+				if (install_service_fd(STREAM_PRIVATE_SK_OFF, fd) < 0) {
+					pr_err("Failed to install streamer private sock as service fd\n");
+					return -1;
+				}
+			}
+		}
+	}
+
 	if (check_img_inventory(/* restore = */ true) < 0)
 		return -1;
 

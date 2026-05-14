@@ -30,6 +30,7 @@ enum sfd_type {
 	TRANSPORT_FD_OFF, /* to transfer file descriptors */
 	RPC_SK_OFF,
 	FDSTORE_SK_OFF,
+	STREAM_PRIVATE_SK_OFF, /* Pipeline C: agent-pre-created streamer sock */
 
 	SERVICE_FD_MAX
 };
