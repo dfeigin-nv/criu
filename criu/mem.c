@@ -34,6 +34,7 @@
 #include "prctl.h"
 #include "compel/infect-util.h"
 #include "pidfd-store.h"
+#include "common/scm.h"
 
 #include "protobuf.h"
 #include "images/pagemap.pb-c.h"
@@ -1821,6 +1822,69 @@ out:
 	return ret;
 }
 
+/*
+ * Pipeline C: streamer-fed scratch memfd for private VMA pages.
+ *
+ * In --stream-restore mode the agent pre-creates a control socket pair
+ * (its end + CRIU's end). The CRIU-side fd number is passed in via the
+ * CRIU_STREAMER_PRIVATE_SOCK environment variable. CRIU then receives
+ * one memfd per task over that socket via SCM_RIGHTS. The streamer fills
+ * the memfd in parallel with PIE setup; PIE waits on the per-iov futex
+ * word before consuming each restore_vma_io.
+ *
+ * The full streamer/agent wiring lands in P5. Until then, this code path
+ * is unreachable unless the user sets both --stream-restore and the env
+ * var; without those it stays inert.
+ */
+static int recv_streamer_private_fd(void)
+{
+	const char *env = getenv("CRIU_STREAMER_PRIVATE_SOCK");
+	int sock, fd;
+
+	if (!env) {
+		pr_err("--stream-restore set but CRIU_STREAMER_PRIVATE_SOCK is unset\n");
+		return -1;
+	}
+	sock = atoi(env);
+	if (sock < 0) {
+		pr_err("CRIU_STREAMER_PRIVATE_SOCK=%s is not a valid fd\n", env);
+		return -1;
+	}
+	fd = recv_fd(sock);
+	if (fd < 0)
+		pr_err("Failed to receive streamer private memfd on sock %d\n", sock);
+	return fd;
+}
+
+/*
+ * Allocate the per-vma_io readiness futex array in shmalloc'd memory so
+ * the words survive fork() into the PIE restorer (same lifetime pattern
+ * as img_streamer_fd_lock; see img-streamer.c:79).
+ *
+ * Kill-switch K-SHMALLOC-FUTEX: if shmalloc'd memory is not visible to
+ * PIE for any reason (mmap permissions, MAP_ANONYMOUS expectation), the
+ * back-out is to switch this to mmap(NULL, n*sizeof(uint), PROT_READ|
+ * PROT_WRITE, MAP_ANONYMOUS|MAP_SHARED, -1, 0) and pass the pointer
+ * through args the same way. The interface to the rest of the code
+ * does not change.
+ */
+static unsigned int *alloc_streamer_futex_array(unsigned int n)
+{
+	unsigned int *fut;
+	size_t bytes = (size_t)n * sizeof(unsigned int);
+
+	if (n == 0)
+		return NULL;
+
+	fut = shmalloc(bytes);
+	if (!fut) {
+		pr_err("Failed to shmalloc %u-entry streamer futex array\n", n);
+		return NULL;
+	}
+	memset(fut, 0, bytes);
+	return fut;
+}
+
 static int prepare_vma_ios(struct pstree_item *t, struct task_restore_args *ta)
 {
 	struct cr_img *pages;
@@ -1836,8 +1900,37 @@ static int prepare_vma_ios(struct pstree_item *t, struct task_restore_args *ta)
 		ta->vma_ios = NULL;
 		ta->vma_ios_n = 0;
 		ta->vma_ios_fd = -1;
+		ta->streamer_private_pages_fd = -1;
+		ta->streamer_private_ready_futex = NULL;
+		ta->streamer_private_ready_futex_n = 0;
 		return 0;
 	}
+
+	if (opts.stream_restore) {
+		int memfd = recv_streamer_private_fd();
+		if (memfd < 0)
+			return -1;
+
+		ta->vma_ios_fd = memfd;
+		ta->streamer_private_pages_fd = memfd;
+
+		if (pagemap_render_iovec(&rsti(t)->vma_io, ta) < 0)
+			return -1;
+
+		ta->streamer_private_ready_futex = alloc_streamer_futex_array(ta->vma_ios_n);
+		if (ta->vma_ios_n && !ta->streamer_private_ready_futex)
+			return -1;
+		ta->streamer_private_ready_futex_n = ta->vma_ios_n;
+		return 0;
+	}
+
+	/*
+	 * Default (non-stream) path: keep the existing pages-{N}.img + AIO
+	 * setup unchanged, and leave the stream fields cleared.
+	 */
+	ta->streamer_private_pages_fd = -1;
+	ta->streamer_private_ready_futex = NULL;
+	ta->streamer_private_ready_futex_n = 0;
 
 	/*
 	 * If auto-dedup is on we need RDWR mode to be able to punch holes in
