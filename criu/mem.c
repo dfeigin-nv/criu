@@ -1671,10 +1671,21 @@ int open_vmas(struct pstree_item *t)
  * is unreachable unless the user sets both --stream-restore and the env
  * var; without those it stays inert.
  */
-static int recv_streamer_private_fd(void)
+/*
+ * Pipeline C wire protocol on the per-task private-pages socket:
+ *   1) streamer -> CRIU: SCM_RIGHTS carrying [pages_memfd, futex_memfd]
+ *                        in a single sendmsg, no payload bytes.
+ *
+ * The pages_memfd is the streamer-filled scratch image read by PIE's
+ * io_submit. The futex_memfd is sized vma_ios_n * sizeof(uint32) and
+ * mmap'd MAP_SHARED on both sides so the streamer can write the per-
+ * range ready word and FUTEX_WAKE the PIE restorer once the matching
+ * range has landed.
+ */
+static int recv_streamer_private_fds(int *out_pages_fd, int *out_futex_fd)
 {
 	const char *env = getenv("CRIU_STREAMER_PRIVATE_SOCK");
-	int sock, fd;
+	int sock, fds[2];
 
 	if (!env) {
 		pr_err("--stream-restore set but CRIU_STREAMER_PRIVATE_SOCK is unset\n");
@@ -1685,39 +1696,44 @@ static int recv_streamer_private_fd(void)
 		pr_err("CRIU_STREAMER_PRIVATE_SOCK=%s is not a valid fd\n", env);
 		return -1;
 	}
-	fd = recv_fd(sock);
-	if (fd < 0)
-		pr_err("Failed to receive streamer private memfd on sock %d\n", sock);
-	return fd;
+	if (recv_fds(sock, fds, 2, NULL, 0) < 0) {
+		pr_err("Failed to receive streamer private fds on sock %d\n", sock);
+		return -1;
+	}
+	*out_pages_fd = fds[0];
+	*out_futex_fd = fds[1];
+	return 0;
 }
 
 /*
- * Allocate the per-vma_io readiness futex array in shmalloc'd memory so
- * the words survive fork() into the PIE restorer (same lifetime pattern
- * as img_streamer_fd_lock; see img-streamer.c:79).
+ * Map the streamer-created futex memfd into this process. Same memfd is
+ * mmap'd MAP_SHARED by the streamer; fork() carries the mapping into
+ * the PIE restorer, so PIE can FUTEX_WAIT on the words the streamer
+ * FUTEX_WAKEs as each range's bytes land.
  *
- * Kill-switch K-SHMALLOC-FUTEX: if shmalloc'd memory is not visible to
- * PIE for any reason (mmap permissions, MAP_ANONYMOUS expectation), the
- * back-out is to switch this to mmap(NULL, n*sizeof(uint), PROT_READ|
- * PROT_WRITE, MAP_ANONYMOUS|MAP_SHARED, -1, 0) and pass the pointer
- * through args the same way. The interface to the rest of the code
- * does not change.
+ * Replaces the earlier shmalloc-only path because the streamer is a
+ * separate process and shmalloc's MAP_ANONYMOUS|MAP_SHARED region is
+ * not addressable from outside the criu process group.
  */
-static unsigned int *alloc_streamer_futex_array(unsigned int n)
+static unsigned int *map_streamer_futex_array(int futex_fd, unsigned int n)
 {
-	unsigned int *fut;
-	size_t bytes = (size_t)n * sizeof(unsigned int);
+	size_t bytes;
+	void *p;
 
 	if (n == 0)
 		return NULL;
+	bytes = (size_t)n * sizeof(unsigned int);
 
-	fut = shmalloc(bytes);
-	if (!fut) {
-		pr_err("Failed to shmalloc %u-entry streamer futex array\n", n);
+	if (ftruncate(futex_fd, bytes) < 0) {
+		pr_perror("Failed to ftruncate streamer futex memfd to %zu", bytes);
 		return NULL;
 	}
-	memset(fut, 0, bytes);
-	return fut;
+	p = mmap(NULL, bytes, PROT_READ | PROT_WRITE, MAP_SHARED, futex_fd, 0);
+	if (p == MAP_FAILED) {
+		pr_perror("Failed to mmap streamer futex memfd (%u entries)", n);
+		return NULL;
+	}
+	return (unsigned int *)p;
 }
 
 static int prepare_vma_ios(struct pstree_item *t, struct task_restore_args *ta)
@@ -1744,22 +1760,26 @@ static int prepare_vma_ios(struct pstree_item *t, struct task_restore_args *ta)
 	}
 
 	if (opts.stream_restore) {
-		int memfd = recv_streamer_private_fd();
-		if (memfd < 0)
+		int pages_fd = -1, futex_fd = -1;
+
+		if (recv_streamer_private_fds(&pages_fd, &futex_fd) < 0)
 			return -1;
 
-		ta->vma_ios_fd = memfd;
-		ta->streamer_private_pages_fd = memfd;
+		ta->vma_ios_fd = pages_fd;
+		ta->streamer_private_pages_fd = pages_fd;
 		/*
 		 * The streamer memfd is not opened O_DIRECT, so PIE must use
 		 * the buffered preadv engine rather than restore_vma_aio().
 		 */
 		ta->vma_ios_use_direct = false;
 
-		if (pagemap_render_iovec(&rsti(t)->vma_io, ta) < 0)
+		if (pagemap_render_iovec(&rsti(t)->vma_io, ta) < 0) {
+			close(futex_fd);
 			return -1;
+		}
 
-		ta->streamer_private_ready_futex = alloc_streamer_futex_array(ta->vma_ios_n);
+		ta->streamer_private_ready_futex = map_streamer_futex_array(futex_fd, ta->vma_ios_n);
+		close(futex_fd);
 		if (ta->vma_ios_n && !ta->streamer_private_ready_futex)
 			return -1;
 		ta->streamer_private_ready_futex_n = ta->vma_ios_n;
