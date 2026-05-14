@@ -38,6 +38,7 @@
 #define _UFFDIO_WAKE	   (0x02)
 #define _UFFDIO_COPY	   (0x03)
 #define _UFFDIO_ZEROPAGE   (0x04)
+#define _UFFDIO_CONTINUE   (0x07)
 #define _UFFDIO_API	   (0x3F)
 
 /* userfaultfd ioctl ids */
@@ -48,6 +49,7 @@
 #define UFFDIO_WAKE	  _IOR(UFFDIO, _UFFDIO_WAKE, struct uffdio_range)
 #define UFFDIO_COPY	  _IOWR(UFFDIO, _UFFDIO_COPY, struct uffdio_copy)
 #define UFFDIO_ZEROPAGE	  _IOWR(UFFDIO, _UFFDIO_ZEROPAGE, struct uffdio_zeropage)
+#define UFFDIO_CONTINUE	  _IOWR(UFFDIO, _UFFDIO_CONTINUE, struct uffdio_continue)
 
 /* read() structure */
 struct uffd_msg {
@@ -144,6 +146,8 @@ struct uffdio_api {
 #define UFFD_FEATURE_MISSING_HUGETLBFS (1 << 4)
 #define UFFD_FEATURE_MISSING_SHMEM     (1 << 5)
 #define UFFD_FEATURE_EVENT_UNMAP       (1 << 6)
+#define UFFD_FEATURE_MINOR_HUGETLBFS   (1 << 9)
+#define UFFD_FEATURE_MINOR_SHMEM       (1 << 10)
 	__u64 features;
 
 	__u64 ioctls;
@@ -158,6 +162,7 @@ struct uffdio_register {
 	struct uffdio_range range;
 #define UFFDIO_REGISTER_MODE_MISSING ((__u64)1 << 0)
 #define UFFDIO_REGISTER_MODE_WP	     ((__u64)1 << 1)
+#define UFFDIO_REGISTER_MODE_MINOR   ((__u64)1 << 2)
 	__u64 mode;
 
 	/*
@@ -197,6 +202,18 @@ struct uffdio_zeropage {
 	 * the copy_from_user will not read the last 8 bytes.
 	 */
 	__s64 zeropage;
+};
+
+struct uffdio_continue {
+	struct uffdio_range range;
+#define UFFDIO_CONTINUE_MODE_DONTWAKE ((__u64)1 << 0)
+	__u64 mode;
+
+	/*
+	 * Fields below here are written by the ioctl and must be at the end:
+	 * the copy_from_user will not read past here.
+	 */
+	__s64 mapped;
 };
 
 #endif /* _LINUX_USERFAULTFD_H */

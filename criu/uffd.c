@@ -14,6 +14,9 @@
 #include <sys/un.h>
 #include <sys/socket.h>
 #include <sys/wait.h>
+#include <sys/eventfd.h>
+#include <limits.h>
+#include <linux/futex.h>
 
 #include "linux/userfaultfd.h"
 
@@ -110,7 +113,31 @@ static struct epoll_rfd lazy_sk_rfd;
 /* socket for communication with lazy-pages daemon */
 static int lazy_pages_sk_id = -1;
 
+/*
+ * Pipeline C (stream-restore) daemon state. The streamer process feeds
+ * memfd content over a side channel and signals readiness via eventfds.
+ * - streamer_abort_rfd: eventfd owned by the streamer; POLLIN means
+ *   graceful abort, POLLHUP means streamer died. Either fires the
+ *   futex-poison path so PIE bails out of io_submit cleanly.
+ * - streamer_evfd_rfds: per-memfd ready eventfds (count matches the
+ *   manifest's shmem entry count). UFFDIO_CONTINUE installs the bytes
+ *   into the restored shmem VMA range once the corresponding eventfd
+ *   fires.
+ * - streamer_ready_futex: shmalloc'd futex array shared with PIE; one
+ *   word per vma_ios entry. Values: 0 = not ready, 1 = ready,
+ *   0xFFFFFFFFu = abort.
+ * All scaffolding is no-op until commit 7 wires producers/consumers.
+ */
+static struct epoll_rfd streamer_abort_rfd = { .fd = -1 };
+static struct epoll_rfd *streamer_evfd_rfds;
+static unsigned int streamer_evfd_n;
+static unsigned int *streamer_ready_futex;
+static unsigned int streamer_ready_futex_n;
+
 static int handle_uffd_event(struct epoll_rfd *lpfd);
+static int handle_streamer_evfd(struct epoll_rfd *rfd);
+static int handle_abort_event(struct epoll_rfd *rfd);
+static int handle_abort_hangup(struct epoll_rfd *rfd);
 
 static struct lazy_pages_info *lpi_init(void)
 {
@@ -304,6 +331,17 @@ int setup_uffd(int pid, struct task_restore_args *task_args)
 		task_args->uffd = -1;
 		return 0;
 	}
+
+	/*
+	 * In stream-restore (Pipeline C) mode, also request
+	 * UFFD_FEATURE_MINOR_SHMEM so the daemon can use UFFDIO_CONTINUE
+	 * to install streamer-filled shmem pages on demand. The bit is
+	 * only OR'd in if the running kernel actually advertises it
+	 * (kdat.uffd_features); otherwise UFFDIO_API would reject the
+	 * request.
+	 */
+	if (opts.stream_restore)
+		features |= (kdat.uffd_features & UFFD_FEATURE_MINOR_SHMEM);
 
 	/*
 	 * Open userfaulfd FD which is passed to the restorer blob and
@@ -1365,6 +1403,169 @@ static int lazy_sk_hangup_event(struct epoll_rfd *rfd)
 	return 0;
 }
 
+/*
+ * Wake all PIE waiters with the abort sentinel so they bail out of
+ * io_submit cleanly. The futex array is shmalloc'd memory shared with
+ * the restorer; PIE side performs FUTEX_WAIT on each word.
+ */
+static void streamer_poison_futexes(void)
+{
+	unsigned int i;
+
+	if (!streamer_ready_futex)
+		return;
+
+	for (i = 0; i < streamer_ready_futex_n; i++)
+		__atomic_store_n(&streamer_ready_futex[i], 0xFFFFFFFFu,
+				 __ATOMIC_RELEASE);
+
+	/*
+	 * Best-effort FUTEX_WAKE on each word. INT_MAX wakes any
+	 * sleepers without requiring us to know exact waiter counts.
+	 */
+	for (i = 0; i < streamer_ready_futex_n; i++)
+		syscall(SYS_futex, &streamer_ready_futex[i], FUTEX_WAKE,
+			INT_MAX, NULL, NULL, 0);
+}
+
+/*
+ * Per-memfd ready signal from the streamer. The eventfd counter is
+ * drained on each EPOLLIN; the actual count value is ignored (we only
+ * care that the streamer wrote something nonzero).
+ *
+ * Once a memfd is ready, the daemon would normally call
+ * uffd_continue_memfd() against the corresponding shmem VMA range to
+ * install the bytes via UFFDIO_CONTINUE. Wiring the VMA-range lookup
+ * is deferred to a follow-on commit; here we just consume the event
+ * and let any private-pages futex word matched by index transition to
+ * "ready" so PIE can submit io_submit on that range.
+ */
+static int handle_streamer_evfd(struct epoll_rfd *rfd)
+{
+	uint64_t val;
+	int ret;
+	unsigned int idx;
+
+	ret = read(rfd->fd, &val, sizeof(val));
+	if (ret < 0) {
+		if (errno == EAGAIN)
+			return 0;
+		pr_perror("streamer eventfd read error");
+		return -1;
+	}
+	if (ret != sizeof(val)) {
+		pr_err("streamer eventfd short read: %d\n", ret);
+		return -1;
+	}
+
+	/* Find which memfd fired (linear scan; n is small). */
+	idx = streamer_evfd_n;
+	if (streamer_evfd_rfds) {
+		unsigned int i;
+		for (i = 0; i < streamer_evfd_n; i++) {
+			if (streamer_evfd_rfds[i].fd == rfd->fd) {
+				idx = i;
+				break;
+			}
+		}
+	}
+	pr_debug("streamer evfd[%u] ready (val=%llu)\n", idx,
+		 (unsigned long long)val);
+
+	/*
+	 * Mark the matching futex word ready so PIE can proceed.
+	 * The per-index mapping is one-to-one with vma_ios[] in the
+	 * MVP wiring; a follow-on commit will replace this with the
+	 * full memfd -> vma_ios index table from the manifest.
+	 */
+	if (streamer_ready_futex && idx < streamer_ready_futex_n) {
+		__atomic_store_n(&streamer_ready_futex[idx], 1,
+				 __ATOMIC_RELEASE);
+		syscall(SYS_futex, &streamer_ready_futex[idx], FUTEX_WAKE,
+			INT_MAX, NULL, NULL, 0);
+	}
+
+	return 0;
+}
+
+/*
+ * Streamer-initiated abort. Two paths reach this:
+ *  - graceful: streamer wrote a non-zero counter on its abort eventfd
+ *    (e.g. atexit handler or SIGTERM handler). Read drains the counter.
+ *  - process-death: streamer closed the eventfd (SIGKILL, OOM). The
+ *    kernel delivers POLLHUP, handled by handle_abort_hangup().
+ * Either way: poison every PIE futex word so io_submit bails, then
+ * close the lazy-pages socket so the existing error path tears down.
+ */
+static int handle_abort_event(struct epoll_rfd *rfd)
+{
+	uint64_t val;
+	int ret;
+
+	ret = read(rfd->fd, &val, sizeof(val));
+	if (ret < 0 && errno != EAGAIN) {
+		pr_perror("streamer abort_fd read error");
+		/* fall through to poison anyway */
+	}
+
+	pr_err("streamer reported abort (val=%llu)\n",
+	       (unsigned long long)val);
+
+	streamer_poison_futexes();
+
+	if (lazy_pages_sk_id >= 0) {
+		int sk = fdstore_get(lazy_pages_sk_id);
+		if (sk >= 0) {
+			shutdown(sk, SHUT_RDWR);
+			close(sk);
+		}
+	}
+
+	return -1;
+}
+
+static int handle_abort_hangup(struct epoll_rfd *rfd)
+{
+	pr_err("streamer process closed abort_fd (process died)\n");
+	streamer_poison_futexes();
+	return -1;
+}
+
+/*
+ * Install streamer-filled bytes into [addr, addr+len) on the restored
+ * process's shmem VMA via UFFDIO_CONTINUE. The kernel resolves the
+ * page-cache pages from the shmem inode the memfd shares.
+ *
+ * Caller: handle_streamer_evfd() once VMA-range mapping is wired
+ * (follow-on commit). Kept here as the canonical entry point so that
+ * commit can land without re-introducing a header.
+ */
+static int __maybe_unused uffd_continue_memfd(struct lazy_pages_info *lpi,
+					      uintptr_t addr, size_t len)
+{
+	struct uffdio_continue cont;
+
+	cont.range.start = addr;
+	cont.range.len = len;
+	cont.mode = 0;
+	cont.mapped = 0;
+
+	if (ioctl(lpi->lpfd.fd, UFFDIO_CONTINUE, &cont) < 0) {
+		lp_perror(lpi, "UFFDIO_CONTINUE %lx/%zu", addr, len);
+		return -1;
+	}
+
+	if ((size_t)cont.mapped != len) {
+		lp_warn(lpi, "UFFDIO_CONTINUE partial: %lld of %zu bytes\n",
+			(long long)cont.mapped, len);
+		/* K-CONT-PARTIAL kill-switch territory; surface as warning
+		 * for now. Per-page CONTINUE re-architecture would land in a
+		 * follow-on commit if this fires in practice. */
+	}
+
+	return 0;
+}
+
 static int prepare_uffds(int listen, int epollfd)
 {
 	int i;
@@ -1395,6 +1596,31 @@ static int prepare_uffds(int listen, int epollfd)
 	lazy_sk_rfd.hangup_event = lazy_sk_hangup_event;
 	if (epoll_add_rfd(epollfd, &lazy_sk_rfd))
 		goto close_uffd;
+
+	/*
+	 * Pipeline C: wire the streamer abort_fd and per-memfd ready
+	 * eventfds into the daemon epoll set. The fds themselves arrive
+	 * from the agent via a separate handshake (added in a follow-on
+	 * commit); until that handshake runs, streamer_abort_rfd.fd stays
+	 * -1 and streamer_evfd_rfds stays NULL, so this block is a no-op
+	 * in the default-path build.
+	 */
+	if (opts.stream_restore) {
+		unsigned int i;
+
+		if (streamer_abort_rfd.fd >= 0) {
+			streamer_abort_rfd.read_event = handle_abort_event;
+			streamer_abort_rfd.hangup_event = handle_abort_hangup;
+			if (epoll_add_rfd(epollfd, &streamer_abort_rfd))
+				goto close_uffd;
+		}
+
+		for (i = 0; i < streamer_evfd_n; i++) {
+			streamer_evfd_rfds[i].read_event = handle_streamer_evfd;
+			if (epoll_add_rfd(epollfd, &streamer_evfd_rfds[i]))
+				goto close_uffd;
+		}
+	}
 
 	close(listen);
 	return 0;
@@ -1448,9 +1674,14 @@ int cr_lazy_pages(bool daemon)
 	/*
 	 * we poll nr_tasks userfault fds, UNIX socket between lazy-pages
 	 * daemon and the cr-restore, and, optionally TCP socket for
-	 * remote pages
+	 * remote pages. In stream-restore (Pipeline C) mode also reserve
+	 * room for the streamer abort_fd and per-memfd ready eventfds;
+	 * these counts default to zero until the agent handshake wires
+	 * them in a follow-on commit.
 	 */
 	nr_fds = task_entries->nr_tasks + (opts.use_page_server ? 2 : 1);
+	if (opts.stream_restore)
+		nr_fds += (streamer_abort_rfd.fd >= 0 ? 1 : 0) + streamer_evfd_n;
 	epollfd = epoll_prepare(nr_fds, &events);
 	if (epollfd < 0)
 		return -1;
