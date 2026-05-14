@@ -44,6 +44,7 @@
 #include "fdstore.h"
 #include "util.h"
 #include "namespaces.h"
+#include "common/scm.h"
 
 #undef LOG_PREFIX
 #define LOG_PREFIX "uffd: "
@@ -138,6 +139,89 @@ static int handle_uffd_event(struct epoll_rfd *lpfd);
 static int handle_streamer_evfd(struct epoll_rfd *rfd);
 static int handle_abort_event(struct epoll_rfd *rfd);
 static int handle_abort_hangup(struct epoll_rfd *rfd);
+
+/*
+ * Pipeline C: receive the streamer-owned eventfds and abort_fd over the
+ * agent-pre-created Unix socket. Socket fd is inherited via the
+ * CRIU_STREAMER_DAEMON_SOCK env var (same pattern as
+ * CRIU_STREAMER_PRIVATE_SOCK in mem.c).
+ *
+ * Wire protocol (one connection, sequential):
+ *   1) plain recv() of one uint32 n_evfd header (host byte order)
+ *   2) recv_fds() of (1 + n_evfd) fds: [abort_fd, ev_0..ev_{n-1}]
+ *      no payload bytes
+ *
+ * After the recv we shmalloc the daemon-side streamer_ready_futex[n]
+ * array. PIE has its own per-task streamer_private_ready_futex[] in
+ * task_restore_args (see mem.c:alloc_streamer_futex_array); the two
+ * arrays serve different consumers (daemon's UFFDIO_CONTINUE side
+ * vs PIE's io_submit side) and the streamer signals both.
+ *
+ * No-op if --stream-restore is off or the env var is unset.
+ */
+static int recv_streamer_daemon_fds(void)
+{
+	const char *env = getenv("CRIU_STREAMER_DAEMON_SOCK");
+	int sock, *fds = NULL;
+	uint32_t n;
+	unsigned int i;
+
+	if (!opts.stream_restore)
+		return 0;
+
+	if (!env) {
+		pr_err("--stream-restore set but CRIU_STREAMER_DAEMON_SOCK is unset\n");
+		return -1;
+	}
+	sock = atoi(env);
+	if (sock < 0) {
+		pr_err("CRIU_STREAMER_DAEMON_SOCK=%s is not a valid fd\n", env);
+		return -1;
+	}
+
+	if (recv(sock, &n, sizeof(n), MSG_WAITALL) != (ssize_t)sizeof(n)) {
+		pr_perror("[stream-c] failed to recv n_evfd header on daemon sock");
+		return -1;
+	}
+	if (n == 0 || n > 1024) {
+		pr_err("[stream-c] bogus n_evfd %u\n", n);
+		return -1;
+	}
+
+	fds = xmalloc(sizeof(int) * (n + 1));
+	if (!fds)
+		return -1;
+
+	if (recv_fds(sock, fds, n + 1, NULL, 0) < 0) {
+		pr_err("[stream-c] recv_fds(%u) on daemon sock failed\n", n + 1);
+		xfree(fds);
+		return -1;
+	}
+
+	streamer_abort_rfd.fd = fds[0];
+
+	streamer_evfd_rfds = xzalloc(sizeof(*streamer_evfd_rfds) * n);
+	if (!streamer_evfd_rfds) {
+		xfree(fds);
+		return -1;
+	}
+	for (i = 0; i < n; i++)
+		streamer_evfd_rfds[i].fd = fds[i + 1];
+	streamer_evfd_n = n;
+	xfree(fds);
+
+	streamer_ready_futex = shmalloc(sizeof(unsigned int) * n);
+	if (!streamer_ready_futex) {
+		pr_err("[stream-c] shmalloc streamer_ready_futex[%u] failed\n", n);
+		return -1;
+	}
+	memset(streamer_ready_futex, 0, sizeof(unsigned int) * n);
+	streamer_ready_futex_n = n;
+
+	pr_info("[stream-c] daemon got abort_fd=%d, %u eventfds, futex[%u]\n",
+		streamer_abort_rfd.fd, streamer_evfd_n, streamer_ready_futex_n);
+	return 0;
+}
 
 static struct lazy_pages_info *lpi_init(void)
 {
@@ -1671,13 +1755,15 @@ int cr_lazy_pages(bool daemon)
 	if (status_ready())
 		return -1;
 
+	if (recv_streamer_daemon_fds())
+		return -1;
+
 	/*
 	 * we poll nr_tasks userfault fds, UNIX socket between lazy-pages
 	 * daemon and the cr-restore, and, optionally TCP socket for
 	 * remote pages. In stream-restore (Pipeline C) mode also reserve
-	 * room for the streamer abort_fd and per-memfd ready eventfds;
-	 * these counts default to zero until the agent handshake wires
-	 * them in a follow-on commit.
+	 * room for the streamer abort_fd and per-memfd ready eventfds
+	 * (populated by recv_streamer_daemon_fds above).
 	 */
 	nr_fds = task_entries->nr_tasks + (opts.use_page_server ? 2 : 1);
 	if (opts.stream_restore)
