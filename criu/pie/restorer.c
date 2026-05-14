@@ -1978,6 +1978,39 @@ __visible long __export_restore_task(struct task_restore_args *args)
 				unsigned int batch = n - submitted;
 				if (batch > AIO_BATCH - (submitted - completed))
 					batch = AIO_BATCH - (submitted - completed);
+				/*
+				 * Stream-restore (Pipeline C): the streamer fills
+				 * the scratch memfd in parallel with PIE setup, one
+				 * pagemap range per vma_ios[] entry. Each range gets
+				 * a futex word that the daemon flips to 1 when the
+				 * range is ready, or to 0xFFFFFFFFu on streamer abort
+				 * (handled in criu/uffd.c). Block here until the next
+				 * range we'd submit is marked ready; abort the whole
+				 * AIO loop if the streamer poisoned the futex.
+				 *
+				 * iocbps[submitted] was built 1:1 with
+				 * args->vma_ios[submitted] in the loop above, so the
+				 * submission index doubles as the futex index.
+				 */
+				if (args->streamer_private_ready_futex) {
+					unsigned int idx = submitted;
+					unsigned int *fut =
+						&args->streamer_private_ready_futex[idx];
+
+					for (;;) {
+						unsigned int v = __atomic_load_n(
+							fut, __ATOMIC_ACQUIRE);
+						if (v == 1)
+							break;
+						if (v == 0xFFFFFFFFu) {
+							pr_err("stream: streamer aborted at idx %u\n",
+							       idx);
+							goto aio_error;
+						}
+						sys_futex(fut, FUTEX_WAIT, 0, NULL,
+							  NULL, 0);
+					}
+				}
 				aio_ret = sys_io_submit(aio_ctx, batch, &iocbps[submitted]);
 				if (aio_ret <= 0) {
 					pr_err("io_submit failed: %ld (submitted %u/%u)\n",
@@ -2035,6 +2068,27 @@ __visible long __export_restore_task(struct task_restore_args *args)
 						cb->aio_nbytes = nr_next;
 						cb->aio_offset = r->off;
 						cb->aio_data -= (__u64)events[k].res;
+						/*
+						 * In stream-restore mode, the range's
+						 * futex word was already 1 when the
+						 * original submit went through. Re-check
+						 * for the abort sentinel only — no need
+						 * to wait, since the range data is on
+						 * the memfd already. If the streamer
+						 * aborted between submit and reap, fail
+						 * the AIO loop instead of looping forever.
+						 */
+						if (args->streamer_private_ready_futex) {
+							unsigned int *fut =
+								&args->streamer_private_ready_futex[idx];
+							unsigned int v = __atomic_load_n(
+								fut, __ATOMIC_ACQUIRE);
+							if (v == 0xFFFFFFFFu) {
+								pr_err("stream: streamer aborted at idx %u during retry\n",
+								       idx);
+								goto aio_error;
+							}
+						}
 						{
 							long ret2 = sys_io_submit(aio_ctx, 1, &cb);
 							if (ret2 != 1) {
