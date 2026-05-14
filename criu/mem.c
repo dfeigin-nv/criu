@@ -1849,20 +1849,20 @@ out:
  */
 static int recv_streamer_private_fds(int *out_pages_fd, int *out_futex_fd)
 {
-	const char *env = getenv("CRIU_STREAMER_PRIVATE_SOCK");
 	int sock, fds[2];
 
-	if (!env) {
-		pr_err("--stream-restore set but CRIU_STREAMER_PRIVATE_SOCK is unset\n");
-		return -1;
-	}
-	sock = atoi(env);
+	/*
+	 * The streamer sock was installed as a service fd in
+	 * cr_restore_tasks() so it survives close_old_fds() in each
+	 * forked task. Pull it back out here.
+	 */
+	sock = get_service_fd(STREAM_PRIVATE_SK_OFF);
 	if (sock < 0) {
-		pr_err("CRIU_STREAMER_PRIVATE_SOCK=%s is not a valid fd\n", env);
+		pr_err("--stream-restore set but STREAM_PRIVATE_SK_OFF service fd is missing\n");
 		return -1;
 	}
 	if (recv_fds(sock, fds, 2, NULL, 0) < 0) {
-		pr_err("Failed to receive streamer private fds on sock %d\n", sock);
+		pr_perror("Failed to receive streamer private fds on sock %d", sock);
 		return -1;
 	}
 	*out_pages_fd = fds[0];
