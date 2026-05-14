@@ -193,6 +193,34 @@ static int establish_streamer_file_pipe(void)
 	return ret;
 }
 
+/*
+ * Pipeline C (--stream-restore) variant of the streamer file handover.
+ *
+ * Instead of CRIU creating a pipe and sending one end to the streamer, the
+ * streamer creates a memfd, pre-sizes it via ftruncate(file_size), and
+ * (for the metadata images consumed before the daemon takes over) prewrites
+ * the bytes; CRIU then receives the memfd via SCM_RIGHTS and bfd-reads it.
+ *
+ * Wire format on the existing IMG_STREAMER_FD_OFF socket:
+ *   - protobuf preamble (send_file_request + recv_file_reply.exists) -- unchanged
+ *   - one SCM_RIGHTS message carrying one fd (the memfd) and no payload bytes
+ *
+ * The memfd contract is owned by the streamer: it has already done
+ * memfd_create + ftruncate(file_size) + pwrite(file_bytes) by the time it
+ * sends the fd. CRIU's bfd just mmap's the memfd and reads.
+ *
+ * Only valid in restore mode (O_RSTR). Dump-side stream mode keeps the pipe.
+ */
+static int establish_streamer_file_memfd(void)
+{
+	int memfd = recv_fd(get_service_fd(IMG_STREAMER_FD_OFF));
+	if (memfd < 0) {
+		pr_err("Failed to receive memfd from streamer\n");
+		return -1;
+	}
+	return memfd;
+}
+
 static int _img_streamer_open(char *filename)
 {
 	if (send_file_request(filename) < 0)
@@ -215,6 +243,9 @@ static int _img_streamer_open(char *filename)
 	 * what would happen if we were connecting criu and * criu-image-streamer
 	 * via a shell pipe.
 	 */
+
+	if (img_streamer_mode == O_RSTR && opts.stream_restore)
+		return establish_streamer_file_memfd();
 
 	return establish_streamer_file_pipe();
 }
