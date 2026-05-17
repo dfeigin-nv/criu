@@ -1894,13 +1894,16 @@ static int recv_streamer_private_fd(uint32_t pages_img_id, int *out_pages_fd)
  * shmalloc'd memory is in the rst-malloc MAP_SHARED|MAP_ANONYMOUS pool
  * mapped at restorer-fixed addresses preserved across unmap.
  *
- * Pre-filled to 1 by the caller right after the streamer ack: in the
- * synchronous local-files smoke + first-cut S3 paths the streamer is
- * fully done by the time PIE runs, so PIE's futex_wait loop short-
- * circuits on the first check. Async overlap can later replace the
- * ack with per-range eventfd notifications + a helper that writes
- * shmalloc'd words + FUTEX_WAKE.
+ * NOTE: not called by the current synchronous Pipeline C protocol —
+ * the streamer ack on the private socket already guarantees the memfd
+ * is filled, so PIE's NULL-gated wait-loops just no-op. shmalloc()
+ * here also BUGs at rst-malloc.c:169 because RM_SHARED is disabled by
+ * the time prepare_vma_ios runs. Keep this allocator around for the
+ * async overlap follow-on (per-range eventfd + FUTEX_WAKE) once it
+ * either moves the allocation earlier or switches to a PIE-mapped
+ * slab.
  */
+__attribute__((unused))
 static unsigned int *alloc_streamer_futex_array(unsigned int n)
 {
 	unsigned int *fut;
@@ -1941,7 +1944,6 @@ static int prepare_vma_ios(struct pstree_item *t, struct task_restore_args *ta)
 
 	if (opts.stream_restore) {
 		int pages_fd = -1;
-		unsigned int i;
 
 		if (recv_streamer_private_fd(rsti(t)->pages_img_id, &pages_fd) < 0)
 			return -1;
@@ -1952,19 +1954,23 @@ static int prepare_vma_ios(struct pstree_item *t, struct task_restore_args *ta)
 		if (pagemap_render_iovec(&rsti(t)->vma_io, ta) < 0)
 			return -1;
 
-		ta->streamer_private_ready_futex = alloc_streamer_futex_array(ta->vma_ios_n);
-		if (ta->vma_ios_n && !ta->streamer_private_ready_futex)
-			return -1;
-		ta->streamer_private_ready_futex_n = ta->vma_ios_n;
-
 		/*
-		 * The streamer already acked all ranges before we got here,
-		 * so the memfd content is complete. Mark every futex word
-		 * ready so PIE's wait-loop in restorer.c:1895 / 2050 falls
-		 * through on the first atomic load.
+		 * Synchronous Pipeline C: streamer's ack on recv_streamer_
+		 * private_fd guarantees the memfd is fully populated before
+		 * we return. PIE's wait-loops (pie/restorer.c:1895, :2050)
+		 * are NULL-gated on streamer_private_ready_futex, so leaving
+		 * it NULL is the correct "everything ready" signal — no need
+		 * to allocate or pre-fill anything.
+		 *
+		 * alloc_streamer_futex_array() used shmalloc(), which fires
+		 * BUG_ON in rst-malloc.c:169 at this point in restore because
+		 * rst_mem_switch_to_private (cr-restore.c) has already
+		 * disabled RM_SHARED. Async overlap will reintroduce a
+		 * compatible allocator (e.g. shmalloc moved earlier or PIE-
+		 * mapped slab) when the per-range eventfd path lands.
 		 */
-		for (i = 0; i < ta->streamer_private_ready_futex_n; i++)
-			ta->streamer_private_ready_futex[i] = 1;
+		ta->streamer_private_ready_futex = NULL;
+		ta->streamer_private_ready_futex_n = 0;
 		return 0;
 	}
 
