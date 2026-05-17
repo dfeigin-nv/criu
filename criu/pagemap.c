@@ -1,6 +1,8 @@
 #include <fcntl.h>
 #include <stdio.h>
 #include <unistd.h>
+#include <errno.h>
+#include <string.h>
 #include <linux/falloc.h>
 #include <sys/uio.h>
 #include <limits.h>
@@ -236,6 +238,8 @@ static int read_local_page(struct page_read *pr, unsigned long vaddr, unsigned l
 	int fd;
 	ssize_t ret;
 	size_t curr = 0;
+	void *aligned_buf = NULL;
+	void *read_buf = buf;
 
 	fd = img_raw_fd(pr->pi);
 	if (fd < 0) {
@@ -249,16 +253,36 @@ static int read_local_page(struct page_read *pr, unsigned long vaddr, unsigned l
 	if (pr->sync(pr))
 		return -1;
 
+	if (pr->use_direct) {
+		if (((unsigned long)buf & (PAGE_SIZE - 1)) || (len & (PAGE_SIZE - 1)) ||
+		    (pr->pi_off & (PAGE_SIZE - 1))) {
+			int err;
+
+			err = posix_memalign(&aligned_buf, PAGE_SIZE, len);
+			if (err) {
+				pr_err("Can't allocate aligned buffer for direct read (%lu bytes, err=%d)\n", len, err);
+				return -1;
+			}
+			read_buf = aligned_buf;
+		}
+	}
+
 	pr_debug("\tpr%lu-%u Read page from self %lx/%" PRIx64 "\n", pr->img_id, pr->id, pr->cvaddr, pr->pi_off);
 	while (1) {
-		ret = pread(fd, buf + curr, len - curr, pr->pi_off + curr);
+		ret = pread(fd, read_buf + curr, len - curr, pr->pi_off + curr);
 		if (ret < 1) {
 			pr_perror("Can't read mapping page %zd", ret);
+			xfree(aligned_buf);
 			return -1;
 		}
 		curr += ret;
 		if (curr == len)
 			break;
+	}
+
+	if (aligned_buf) {
+		memcpy(buf, aligned_buf, len);
+		xfree(aligned_buf);
 	}
 
 	if (opts.auto_dedup && !pr->disable_dedup) {
@@ -527,49 +551,108 @@ static void advance_piov(struct page_read_iov *piov, ssize_t len)
 	pr_debug("Advanced iov %zu bytes, %d->%d iovs, %zu tail\n", olen, onr, piov->nr, len);
 }
 
+/*
+ * Drain (free without reading) all async entries in pr and its parent chain.
+ * Called on error paths to satisfy BUG_ON(!list_empty(&pr->async)) in
+ * close_page_read().
+ */
+static void drain_async_queue(struct page_read *pr)
+{
+	struct page_read_iov *piov, *n;
+
+	list_for_each_entry_safe(piov, n, &pr->async, l) {
+		list_del(&piov->l);
+		xfree(piov->to);
+		xfree(piov);
+	}
+	if (pr->parent)
+		drain_async_queue(pr->parent);
+}
+
 static int process_async_reads(struct page_read *pr)
 {
 	int fd, ret = 0;
 	struct page_read_iov *piov, *n;
+	off_t first_off = 0, last_end = 0;
+	bool have_range = false;
 
 	fd = img_raw_fd(pr->pi);
+	if (!pr->use_direct) {
+		list_for_each_entry(piov, &pr->async, l) {
+			if (!have_range) {
+				first_off = piov->from;
+				last_end = piov->end;
+				have_range = true;
+			} else {
+				if (piov->from < first_off)
+					first_off = piov->from;
+				if (piov->end > last_end)
+					last_end = piov->end;
+			}
+		}
+		if (have_range && last_end > first_off) {
+			if (posix_fadvise(fd, first_off, (off_t)(last_end - first_off), POSIX_FADV_WILLNEED) != 0)
+				pr_debug("posix_fadvise(WILLNEED) failed for async range\n");
+		}
+	}
+
 	list_for_each_entry_safe(piov, n, &pr->async, l) {
-		ssize_t ret;
+		ssize_t bytes;
 		struct iovec *iovs = piov->to;
+		bool io_failed = false;
 
 		pr_debug("Read piov iovs %d, from %ju, len %ju, first %p:%zu\n", piov->nr, piov->from,
 			 piov->end - piov->from, piov->to->iov_base, piov->to->iov_len);
 	more:
-		ret = preadv(fd, piov->to, piov->nr, piov->from);
-		if (fault_injected(FI_PARTIAL_PAGES)) {
-			/*
+			bytes = preadv(fd, piov->to, piov->nr, piov->from);
+			if (fault_injected(FI_PARTIAL_PAGES)) {
+				/*
 			 * We might have read everything, but for debug
 			 * purposes let's try to force the advance_piov()
 			 * and re-read tail.
 			 */
-			if (ret > 0 && piov->nr >= 2) {
-				pr_debug("`- trim preadv %zu\n", ret);
-				ret /= 2;
+				if (bytes > 0 && piov->nr >= 2) {
+					pr_debug("`- trim preadv %zu\n", bytes);
+					bytes /= 2;
+					if (pr->use_direct)
+						bytes &= ~(PAGE_SIZE - 1);
+				}
 			}
-		}
 
-		if (ret < 0) {
-			pr_err("Can't read async pr bytes (%zd / %ju read, %ju off, %d iovs)\n", ret,
-			       piov->end - piov->from, piov->from, piov->nr);
-			return -1;
-		}
+			if (bytes < 0) {
+				pr_err("Can't read async pr bytes (%zd / %ju read, %ju off, %d iovs)\n", bytes,
+				       piov->end - piov->from, piov->from, piov->nr);
+				io_failed = true;
+			} else if (bytes == 0) {
+				pr_err("Unexpected EOF in async page read (%ju bytes remaining at off %ju, %d iovs)\n",
+				       piov->end - piov->from, piov->from, piov->nr);
+				io_failed = true;
+			} else {
+				/*
+				 * O_DIRECT requires page-aligned retry. Mask
+				 * before the auto-dedup punch so punch_hole()
+				 * covers only what we actually consume;
+				 * otherwise the retry preadv() would read from
+				 * a punched hole.
+				 */
+				if (pr->use_direct && bytes != piov->end - piov->from) {
+					ssize_t aligned = bytes & ~(PAGE_SIZE - 1);
 
-		if (ret == 0 && piov->end != piov->from) {
-			pr_err("Unexpected EOF reading pages: expected %ju more bytes at offset %ju\n",
-			       piov->end - piov->from, piov->from);
-			return -1;
-		}
+					if (aligned == 0) {
+						pr_err("Sub-page short read on O_DIRECT fd: %zd bytes\n", bytes);
+						io_failed = true;
+					} else {
+						bytes = aligned;
+					}
+				}
 
-		if (opts.auto_dedup && punch_hole(pr, piov->from, ret, false))
-			return -1;
+				if (!io_failed && opts.auto_dedup &&
+				    punch_hole(pr, piov->from, bytes, false))
+					io_failed = true;
+			}
 
-		if (ret != piov->end - piov->from) {
-			/*
+			if (!io_failed && bytes != piov->end - piov->from) {
+				/*
 			 * The preadv() can return less than requested. It's
 			 * valid and doesn't mean error or EOF. We should advance
 			 * the iovecs and continue
@@ -578,9 +661,17 @@ static int process_async_reads(struct page_read *pr)
 			 * anyway.
 			 */
 
-			advance_piov(piov, ret);
-			goto more;
-		}
+				advance_piov(piov, bytes);
+				goto more;
+			}
+
+			if (io_failed) {
+				list_del(&piov->l);
+				xfree(iovs);
+				xfree(piov);
+				drain_async_queue(pr);
+				return -1;
+			}
 
 		BUG_ON(pr->io_complete); /* FIXME -- implement once needed */
 
@@ -802,6 +893,7 @@ int open_page_read_at(int dfd, unsigned long img_id, struct page_read *pr, int p
 	pr->pmes = NULL;
 	pr->pieok = false;
 	pr->disable_dedup = false;
+	pr->use_direct = false;
 
 	pr->pmi = open_image_at(dfd, i_typ, O_RSTR, img_id);
 	if (!pr->pmi)
@@ -821,6 +913,65 @@ int open_page_read_at(int dfd, unsigned long img_id, struct page_read *pr, int p
 	if (!pr->pi) {
 		close_page_read(pr);
 		return -1;
+	}
+
+	{
+		int pfd = img_raw_fd(pr->pi);
+
+		if (pfd >= 0 && !opts.stream) {
+			int fl = fcntl(pfd, F_GETFL);
+
+			if (fl >= 0) {
+				int ret = fcntl(pfd, F_SETFL, fl | O_DIRECT);
+
+				if (ret < 0) {
+					pr_warn("Failed to set O_DIRECT on pages fd %d: %s\n", pfd, strerror(errno));
+				} else {
+					/*
+					 * PAGE_SIZE is not a compile-time constant on
+					 * aarch64, so the probe buffer is allocated via
+					 * posix_memalign() instead of a stack array with
+					 * __attribute__((aligned)).
+					 */
+					void *probe = NULL;
+					ssize_t probe_ret;
+					int memerr;
+
+					memerr = posix_memalign(&probe, PAGE_SIZE, PAGE_SIZE);
+					if (memerr) {
+						pr_err("O_DIRECT probe alloc failed on pages fd %d: %s\n",
+						       pfd, strerror(memerr));
+						close_page_read(pr);
+						return -1;
+					}
+
+					probe_ret = pread(pfd, probe, PAGE_SIZE, 0);
+					xfree(probe);
+					if (probe_ret < 0) {
+						if (errno != EINVAL) {
+							pr_perror("O_DIRECT probe failed on pages fd %d", pfd);
+							close_page_read(pr);
+							return -1;
+						}
+
+						pr_info("O_DIRECT rejected at read time on pages fd %d, using buffered I/O\n",
+							pfd);
+						if (fcntl(pfd, F_SETFL, fl) < 0) {
+							pr_perror("Failed to clear O_DIRECT on pages fd %d", pfd);
+							close_page_read(pr);
+							return -1;
+						}
+
+						/* Hint the kernel that fallback buffered reads will mostly
+						 * advance through the pages file in offset order. */
+						posix_fadvise(pfd, 0, 0, POSIX_FADV_SEQUENTIAL);
+					} else {
+						pr_debug("O_DIRECT enabled on pages fd %d\n", pfd);
+						pr->use_direct = true;
+					}
+				}
+			}
+		}
 	}
 
 	if (init_pagemaps(pr)) {
