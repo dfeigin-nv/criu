@@ -1,6 +1,8 @@
 #include <unistd.h>
 #include <stdio.h>
 #include <sys/mman.h>
+#include <sys/socket.h>
+#include <sys/stat.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <sys/syscall.h>
@@ -1882,6 +1884,17 @@ static int recv_streamer_private_fd(uint32_t pages_img_id, int *out_pages_fd)
 	if (write(sock, &pages_img_id, sizeof(pages_img_id)) != (ssize_t)sizeof(pages_img_id)) {
 		pr_perror("Failed to send pages_img_id=%u to streamer", pages_img_id);
 		return -1;
+	}
+	{
+		struct stat st;
+		int so_type = -1;
+		socklen_t so_len = sizeof(so_type);
+		int so_err = (getsockopt(sock, SOL_SOCKET, SO_TYPE, &so_type, &so_len) < 0) ? errno : 0;
+		int fstat_err = (fstat(sock, &st) < 0) ? errno : 0;
+		pr_info("[stream-diag] task=%d id=%u sock=%d so_type=%d so_err=%d "
+			"fstat_err=%d st_mode=0%o st_ino=%lu\n",
+			(int)getpid(), pages_img_id, sock, so_type, so_err,
+			fstat_err, (unsigned)st.st_mode, (unsigned long)st.st_ino);
 	}
 	if (recv_fds(sock, &fd, 1, NULL, 0) < 0) {
 		pr_perror("Failed to receive streamer private memfd for id=%u on sock %d",
