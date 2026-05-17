@@ -1838,9 +1838,13 @@ out:
  */
 /*
  * Pipeline C wire protocol on the per-task private-pages socket:
- *   1) streamer -> CRIU: SCM_RIGHTS carrying [pages_memfd] in one
- *                        sendmsg, no payload bytes.
- *   2) streamer -> CRIU: 1 plain byte ('A') after the streamer finishes
+ *   1) CRIU -> streamer: 4-byte uint32 pages_img_id (host byte order),
+ *                        one request per task's prepare_vma_ios call.
+ *                        Lets the streamer dispatch the right memfd
+ *                        when tasks have distinct pages_img_id values.
+ *   2) streamer -> CRIU: SCM_RIGHTS carrying [pages_memfd] in one
+ *                        sendmsg, with a 1-byte dummy payload.
+ *   3) streamer -> CRIU: 1 plain byte ('A') after the streamer finishes
  *                        writing all private-VMA bytes to the memfd.
  *                        CRIU blocks reading this byte before letting
  *                        PIE run, so the memfd content is complete by
@@ -1855,7 +1859,7 @@ out:
  * with the async streamer, but mem.c pre-fills the words to 1 right
  * after the ack so PIE never has to wait.
  */
-static int recv_streamer_private_fd(int *out_pages_fd)
+static int recv_streamer_private_fd(uint32_t pages_img_id, int *out_pages_fd)
 {
 	int sock, fd;
 	char ack = 0;
@@ -1865,13 +1869,18 @@ static int recv_streamer_private_fd(int *out_pages_fd)
 		pr_err("--stream-restore set but STREAM_PRIVATE_SK_OFF service fd is missing\n");
 		return -1;
 	}
+	if (write(sock, &pages_img_id, sizeof(pages_img_id)) != (ssize_t)sizeof(pages_img_id)) {
+		pr_perror("Failed to send pages_img_id=%u to streamer", pages_img_id);
+		return -1;
+	}
 	if (recv_fds(sock, &fd, 1, NULL, 0) < 0) {
-		pr_perror("Failed to receive streamer private memfd on sock %d", sock);
+		pr_perror("Failed to receive streamer private memfd for id=%u on sock %d",
+			  pages_img_id, sock);
 		return -1;
 	}
 	if (read(sock, &ack, 1) != 1 || ack != 'A') {
-		pr_perror("Failed to receive streamer fill-done ack (got 0x%02x)",
-			  (unsigned)ack);
+		pr_perror("Failed to receive streamer fill-done ack for id=%u (got 0x%02x)",
+			  pages_img_id, (unsigned)ack);
 		close(fd);
 		return -1;
 	}
@@ -1934,7 +1943,7 @@ static int prepare_vma_ios(struct pstree_item *t, struct task_restore_args *ta)
 		int pages_fd = -1;
 		unsigned int i;
 
-		if (recv_streamer_private_fd(&pages_fd) < 0)
+		if (recv_streamer_private_fd(rsti(t)->pages_img_id, &pages_fd) < 0)
 			return -1;
 
 		ta->vma_ios_fd = pages_fd;
