@@ -1302,7 +1302,17 @@ static int restore_priv_vma_content(struct pstree_item *t, struct page_read *pr)
 				goto err_addr;
 			}
 
-			if (!vma_area_is(vma, VMA_PREMMAPED)) {
+			/*
+			 * In stream-restore mode every private-VMA page goes
+			 * through the per-task streamer memfd via vma_io / PIE
+			 * io_submit. There is no pages-*.img on disk to feed
+			 * pr->async / process_async_reads, so route premmaped
+			 * VMAs through the same enqueue path as non-premmaped
+			 * ones. The premapped target address is identical, so
+			 * PIE writes land in the right place. COW (snapshot-
+			 * chain) reads are not supported under stream_restore.
+			 */
+			if (opts.stream_restore || !vma_area_is(vma, VMA_PREMMAPED)) {
 				unsigned long len = min_t(unsigned long, (nr_pages - i) * PAGE_SIZE, vma->e->end - va);
 
 				if (vma->e->status & VMA_NO_PROT_WRITE) {
