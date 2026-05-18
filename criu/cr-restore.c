@@ -2439,6 +2439,7 @@ int prepare_dummy_task_state(struct pstree_item *pi)
 }
 
 extern mutex_t *streamer_private_sock_lock;
+extern mutex_t *streamer_shmem_sock_lock;
 
 int cr_restore_tasks(void)
 {
@@ -2476,6 +2477,30 @@ int cr_restore_tasks(void)
 			return -1;
 		}
 		mutex_init(streamer_private_sock_lock);
+
+		/*
+		 * Stage 2c: a parallel side channel for shmem memfds. open_shmem
+		 * sends 8-byte shmid LE and recvs SCM_RIGHTS(memfd). No ack — the
+		 * streamer fills asynchronously; the daemon-side UFFD CONTINUE
+		 * path gates visibility via streamer_ready_futex. Optional: when
+		 * unset (private-only restore), the slot stays uninstalled.
+		 */
+		env = getenv("CRIU_STREAMER_SHMEM_SOCK");
+		if (env) {
+			int fd = atoi(env);
+			if (fd >= 0) {
+				if (install_service_fd(STREAM_SHMEM_SK_OFF, fd) < 0) {
+					pr_err("Failed to install streamer shmem sock as service fd\n");
+					return -1;
+				}
+			}
+			streamer_shmem_sock_lock = shmalloc(sizeof(mutex_t));
+			if (!streamer_shmem_sock_lock) {
+				pr_err("Failed to shmalloc streamer shmem sock lock\n");
+				return -1;
+			}
+			mutex_init(streamer_shmem_sock_lock);
+		}
 	}
 
 	if (check_img_inventory(/* restore = */ true) < 0)

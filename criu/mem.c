@@ -50,6 +50,14 @@
  */
 mutex_t *streamer_private_sock_lock;
 
+/*
+ * Pipeline C Stage 2c: parallel mutex for the shmem memfd side channel.
+ * Each open_shmem() call serializes write(shmid) + recv_fds(memfd) (no
+ * ack) on this socket. Allocated in cr_restore_tasks() when the agent
+ * passes CRIU_STREAMER_SHMEM_SOCK; NULL otherwise (private-only restore).
+ */
+mutex_t *streamer_shmem_sock_lock;
+
 static int task_reset_dirty_track(int pid)
 {
 	int ret;
@@ -1755,6 +1763,46 @@ static int recv_streamer_private_fd(uint32_t pages_img_id, int *out_pages_fd)
 	rc = 0;
 out:
 	mutex_unlock(streamer_private_sock_lock);
+	return rc;
+}
+
+/*
+ * Stage 2c shmem zero-copy: ask the streamer for the shmem memfd that
+ * matches `shmid`. Wire protocol differs from the private side: write
+ * the 8-byte shmid LE, recv SCM_RIGHTS(memfd), and DO NOT wait for an
+ * ack. The streamer fills asynchronously via NIXL; the lazy-pages daemon
+ * gates user-visible reads on streamer_ready_futex per range. Caller
+ * uses the returned memfd as the backing inode for the shmem VMA mmap.
+ */
+int recv_streamer_shmem_memfd(uint64_t shmid, int *out_memfd)
+{
+	int sock, fd, rc = -1;
+
+	sock = get_service_fd(STREAM_SHMEM_SK_OFF);
+	if (sock < 0) {
+		pr_err("--stream-restore set but STREAM_SHMEM_SK_OFF service fd is missing\n");
+		return -1;
+	}
+	if (!streamer_shmem_sock_lock) {
+		pr_err("streamer_shmem_sock_lock not initialized\n");
+		return -1;
+	}
+
+	mutex_lock(streamer_shmem_sock_lock);
+
+	if (write(sock, &shmid, sizeof(shmid)) != (ssize_t)sizeof(shmid)) {
+		pr_perror("Failed to send shmid=0x%" PRIx64 " to streamer", shmid);
+		goto out;
+	}
+	if (recv_fds(sock, &fd, 1, NULL, 0) < 0) {
+		pr_err("Failed to receive streamer shmem memfd for shmid=0x%" PRIx64 "\n",
+		       shmid);
+		goto out;
+	}
+	*out_memfd = fd;
+	rc = 0;
+out:
+	mutex_unlock(streamer_shmem_sock_lock);
 	return rc;
 }
 
