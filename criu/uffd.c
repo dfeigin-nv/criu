@@ -288,6 +288,9 @@ static int recv_streamer_daemon_fds(void)
 
 	pr_info("[stream-c] daemon got abort_fd=%d, %u eventfds, futex[%u], shmids[%u]\n",
 		streamer_abort_rfd.fd, streamer_evfd_n, streamer_ready_futex_n, n);
+	for (i = 0; i < n; i++)
+		pr_info("[stream-c]   shmid[%u]=0x%lx\n", i,
+			(unsigned long)streamer_evfd_shmids[i]);
 	return 0;
 }
 
@@ -1769,6 +1772,14 @@ static int build_streamer_evfd_vmas(void)
 			VmaEntry *vma = mm->vmas[n];
 			unsigned int i;
 
+			if (vma->shmid != 0) {
+				lp_debug(lpi,
+					 "[stream-c] vma %lx-%lx status=%x flags=%x shmid=0x%lx\n",
+					 (unsigned long)vma->start,
+					 (unsigned long)vma->end,
+					 vma->status, vma->flags,
+					 (unsigned long)vma->shmid);
+			}
 			if (!(vma->status & VMA_ANON_SHARED))
 				continue;
 			if (vma->flags & MAP_HUGETLB)
