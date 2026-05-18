@@ -983,13 +983,7 @@ int open_page_read_at(int dfd, unsigned long img_id, struct page_read *pr, int p
 		pr->maybe_read_page = maybe_read_page_img_streamer;
 	else {
 		pr->maybe_read_page = maybe_read_page_local;
-		/*
-		 * Stream-restore (Pipeline C) uses PIE's AIO loop against the
-		 * streamer-provided memfd, NOT the host-side lazy-pages flow.
-		 * Keep pieok=true so the host doesn't pre-restore everything;
-		 * the daemon only handles shmem MODE_MINOR faults.
-		 */
-		if (!pr->parent && (!opts.lazy_pages || opts.stream_restore))
+		if (!pr->parent && !opts.lazy_pages)
 			pr->pieok = true;
 	}
 

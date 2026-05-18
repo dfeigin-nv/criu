@@ -1115,7 +1115,7 @@ static int enable_uffd(int uffd, unsigned long addr, unsigned long len,
 	return 0;
 }
 
-static int vma_remap(VmaEntry *vma_entry, int uffd, bool stream_restore)
+static int vma_remap(VmaEntry *vma_entry, int uffd)
 {
 	unsigned long src = vma_premmaped_start(vma_entry);
 	unsigned long dst = vma_entry->start;
@@ -1213,13 +1213,7 @@ static int vma_remap(VmaEntry *vma_entry, int uffd, bool stream_restore)
 	 * pages, so that the processes will hang until the memory is
 	 * injected via userfaultfd.
 	 */
-	/*
-	 * Stream-restore (Pipeline C): private VMAs are filled by PIE's AIO
-	 * loop reading from the streamer-provided memfd, so we MUST NOT mark
-	 * them MODE_MISSING. The daemon only handles shmem MODE_MINOR faults
-	 * registered in the dedicated block in restore_task.
-	 */
-	if (vma_entry_can_be_lazy(vma_entry) && !stream_restore)
+	if (vma_entry_can_be_lazy(vma_entry))
 		if (enable_uffd(uffd, dst, len, UFFDIO_REGISTER_MODE_MISSING) != 0)
 			return -1;
 
@@ -1848,7 +1842,7 @@ __visible long __export_restore_task(struct task_restore_args *args)
 		if (vma_entry->start > vma_entry->shmid)
 			break;
 
-		if (vma_remap(vma_entry, args->uffd, args->streamer_private_pages_fd >= 0))
+		if (vma_remap(vma_entry, args->uffd))
 			goto core_restore_end;
 	}
 
@@ -1865,7 +1859,7 @@ __visible long __export_restore_task(struct task_restore_args *args)
 		if (vma_entry->start < vma_entry->shmid)
 			break;
 
-		if (vma_remap(vma_entry, args->uffd, args->streamer_private_pages_fd >= 0))
+		if (vma_remap(vma_entry, args->uffd))
 			goto core_restore_end;
 	}
 
@@ -1898,7 +1892,7 @@ __visible long __export_restore_task(struct task_restore_args *args)
 	 * Gate: args->streamer_private_ready_futex — same single-source
 	 * runtime gate as commit 7. Default path stays byte-equivalent.
 	 */
-	if (args->streamer_private_pages_fd >= 0 && args->uffd > -1) {
+	if (args->streamer_private_ready_futex && args->uffd > -1) {
 		for (i = 0; i < args->vmas_n; i++) {
 			VmaEntry *e = args->vmas + i;
 			unsigned long len;
