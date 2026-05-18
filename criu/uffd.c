@@ -1777,7 +1777,17 @@ static int build_streamer_evfd_vmas(void)
 			VmaEntry *vma = mm->vmas[n];
 			unsigned int i;
 
-			if (!(vma->status & VMA_ANON_SHARED))
+			/*
+			 * Match by shmid alone — streamer_evfd_shmids is the
+			 * authoritative set of streamer-managed shmem regions
+			 * (built from pagemap-shmem-<shmid>.img enumeration).
+			 * Status flags vary between memfd-backed (VMA_AREA_MEMFD)
+			 * and anonymous shmem (VMA_ANON_SHARED); we don't need
+			 * to discriminate here, and the streamer side never
+			 * generates a shmid for hugetlb so MAP_HUGETLB filter is
+			 * redundant — but keep it as a defense-in-depth gate.
+			 */
+			if (vma->shmid == 0)
 				continue;
 			if (vma->flags & MAP_HUGETLB)
 				continue;
