@@ -37,9 +37,18 @@
 #include "pidfd-store.h"
 #include "compression.h"
 #include "common/scm.h"
+#include "common/lock.h"
 
 #include "protobuf.h"
 #include "images/pagemap.pb-c.h"
+
+/*
+ * Pipeline C: shmalloc'd cross-process mutex serializing the
+ * write(id) + recv_fds(memfd) + read(ack) trio on the shared streamer
+ * private socket. Allocated in cr-restore.c:cr_restore_tasks() before
+ * fork; visible in all forked task processes via inherited shmem.
+ */
+mutex_t *streamer_private_sock_lock;
 
 static int task_reset_dirty_track(int pid)
 {
@@ -1706,7 +1715,7 @@ int open_vmas(struct pstree_item *t)
  */
 static int recv_streamer_private_fd(uint32_t pages_img_id, int *out_pages_fd)
 {
-	int sock, fd;
+	int sock, fd, rc = -1;
 	char ack = 0;
 
 	sock = get_service_fd(STREAM_PRIVATE_SK_OFF);
@@ -1714,23 +1723,39 @@ static int recv_streamer_private_fd(uint32_t pages_img_id, int *out_pages_fd)
 		pr_err("--stream-restore set but STREAM_PRIVATE_SK_OFF service fd is missing\n");
 		return -1;
 	}
+	if (!streamer_private_sock_lock) {
+		pr_err("streamer_private_sock_lock not initialized\n");
+		return -1;
+	}
+
+	/*
+	 * Serialize the write/recv_fds/read trio across forked tasks.
+	 * The streamer protocol assumes one in-flight request per socket;
+	 * without this lock concurrent tasks interleave bytes and
+	 * recv_fds() picks up the wrong SCM_RIGHTS payload (ENOENT).
+	 */
+	mutex_lock(streamer_private_sock_lock);
+
 	if (write(sock, &pages_img_id, sizeof(pages_img_id)) != (ssize_t)sizeof(pages_img_id)) {
 		pr_perror("Failed to send pages_img_id=%u to streamer", pages_img_id);
-		return -1;
+		goto out;
 	}
 	if (recv_fds(sock, &fd, 1, NULL, 0) < 0) {
 		pr_perror("Failed to receive streamer private memfd for id=%u on sock %d",
 			  pages_img_id, sock);
-		return -1;
+		goto out;
 	}
 	if (read(sock, &ack, 1) != 1 || ack != 'A') {
 		pr_perror("Failed to receive streamer fill-done ack for id=%u (got 0x%02x)",
 			  pages_img_id, (unsigned)ack);
 		close(fd);
-		return -1;
+		goto out;
 	}
 	*out_pages_fd = fd;
-	return 0;
+	rc = 0;
+out:
+	mutex_unlock(streamer_private_sock_lock);
+	return rc;
 }
 
 /*

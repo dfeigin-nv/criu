@@ -2450,6 +2450,12 @@ int cr_restore_tasks(void)
 	 * CRIU_STREAMER_PRIVATE_SOCK. Move it into the service-fd slot so
 	 * close_old_fds() (called per-task after fork) leaves it alone;
 	 * mem.c:recv_streamer_private_fds will retrieve it from the slot.
+	 *
+	 * Allocate a shmalloc'd mutex_t that all forked tasks serialize on
+	 * around the write(id)+recv_fds(memfd)+read(ack) trio. The socket
+	 * is a single shared SOCK_STREAM endpoint inherited by every task;
+	 * without a cross-process lock, concurrent task writes interleave
+	 * and recv_fds pulls the wrong SCM_RIGHTS payload (errno=ENOENT).
 	 */
 	if (opts.stream_restore) {
 		const char *env = getenv("CRIU_STREAMER_PRIVATE_SOCK");
@@ -2462,6 +2468,12 @@ int cr_restore_tasks(void)
 				}
 			}
 		}
+		streamer_private_sock_lock = shmalloc(sizeof(mutex_t));
+		if (!streamer_private_sock_lock) {
+			pr_err("Failed to shmalloc streamer private sock lock\n");
+			return -1;
+		}
+		mutex_init(streamer_private_sock_lock);
 	}
 
 	if (check_img_inventory(/* restore = */ true) < 0)
