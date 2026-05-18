@@ -2381,6 +2381,7 @@ int cr_restore_tasks(void)
 	 * without a cross-process lock, concurrent task writes interleave
 	 * and recv_fds pulls the wrong SCM_RIGHTS payload (errno=ENOENT).
 	 */
+	extern mutex_t *streamer_private_sock_lock;
 	if (opts.stream_restore) {
 		const char *env = getenv("CRIU_STREAMER_PRIVATE_SOCK");
 		if (env) {
