@@ -34,6 +34,11 @@
 #define SEEK_HOLE 4
 #endif
 
+/* Pipeline C Stage 2c: defined in mem.c. Returns the streamer-owned memfd
+ * that backs the shmem region keyed by shmid. Caller mmaps the memfd as
+ * the shmem VMA's inode; bytes arrive asynchronously via NIXL. */
+extern int recv_streamer_shmem_memfd(uint64_t shmid, int *out_memfd);
+
 /*
  * Hash table and routines for keeping shmid -> shmem_xinfo mappings
  */
@@ -640,10 +645,28 @@ static int open_shmem(int pid, struct vma_area *vma)
 	}
 
 	if (kdat.has_memfd && (!is_hugetlb || kdat.has_memfd_hugetlb)) {
-		f = memfd_create("", memfd_flag);
-		if (f < 0) {
-			pr_perror("Unable to create memfd");
-			goto err;
+		/*
+		 * Stage 2c: ask the streamer for the memfd backing this shmid.
+		 * The streamer pre-allocated + ftruncate'd the memfd and is
+		 * filling it via NIXL; we just adopt its fd so the resulting
+		 * shmem VMA shares the same shmem-inode page cache the daemon
+		 * later UFFDIO_CONTINUE-installs from. Excluded for hugetlb:
+		 * MODE_MINOR UFFD isn't supported on hugetlb, and the streamer
+		 * never created a memfd for those shmids.
+		 */
+		if (opts.stream_restore && !is_hugetlb &&
+		    get_service_fd(STREAM_SHMEM_SK_OFF) >= 0) {
+			if (recv_streamer_shmem_memfd(vi->shmid, &f) < 0) {
+				pr_err("Failed to recv shmem memfd from streamer for shmid=0x%" PRIx64 "\n",
+				       vi->shmid);
+				goto err;
+			}
+		} else {
+			f = memfd_create("", memfd_flag);
+			if (f < 0) {
+				pr_perror("Unable to create memfd");
+				goto err;
+			}
 		}
 
 		flags |= MAP_FILE;
