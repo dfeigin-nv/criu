@@ -237,7 +237,7 @@ out:
 
 int lazy_pages_setup_zombie(int pid)
 {
-	if (!opts.lazy_pages)
+	if (!opts.lazy_pages && !opts.stream_restore)
 		return 0;
 
 	if (send_uffd(0, -pid))
@@ -303,7 +303,7 @@ int setup_uffd(int pid, struct task_restore_args *task_args)
 	unsigned long features = kdat.uffd_features & NEED_UFFD_API_FEATURES;
 	int err = 0;
 
-	if (!opts.lazy_pages) {
+	if (!opts.lazy_pages && !opts.stream_restore) {
 		task_args->uffd = -1;
 		return 0;
 	}
@@ -337,7 +337,7 @@ int prepare_lazy_pages_socket(void)
 	int fd, len, ret = -1;
 	struct sockaddr_un sun;
 
-	if (!opts.lazy_pages)
+	if (!opts.lazy_pages && !opts.stream_restore)
 		return 0;
 
 	if (prepare_sock_addr(&sun))
@@ -1300,7 +1300,7 @@ int lazy_pages_finish_restore(void)
 	uint32_t fin = LAZY_PAGES_RESTORE_FINISHED;
 	int fd, ret;
 
-	if (!opts.lazy_pages)
+	if (!opts.lazy_pages && !opts.stream_restore)
 		return 0;
 
 	fd = fdstore_get(lazy_pages_sk_id);
