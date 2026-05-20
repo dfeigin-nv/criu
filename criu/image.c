@@ -623,7 +623,16 @@ struct cr_img *open_image_at(int dfd, int type, unsigned long flags, ...)
 		lazy = (flags & O_CREAT);
 	}
 
-	img = xmalloc(sizeof(*img));
+	/*
+	 * xzalloc so the embedded bfd starts with b.mem == NULL. The ENOENT
+	 * path (do_open_image -> skip_magic) sets img->_x.fd = EMPTY_IMG_FD
+	 * without touching the bfd buffer fields; if those happen to be
+	 * non-zero heap garbage, bfd_buffered() reads them as "has buffer"
+	 * and img_raw_fd() trips BUG_ON(bfd_buffered) -- intermittently,
+	 * depending on heap state. Streaming restores hit this when
+	 * pages-N.img doesn't exist on disk.
+	 */
+	img = xzalloc(sizeof(*img));
 	if (!img)
 		return NULL;
 
