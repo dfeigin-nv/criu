@@ -213,6 +213,16 @@ struct task_restore_args {
 	unsigned int *streamer_private_ready_futex;
 	unsigned int streamer_private_ready_futex_n;
 
+	/*
+	 * Pipe-per-memfd async-overlap signal (Plan v4). When ≥ 0, PIE reads
+	 * one byte from this pipe before issuing io_submit, blocking until
+	 * the streamer either writes '1' (memfd filled) or closes the pipe
+	 * (abort → reader EOF). Streamer fills the memfd in parallel with
+	 * CRIU C prep + PIE setup. -1 means sync mode (legacy 'A' ack on
+	 * private socket already gated prepare_vma_ios return).
+	 */
+	int streamer_ready_pipe_fd;
+
 	struct restore_posix_timer *posix_timers;
 	unsigned int posix_timers_n;
 	bool posix_timer_cr_ids;

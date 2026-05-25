@@ -1721,9 +1721,19 @@ int open_vmas(struct pstree_item *t)
  * with the async streamer, but mem.c pre-fills the words to 1 right
  * after the ack so PIE never has to wait.
  */
-static int recv_streamer_private_fd(uint32_t pages_img_id, int *out_pages_fd)
+/*
+ * Async-overlap mode: streamer sends [memfd, pipe_rfd] via SCM_RIGHTS and
+ * the 'A' byte immediately on memfd handover. CRIU returns without waiting
+ * for fill. PIE blocks on sys_read(pipe_rfd) at AIO entry. Pipe writer
+ * close (streamer death) gives PIE EOF → clean abort. Sync mode: legacy
+ * single-fd handover + 'A' after fill (out_pipe_fd set to -1).
+ */
+static int recv_streamer_private_fd(uint32_t pages_img_id, int *out_pages_fd,
+				    int *out_pipe_fd)
 {
-	int sock, fd, rc = -1;
+	int sock, fds[2] = { -1, -1 }, rc = -1;
+	int nfds;
+	bool async;
 	char ack = 0;
 
 	sock = get_service_fd(STREAM_PRIVATE_SK_OFF);
@@ -1735,6 +1745,10 @@ static int recv_streamer_private_fd(uint32_t pages_img_id, int *out_pages_fd)
 		pr_err("streamer_private_sock_lock not initialized\n");
 		return -1;
 	}
+
+	async = opts.stream_restore_async != 0;
+	nfds = async ? 2 : 1;
+	*out_pipe_fd = -1;
 
 	/*
 	 * Serialize the write/recv_fds/read trio across forked tasks.
@@ -1748,18 +1762,22 @@ static int recv_streamer_private_fd(uint32_t pages_img_id, int *out_pages_fd)
 		pr_perror("Failed to send pages_img_id=%u to streamer", pages_img_id);
 		goto out;
 	}
-	if (recv_fds(sock, &fd, 1, NULL, 0) < 0) {
-		pr_perror("Failed to receive streamer private memfd for id=%u on sock %d",
-			  pages_img_id, sock);
+	if (recv_fds(sock, fds, nfds, NULL, 0) < 0) {
+		pr_perror("Failed to receive streamer private fds (n=%d) for id=%u on sock %d",
+			  nfds, pages_img_id, sock);
 		goto out;
 	}
 	if (read(sock, &ack, 1) != 1 || ack != 'A') {
-		pr_perror("Failed to receive streamer fill-done ack for id=%u (got 0x%02x)",
+		pr_perror("Failed to receive streamer ack for id=%u (got 0x%02x)",
 			  pages_img_id, (unsigned)ack);
-		close(fd);
+		close(fds[0]);
+		if (nfds > 1)
+			close(fds[1]);
 		goto out;
 	}
-	*out_pages_fd = fd;
+	*out_pages_fd = fds[0];
+	if (async)
+		*out_pipe_fd = fds[1];
 	rc = 0;
 out:
 	mutex_unlock(streamer_private_sock_lock);
@@ -1856,18 +1874,20 @@ static int prepare_vma_ios(struct pstree_item *t, struct task_restore_args *ta)
 		ta->streamer_private_pages_fd = -1;
 		ta->streamer_private_ready_futex = NULL;
 		ta->streamer_private_ready_futex_n = 0;
+		ta->streamer_ready_pipe_fd = -1;
 		return 0;
 	}
 
 	if (opts.stream_restore) {
-		int pages_fd = -1;
+		int pages_fd = -1, pipe_fd = -1;
 		unsigned int i;
 
-		if (recv_streamer_private_fd(rsti(t)->pages_img_id, &pages_fd) < 0)
+		if (recv_streamer_private_fd(rsti(t)->pages_img_id, &pages_fd, &pipe_fd) < 0)
 			return -1;
 
 		ta->vma_ios_fd = pages_fd;
 		ta->streamer_private_pages_fd = pages_fd;
+		ta->streamer_ready_pipe_fd = pipe_fd;
 		/*
 		 * The streamer memfd is not opened O_DIRECT, so PIE must use
 		 * the buffered preadv engine rather than restore_vma_aio().
@@ -1883,10 +1903,24 @@ static int prepare_vma_ios(struct pstree_item *t, struct task_restore_args *ta)
 		ta->streamer_private_ready_futex_n = ta->vma_ios_n;
 
 		/*
-		 * The streamer already acked all ranges before we got here,
-		 * so the memfd content is complete. Mark every futex word
-		 * ready so PIE's wait-loop in restorer.c:1895 / 2050 falls
-		 * through on the first atomic load.
+		 * Synchronization model:
+		 *
+		 *  - sync mode (opts.stream_restore_async = 0): streamer's 'A'
+		 *    ack on the private socket already gated this function on
+		 *    full memfd fill. streamer_ready_pipe_fd is -1; PIE's read
+		 *    loop proceeds immediately.
+		 *  - async mode (default): 'A' ack arrived on memfd handover;
+		 *    streamer is still filling. streamer_ready_pipe_fd points
+		 *    at a pipe the streamer will write one byte to when fill
+		 *    completes (or close on abort). PIE blocks on sys_read
+		 *    before consuming the ranges.
+		 *
+		 * Either way the whole-memfd readiness is carried by the ack or
+		 * the pipe, so the per-range futex words are pre-marked ready
+		 * and PIE's wait-loop falls through on the first atomic load.
+		 * The per-range scaffolding is reserved for sub-memfd
+		 * parallelism if overlap measurement later shows room for it.
+
 		 */
 		for (i = 0; i < ta->streamer_private_ready_futex_n; i++)
 			ta->streamer_private_ready_futex[i] = 1;
@@ -1900,6 +1934,7 @@ static int prepare_vma_ios(struct pstree_item *t, struct task_restore_args *ta)
 	ta->streamer_private_pages_fd = -1;
 	ta->streamer_private_ready_futex = NULL;
 	ta->streamer_private_ready_futex_n = 0;
+	ta->streamer_ready_pipe_fd = -1;
 
 	/*
 	 * If auto-dedup is on we need RDWR mode to be able to punch holes in

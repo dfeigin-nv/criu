@@ -2487,6 +2487,31 @@ __visible long __export_restore_task(struct task_restore_args *args)
 	if (args->vma_ios_n > 0 && args->vma_ios_fd != -1) {
 		int rc;
 
+		/*
+		 * Stream-restore async overlap: if the streamer handed back a
+		 * ready-pipe fd, block here until it has fully filled the
+		 * scratch memfd. One-byte read; reader EOF (writer-side close)
+		 * indicates streamer abort, so bail before touching unfilled
+		 * memfd pages.
+		 *
+		 * Sync mode leaves streamer_ready_pipe_fd = -1;
+		 * recv_streamer_private_fd() already gated on the streamer's
+		 * 'A' ack, so the memfd was complete by the time we got here.
+		 * No-op in that mode.
+		 */
+		if (args->streamer_ready_pipe_fd >= 0) {
+			char ready_byte = 0;
+			long rd = sys_read(args->streamer_ready_pipe_fd, &ready_byte, 1);
+
+			if (rd != 1) {
+				pr_err("stream: ready-pipe read returned %ld (fd=%d)\n", rd,
+				       args->streamer_ready_pipe_fd);
+				sys_close(args->streamer_ready_pipe_fd);
+				goto core_restore_end;
+			}
+			sys_close(args->streamer_ready_pipe_fd);
+		}
+
 		if (args->vma_ios_use_direct)
 			pr_debug("Restoring delayed VMA I/O with native AIO\n");
 		rc = args->vma_ios_use_direct ?
