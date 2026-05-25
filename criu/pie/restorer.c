@@ -2512,13 +2512,71 @@ __visible long __export_restore_task(struct task_restore_args *args)
 			sys_close(args->streamer_ready_pipe_fd);
 		}
 
-		if (args->vma_ios_use_direct)
-			pr_debug("Restoring delayed VMA I/O with native AIO\n");
-		rc = args->vma_ios_use_direct ?
-			     restore_vma_aio(args) :
-			     restore_vma_preadv_mixed(args);
-		if (rc < 0)
-			goto core_restore_end;
+		/*
+		 * Stream-restore zero-copy fast path. When vma_ios_fd is the
+		 * streamer's memfd (opts.stream_restore on), replace each
+		 * pagemap range's anon mapping with MAP_PRIVATE|MAP_FIXED on
+		 * the memfd at the matching file offset. Pages stay shared
+		 * with the streamer's page cache via CoW; first write triggers
+		 * a per-page copy, but for read-mostly workloads (model
+		 * weights) the copy never happens. Eliminates the io_submit
+		 * memcpy ceiling (~16 Gbps on AWS A100) on the critical path.
+		 *
+		 * Discriminator: streamer_private_pages_fd >= 0. Default
+		 * (non-stream) restores keep the AIO path below.
+		 */
+		if (args->streamer_private_pages_fd >= 0) {
+			struct restore_vma_io *zr = args->vma_ios;
+			unsigned int zc_n = args->vma_ios_n;
+			int zc_fd = args->vma_ios_fd;
+			unsigned int zi;
+			struct timeval ztv0, ztv1;
+			size_t zc_total = 0;
+
+			sys_gettimeofday(&ztv0, NULL);
+			for (zi = 0; zi < zc_n; zi++) {
+				off_t cur_off = zr->off;
+				int zj;
+				for (zj = 0; zj < zr->nr_iovs; zj++) {
+					unsigned long va = (unsigned long)zr->iovs[zj].iov_base;
+					size_t len = zr->iovs[zj].iov_len;
+					unsigned long m;
+
+					m = sys_mmap((void *)va, len,
+						     PROT_READ | PROT_WRITE,
+						     MAP_PRIVATE | MAP_FIXED,
+						     zc_fd, cur_off);
+					if (IS_ERR_VALUE(m) || m != va) {
+						pr_err("stream-zcopy: mmap vaddr=%lx len=%lx off=%lx failed: %ld\n",
+						       va, (unsigned long)len,
+						       (unsigned long)cur_off,
+						       IS_ERR_VALUE(m) ? (long)m : 0L);
+						sys_close(zc_fd);
+						args->vma_ios_fd = -1;
+						goto core_restore_end;
+					}
+					cur_off += len;
+					zc_total += len;
+				}
+				zr = (struct restore_vma_io *)((void *)zr +
+							       RIO_SIZE(zr->nr_iovs));
+			}
+			sys_gettimeofday(&ztv1, NULL);
+			pr_info("VMA restore stream-zcopy %lu ms (range %zu MiB, %u ios)\n",
+				(unsigned long)((ztv1.tv_sec - ztv0.tv_sec) * 1000 +
+						(ztv1.tv_usec - ztv0.tv_usec) / 1000),
+				zc_total / (1024 * 1024), zc_n);
+			sys_close(zc_fd);
+			args->vma_ios_fd = -1;
+		} else {
+			if (args->vma_ios_use_direct)
+				pr_debug("Restoring delayed VMA I/O with native AIO\n");
+			rc = args->vma_ios_use_direct ?
+				     restore_vma_aio(args) :
+				     restore_vma_preadv_mixed(args);
+			if (rc < 0)
+				goto core_restore_end;
+		}
 	}
 
 	/*
