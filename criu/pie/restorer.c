@@ -1965,6 +1965,32 @@ __visible long __export_restore_task(struct task_restore_args *args)
 
 		sys_gettimeofday(&tv0, NULL);
 
+		/*
+		 * Pipeline C async overlap (Plan v4): if the streamer handed
+		 * back a ready-pipe fd, block here until the streamer has
+		 * fully filled the scratch memfd. One-byte read; reader EOF
+		 * (writer-side close) indicates streamer abort → bail before
+		 * touching unfilled memfd pages.
+		 *
+		 * Sync mode left streamer_ready_pipe_fd = -1; recv_streamer_
+		 * private_fd already gated on the streamer's 'A' ack so the
+		 * memfd was complete by the time we got here. No-op in that
+		 * mode.
+		 */
+		if (args->streamer_ready_pipe_fd >= 0) {
+			char ready_byte = 0;
+			long rd = sys_read(args->streamer_ready_pipe_fd,
+					   &ready_byte, 1);
+
+			if (rd != 1) {
+				pr_err("stream: ready-pipe read returned %ld (fd=%d)\n",
+				       rd, args->streamer_ready_pipe_fd);
+				sys_close(args->streamer_ready_pipe_fd);
+				goto core_restore_end;
+			}
+			sys_close(args->streamer_ready_pipe_fd);
+		}
+
 		/* Compute total range for logging */
 		{
 			struct restore_vma_io *r = args->vma_ios;

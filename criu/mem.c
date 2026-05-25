@@ -1888,9 +1888,19 @@ out:
  * with the async streamer, but mem.c pre-fills the words to 1 right
  * after the ack so PIE never has to wait.
  */
-static int recv_streamer_private_fd(uint32_t pages_img_id, int *out_pages_fd)
+/*
+ * Async-overlap mode: streamer sends [memfd, pipe_rfd] via SCM_RIGHTS and
+ * the 'A' byte immediately on memfd handover. CRIU returns without waiting
+ * for fill. PIE blocks on sys_read(pipe_rfd) at AIO entry. Pipe writer
+ * close (streamer death) gives PIE EOF → clean abort. Sync mode: legacy
+ * single-fd handover + 'A' after fill (out_pipe_fd set to -1).
+ */
+static int recv_streamer_private_fd(uint32_t pages_img_id, int *out_pages_fd,
+				    int *out_pipe_fd)
 {
-	int sock, fd, rc = -1;
+	int sock, fds[2] = { -1, -1 }, rc = -1;
+	int nfds;
+	bool async;
 	char ack = 0;
 
 	sock = get_service_fd(STREAM_PRIVATE_SK_OFF);
@@ -1902,6 +1912,10 @@ static int recv_streamer_private_fd(uint32_t pages_img_id, int *out_pages_fd)
 		pr_err("streamer_private_sock_lock not initialized\n");
 		return -1;
 	}
+
+	async = opts.stream_restore_async != 0;
+	nfds = async ? 2 : 1;
+	*out_pipe_fd = -1;
 
 	/*
 	 * Serialize the write/recv_fds/read trio across forked tasks.
@@ -1915,20 +1929,24 @@ static int recv_streamer_private_fd(uint32_t pages_img_id, int *out_pages_fd)
 		pr_perror("Failed to send pages_img_id=%u to streamer", pages_img_id);
 		goto out;
 	}
-	pr_info("[stream-diag] task=%d id=%u sock=%d locked\n",
-		(int)getpid(), pages_img_id, sock);
-	if (recv_fds(sock, &fd, 1, NULL, 0) < 0) {
-		pr_perror("Failed to receive streamer private memfd for id=%u on sock %d",
-			  pages_img_id, sock);
+	pr_info("[stream-diag] task=%d id=%u sock=%d locked async=%d\n",
+		(int)getpid(), pages_img_id, sock, async ? 1 : 0);
+	if (recv_fds(sock, fds, nfds, NULL, 0) < 0) {
+		pr_perror("Failed to receive streamer private fds (n=%d) for id=%u on sock %d",
+			  nfds, pages_img_id, sock);
 		goto out;
 	}
 	if (read(sock, &ack, 1) != 1 || ack != 'A') {
-		pr_perror("Failed to receive streamer fill-done ack for id=%u (got 0x%02x)",
+		pr_perror("Failed to receive streamer ack for id=%u (got 0x%02x)",
 			  pages_img_id, (unsigned)ack);
-		close(fd);
+		close(fds[0]);
+		if (nfds > 1)
+			close(fds[1]);
 		goto out;
 	}
-	*out_pages_fd = fd;
+	*out_pages_fd = fds[0];
+	if (async)
+		*out_pipe_fd = fds[1];
 	rc = 0;
 out:
 	mutex_unlock(streamer_private_sock_lock);
@@ -2026,35 +2044,39 @@ static int prepare_vma_ios(struct pstree_item *t, struct task_restore_args *ta)
 		ta->streamer_private_pages_fd = -1;
 		ta->streamer_private_ready_futex = NULL;
 		ta->streamer_private_ready_futex_n = 0;
+		ta->streamer_ready_pipe_fd = -1;
 		return 0;
 	}
 
 	if (opts.stream_restore) {
-		int pages_fd = -1;
+		int pages_fd = -1, pipe_fd = -1;
 
-		if (recv_streamer_private_fd(rsti(t)->pages_img_id, &pages_fd) < 0)
+		if (recv_streamer_private_fd(rsti(t)->pages_img_id, &pages_fd, &pipe_fd) < 0)
 			return -1;
 
 		ta->vma_ios_fd = pages_fd;
 		ta->streamer_private_pages_fd = pages_fd;
+		ta->streamer_ready_pipe_fd = pipe_fd;
 
 		if (pagemap_render_iovec(&rsti(t)->vma_io, ta) < 0)
 			return -1;
 
 		/*
-		 * Synchronous Pipeline C: streamer's ack on recv_streamer_
-		 * private_fd guarantees the memfd is fully populated before
-		 * we return. PIE's wait-loops (pie/restorer.c:1895, :2050)
-		 * are NULL-gated on streamer_private_ready_futex, so leaving
-		 * it NULL is the correct "everything ready" signal — no need
-		 * to allocate or pre-fill anything.
+		 * Pipeline C synchronization model (Plan v4):
 		 *
-		 * alloc_streamer_futex_array() used shmalloc(), which fires
-		 * BUG_ON in rst-malloc.c:169 at this point in restore because
-		 * rst_mem_switch_to_private (cr-restore.c) has already
-		 * disabled RM_SHARED. Async overlap will reintroduce a
-		 * compatible allocator (e.g. shmalloc moved earlier or PIE-
-		 * mapped slab) when the per-range eventfd path lands.
+		 *  - sync mode (opts.stream_restore_async = 0): streamer's 'A'
+		 *    ack on the private socket already gated this function on
+		 *    full memfd fill. streamer_ready_pipe_fd is -1; PIE's AIO
+		 *    loop reads zero bytes and proceeds.
+		 *  - async mode (default): 'A' ack arrived on memfd handover;
+		 *    streamer is still filling. streamer_ready_pipe_fd points
+		 *    at a pipe the streamer will write one byte to when fill
+		 *    completes (or close on abort). PIE blocks on sys_read
+		 *    before issuing io_submit.
+		 *
+		 * Per-pagemap-range futex scaffolding stays NULL-gated and
+		 * dormant; reserved for Step B if overlap measurement shows
+		 * room for sub-memfd parallelism.
 		 */
 		ta->streamer_private_ready_futex = NULL;
 		ta->streamer_private_ready_futex_n = 0;
@@ -2068,6 +2090,7 @@ static int prepare_vma_ios(struct pstree_item *t, struct task_restore_args *ta)
 	ta->streamer_private_pages_fd = -1;
 	ta->streamer_private_ready_futex = NULL;
 	ta->streamer_private_ready_futex_n = 0;
+	ta->streamer_ready_pipe_fd = -1;
 
 	/*
 	 * If auto-dedup is on we need RDWR mode to be able to punch holes in
