@@ -918,7 +918,14 @@ int open_page_read_at(int dfd, unsigned long img_id, struct page_read *pr, int p
 	{
 		int pfd = img_raw_fd(pr->pi);
 
-		if (pfd >= 0 && !opts.stream) {
+		/*
+		 * memfd/shmem bulk read (GPU buffers) restores via O_DIRECT preadv
+		 * into a MAP_SHARED memfd. O_DIRECT there forces FOLL_LONGTERM pinning
+		 * + movable-page migration of every destination page (threads pile up
+		 * in __gup_longterm_locked), capping throughput. Use buffered I/O +
+		 * readahead for PR_SHMEM; keep O_DIRECT for PR_TASK.
+		 */
+		if (pfd >= 0 && !opts.stream && (pr_flags & PR_TYPE_MASK) != PR_SHMEM) {
 			int fl = fcntl(pfd, F_GETFL);
 
 			if (fl >= 0) {
