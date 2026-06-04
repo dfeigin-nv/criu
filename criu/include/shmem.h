@@ -25,6 +25,10 @@ struct async_restore_shmem_args {
 
 int async_restore_shmem_content(void *arg, int fd, pid_t pid);
 
+/* Split memfd content restore (memfd-cache): set size, then fill/borrow. */
+extern int memfd_shmem_set_size(int fd, unsigned long shmid, unsigned long size);
+extern int memfd_shmem_fill_content(int fd, unsigned long shmid, unsigned long size);
+
 #define SYSV_SHMEM_SKIP_FD (0x7fffffff)
 
 #endif /* __CR_SHMEM_H__ */

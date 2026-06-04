@@ -556,6 +556,53 @@ int async_restore_shmem_content(void *arg, int fd, pid_t pid)
 	return 0;
 }
 
+/*
+ * Structural half of memfd content restore: set the file size. Cheap, has no
+ * task/pid/namespace dependency, and is safe to run synchronously in the
+ * coordinator before fork. Returns 0 on success, -1 on failure.
+ */
+int memfd_shmem_set_size(int fd, unsigned long shmid, unsigned long size)
+{
+	if (size == 0)
+		return 0;
+
+	if (ftruncate(fd, size) < 0) {
+		pr_perror("Can't resize shmem 0x%lx size=%ld", shmid, size);
+		return -1;
+	}
+
+	return 0;
+}
+
+/*
+ * Content half of memfd content restore: map the (already-sized) memfd and
+ * copy its pages in from the shmid image. Self-contained -- no task/pid/ns
+ * dependency -- so it is safe to run on an async worker thread. The caller
+ * must have run memfd_shmem_set_size(fd, ...) first. Shares the mmap+copy
+ * body with restore_shmem_fd_content. Returns 0 on success, -1 on failure.
+ */
+int memfd_shmem_fill_content(int fd, unsigned long shmid, unsigned long size)
+{
+	return restore_shmem_fd_content(fd, shmid, size);
+}
+
+/*
+ * Sequential wrapper: structural half followed by content half. Used on the
+ * synchronous restore path (memfd_open_inode_nocache). Returns 0 on success
+ * and 1 on failure to match the original caller convention -- note the split
+ * helpers above return -1, so this is an intentional translation, not a bug.
+ */
+int restore_memfd_shmem_content(int fd, unsigned long shmid, unsigned long size)
+{
+	if (memfd_shmem_set_size(fd, shmid, size) < 0)
+		return 1;
+
+	if (memfd_shmem_fill_content(fd, shmid, size) < 0)
+		return 1;
+
+	return 0;
+}
+
 struct open_map_file_args {
 	unsigned long addr, size;
 };
