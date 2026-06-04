@@ -239,6 +239,14 @@ static int crtools_prepare_shared(void)
 	if (prepare_memfd_inodes())
 		return -1;
 
+	/*
+	 * Pre-fork: create and size every memfd inode, register it in the
+	 * fdstore, and queue its content fill. Runs after prepare_memfd_inodes()
+	 * and fdstore_init(); the fill workers start only after the fork barrier.
+	 */
+	if (memfd_content_prepare())
+		return -1;
+
 	if (prepare_files())
 		return -1;
 
@@ -2179,6 +2187,23 @@ skip_ns_bouncing:
 	if (ret < 0)
 		goto out_kill;
 
+	/*
+	 * Fill memfd content on a pool of coordinator worker threads, then join
+	 * them. The FORKING wait above returns only after CR_STATE_RESTORE has
+	 * finished (see the CR_STATE_FORKING comment in restorer.h), so this is a
+	 * parallel fill phase that runs after the per-task RESTORE stage, not
+	 * overlapping it. Fork-safe: the master runs no fork() between starting and
+	 * joining the workers -- its last fork is fork_with_pid() for the init
+	 * task, already done above. The join must finish before apply_memfd_seals()
+	 * so F_SEAL_FUTURE_WRITE is only set once all content has been written.
+	 */
+	ret = memfd_content_start();
+	if (ret < 0)
+		goto out_kill;
+	ret = memfd_content_drain();
+	if (ret < 0)
+		goto out_kill;
+
 	ret = apply_memfd_seals();
 	if (ret < 0)
 		goto out_kill;
@@ -2362,6 +2387,12 @@ out_kill:
 	}
 
 out:
+	/*
+	 * Free the async fill pool on the abort path. Idempotent: if
+	 * memfd_content_drain() already ran it freed the pool, and the only
+	 * window where the workers are live (start -> drain) never branches here.
+	 */
+	memfd_content_fini();
 	xfree(pids);
 	depopulate_roots_yard(mnt_ns_fd, true);
 	stop_usernsd();

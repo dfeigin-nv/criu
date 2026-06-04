@@ -21,6 +21,17 @@ extern int apply_memfd_seals(void);
 
 extern int prepare_memfd_inodes(void);
 
+/*
+ * Coordinator-hoisted async memfd content restore. prepare() runs the cheap
+ * structural half (create + size + fdstore_add) before fork and queues the
+ * content fill; start()/drain() run and join the fill workers after the
+ * FORKING barrier; fini() frees the pool on the abort path.
+ */
+extern int memfd_content_prepare(void);
+extern int memfd_content_start(void);
+extern int memfd_content_drain(void);
+extern void memfd_content_fini(void);
+
 #ifdef CONFIG_HAS_MEMFD_CREATE
 #include <sys/mman.h>
 #else

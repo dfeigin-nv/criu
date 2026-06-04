@@ -16,7 +16,6 @@ extern int fixup_sysv_shmems(void);
 extern int dump_one_memfd_shmem(int fd, unsigned long shmid, unsigned long size);
 extern int dump_one_sysv_shmem(void *addr, unsigned long size, unsigned long shmid);
 extern int restore_sysv_shmem_content(void *addr, unsigned long size, unsigned long shmid);
-extern int restore_memfd_shmem_content(int fd, unsigned long shmid, unsigned long size);
 extern int memfd_shmem_set_size(int fd, unsigned long shmid, unsigned long size);
 extern int memfd_shmem_fill_content(int fd, unsigned long shmid, unsigned long size);
 

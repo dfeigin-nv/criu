@@ -567,23 +567,6 @@ int memfd_shmem_fill_content(int fd, unsigned long shmid, unsigned long size)
 	return ret;
 }
 
-/*
- * Sequential wrapper: structural half followed by content half. Used on the
- * synchronous restore path (memfd_open_inode_nocache). Returns 0 on success
- * and 1 on failure to match the original caller convention -- note the split
- * helpers above return -1, so this is an intentional translation, not a bug.
- */
-int restore_memfd_shmem_content(int fd, unsigned long shmid, unsigned long size)
-{
-	if (memfd_shmem_set_size(fd, shmid, size) < 0)
-		return 1;
-
-	if (memfd_shmem_fill_content(fd, shmid, size) < 0)
-		return 1;
-
-	return 0;
-}
-
 struct open_map_file_args {
 	unsigned long addr, size;
 };
