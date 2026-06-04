@@ -6,6 +6,7 @@ obj-y			+= action-scripts.o
 obj-y			+= external.o
 obj-y			+= aio.o
 obj-y			+= apparmor.o
+obj-y			+= worker-pool.o
 obj-y			+= bfd.o
 obj-y			+= bitmap.o
 obj-y			+= cgroup.o
