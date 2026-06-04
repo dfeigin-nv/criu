@@ -21,6 +21,12 @@ extern int apply_memfd_seals(void);
 
 extern int prepare_memfd_inodes(void);
 
+/* PROTOTYPE: coordinator-hoisted async memfd content restore. */
+extern int memfd_content_prepare(void);
+extern int memfd_content_start(int n_workers);
+extern int memfd_content_drain(void);
+extern int memfd_worker_count(void);
+
 #ifdef CONFIG_HAS_MEMFD_CREATE
 #include <sys/mman.h>
 #else

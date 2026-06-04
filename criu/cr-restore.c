@@ -239,6 +239,14 @@ static int crtools_prepare_shared(void)
 	if (prepare_memfd_inodes())
 		return -1;
 
+	/*
+	 * PROTOTYPE: pre-fork structural half of memfd content restore
+	 * (create fd, set size, fdstore_add, queue async fill). Must run
+	 * after prepare_memfd_inodes() and fdstore_init(), before fork.
+	 */
+	if (memfd_content_prepare())
+		return -1;
+
 	if (prepare_files())
 		return -1;
 
@@ -2176,6 +2184,20 @@ skip_ns_bouncing:
 		goto out_kill;
 
 	ret = restore_wait_inprogress_tasks();
+	if (ret < 0)
+		goto out_kill;
+
+	/*
+	 * PROTOTYPE: fill memfd content on coordinator worker threads now,
+	 * overlapping the per-task RESTORE stage, then drain. Start is after
+	 * the FORKING barrier (no fork happens until ACT_POST_RESTORE below)
+	 * and the drain completes before apply_memfd_seals() so F_SEAL_WRITE
+	 * is only applied after content has been written.
+	 */
+	ret = memfd_content_start(memfd_worker_count());
+	if (ret < 0)
+		goto out_kill;
+	ret = memfd_content_drain();
 	if (ret < 0)
 		goto out_kill;
 

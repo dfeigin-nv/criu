@@ -1,4 +1,6 @@
 #include <unistd.h>
+#include <stdlib.h>
+#include <time.h>
 #include <linux/memfd.h>
 
 #include "common/compiler.h"
@@ -19,6 +21,7 @@
 #include "namespaces.h"
 #include "shmem.h"
 #include "hugetlb.h"
+#include "async-work.h"
 
 #include "protobuf.h"
 #include "images/memfd.pb-c.h"
@@ -252,6 +255,198 @@ static struct collect_image_info memfd_inode_cinfo = {
 int prepare_memfd_inodes(void)
 {
 	return collect_image(&memfd_inode_cinfo);
+}
+
+/*
+ * PROTOTYPE: coordinator-hoisted async memfd content restore.
+ *
+ * Today each memfd's shared-memory content is restored lazily inside the
+ * forked task (open_vmas -> memfd_open -> restore_memfd_shmem_content), which
+ * dominates restore time for GPU/vLLM workloads. Instead, do the cheap
+ * structural half (memfd_create + ftruncate + fdstore_add) in the coordinator
+ * before fork, and the expensive content half (mmap + page copy) on a pool of
+ * coordinator worker threads that overlap the per-task RESTORE stage. The
+ * memfd inode is shared via the fdstore, so once the pool drains every
+ * referencing task sees the filled content through its inherited fd.
+ */
+struct memfd_fill_job {
+	struct memfd_restore_inode *inode;
+	int fd;
+};
+
+static struct async_work *memfd_async;
+static int memfd_async_inodes;
+static struct timespec memfd_async_start;
+
+static int memfd_fill_worker(void *arg)
+{
+	struct memfd_fill_job *j = arg;
+	MemfdInodeEntry *mie = j->inode->mie;
+	int ret;
+
+	ret = memfd_shmem_fill_content(j->fd, mie->shmid, mie->size);
+	if (ret < 0) {
+		pr_err("Can't fill memfd:%s content (shmid %#lx)\n", mie->name, (unsigned long)mie->shmid);
+		goto out;
+	}
+
+	if (mie->has_mode)
+		ret = cr_fchperm(j->fd, mie->uid, mie->gid, mie->mode);
+	else
+		ret = cr_fchown(j->fd, mie->uid, mie->gid);
+	if (ret) {
+		pr_perror("Can't set permissions { uid %d gid %d mode %#o } of memfd:%s", (int)mie->uid,
+			  (int)mie->gid, mie->has_mode ? (int)mie->mode : -1, mie->name);
+		ret = -1;
+	}
+
+out:
+	close(j->fd);
+	xfree(j);
+	return ret;
+}
+
+/*
+ * Pre-fork: for each memfd inode create the fd, set its size, register it in
+ * the fdstore (so children inherit and short-circuit memfd_open_inode via
+ * fdstore_id), and queue the content fill. No worker threads are started here
+ * — that must wait until after the FORKING barrier (fork-safety).
+ */
+int memfd_content_prepare(void)
+{
+	struct memfd_restore_inode *inode;
+	int n = 0;
+
+	memfd_async = async_work_create();
+	if (!memfd_async)
+		return -1;
+
+	list_for_each_entry(inode, &memfd_inodes, list) {
+		MemfdInodeEntry *mie = inode->mie;
+		struct memfd_fill_job *j;
+		int fd, flags;
+
+		/* Mirror the flag/seal decision from memfd_open_inode_nocache. */
+		if (mie->seals == F_SEAL_SEAL) {
+			inode->pending_seals = 0;
+			flags = 0;
+		} else {
+			/* Seals are applied later due to F_SEAL_FUTURE_WRITE */
+			inode->pending_seals = mie->seals;
+			flags = MFD_ALLOW_SEALING;
+		}
+
+		if (mie->has_hugetlb_flag)
+			flags |= mie->hugetlb_flag;
+
+		fd = memfd_create(mie->name, flags);
+		if (fd < 0) {
+			pr_perror("Can't create memfd:%s", mie->name);
+			return -1;
+		}
+
+		/* Structural half now (synchronous, pre-fork). */
+		if (memfd_shmem_set_size(fd, mie->shmid, mie->size) < 0) {
+			close(fd);
+			return -1;
+		}
+
+		/*
+		 * fdstore_add must happen before fork so every child inherits
+		 * the queued fd and sees inode->fdstore_id != -1.
+		 */
+		inode->fdstore_id = fdstore_add(fd);
+		if (inode->fdstore_id < 0) {
+			close(fd);
+			return -1;
+		}
+
+		j = xmalloc(sizeof(*j));
+		if (!j) {
+			close(fd);
+			return -1;
+		}
+		j->inode = inode;
+		j->fd = fd;
+
+		if (async_work_submit(memfd_async, memfd_fill_worker, j) < 0) {
+			close(fd);
+			xfree(j);
+			return -1;
+		}
+
+		n++;
+	}
+
+	memfd_async_inodes = n;
+	return 0;
+}
+
+/*
+ * Prototype sweep knob: CRIU_MEMFD_RESTORE_WORKERS overrides the worker
+ * count; default to the online CPU count, fall back to 4.
+ */
+int memfd_worker_count(void)
+{
+	char *env;
+	long n;
+
+	env = getenv("CRIU_MEMFD_RESTORE_WORKERS");
+	if (env) {
+		n = atol(env);
+		if (n > 0)
+			return (int)n;
+	}
+
+	n = sysconf(_SC_NPROCESSORS_ONLN);
+	if (n > 0)
+		return (int)n;
+
+	return 4;
+}
+
+/* Start the fill pool. Call after the FORKING barrier, before any fork. */
+int memfd_content_start(int n_workers)
+{
+	if (!memfd_async || memfd_async_inodes == 0)
+		return 0;
+
+	pr_info("memfd async fill: %d workers, %d inodes\n", n_workers, memfd_async_inodes);
+	clock_gettime(CLOCK_MONOTONIC, &memfd_async_start);
+
+	if (async_work_start(memfd_async, n_workers) < 0) {
+		async_work_destroy(memfd_async);
+		memfd_async = NULL;
+		return -1;
+	}
+
+	return 0;
+}
+
+/* Wait for the fill pool to finish. Must run before apply_memfd_seals(). */
+int memfd_content_drain(void)
+{
+	int ret = 0;
+
+	if (!memfd_async)
+		return 0;
+
+	if (memfd_async_inodes > 0) {
+		struct timespec end;
+		long ms;
+
+		ret = async_work_drain(memfd_async);
+
+		clock_gettime(CLOCK_MONOTONIC, &end);
+		ms = (end.tv_sec - memfd_async_start.tv_sec) * 1000 +
+		     (end.tv_nsec - memfd_async_start.tv_nsec) / 1000000;
+		pr_info("memfd async fill: done in %ld ms (%d inodes)\n", ms, memfd_async_inodes);
+	}
+
+	async_work_destroy(memfd_async);
+	memfd_async = NULL;
+
+	return ret;
 }
 
 static int memfd_open_inode_nocache(struct memfd_restore_inode *inode)
