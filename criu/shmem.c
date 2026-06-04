@@ -516,23 +516,43 @@ int restore_sysv_shmem_content(void *addr, unsigned long size, unsigned long shm
 	return do_restore_shmem_content(addr, round_up(size, PAGE_SIZE), shmid);
 }
 
-int restore_memfd_shmem_content(int fd, unsigned long shmid, unsigned long size)
+/*
+ * Structural half of memfd content restore: set the file size. Cheap, has no
+ * task/pid/namespace dependency, and is safe to run synchronously in the
+ * coordinator before fork. Returns 0 on success, -1 on failure.
+ */
+int memfd_shmem_set_size(int fd, unsigned long shmid, unsigned long size)
 {
-	void *addr = NULL;
-	int ret = 1;
-
 	if (size == 0)
 		return 0;
 
 	if (ftruncate(fd, size) < 0) {
 		pr_perror("Can't resize shmem 0x%lx size=%ld", shmid, size);
-		goto out;
+		return -1;
 	}
+
+	return 0;
+}
+
+/*
+ * Content half of memfd content restore: map the (already-sized) memfd and
+ * copy its pages in from the shmid image. Self-contained -- no task/pid/ns
+ * dependency -- so it is safe to run on an async worker thread. The caller
+ * must have run memfd_shmem_set_size(fd, ...) first. Returns 0 on success,
+ * -1 on failure.
+ */
+int memfd_shmem_fill_content(int fd, unsigned long shmid, unsigned long size)
+{
+	void *addr;
+	int ret = 0;
+
+	if (size == 0)
+		return 0;
 
 	addr = mmap(NULL, size, PROT_WRITE | PROT_READ, MAP_SHARED, fd, 0);
 	if (addr == MAP_FAILED) {
 		pr_perror("Can't mmap shmem 0x%lx size=%ld", shmid, size);
-		goto out;
+		return -1;
 	}
 
 	/*
@@ -540,15 +560,28 @@ int restore_memfd_shmem_content(int fd, unsigned long shmid, unsigned long size)
 	 */
 	if (do_restore_shmem_content(addr, round_up(size, PAGE_SIZE), shmid) < 0) {
 		pr_err("Can't restore shmem content\n");
-		goto out;
+		ret = -1;
 	}
 
-	ret = 0;
-
-out:
-	if (addr)
-		munmap(addr, size);
+	munmap(addr, size);
 	return ret;
+}
+
+/*
+ * Sequential wrapper: structural half followed by content half. Used on the
+ * synchronous restore path (memfd_open_inode_nocache). Returns 0 on success
+ * and 1 on failure to match the original caller convention -- note the split
+ * helpers above return -1, so this is an intentional translation, not a bug.
+ */
+int restore_memfd_shmem_content(int fd, unsigned long shmid, unsigned long size)
+{
+	if (memfd_shmem_set_size(fd, shmid, size) < 0)
+		return 1;
+
+	if (memfd_shmem_fill_content(fd, shmid, size) < 0)
+		return 1;
+
+	return 0;
 }
 
 struct open_map_file_args {
