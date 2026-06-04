@@ -92,6 +92,7 @@ UNIT-BUILTINS		+= $(obj)/bfd.o
 UNIT-BUILTINS		+= $(obj)/config.o
 UNIT-BUILTINS		+= $(obj)/log.o
 UNIT-BUILTINS		+= $(obj)/string.o
+UNIT-BUILTINS		+= $(obj)/worker-pool.o
 UNIT-BUILTINS		+= $(obj)/unittest/built-in.o
 
 $(obj)/unittest/Makefile: ;

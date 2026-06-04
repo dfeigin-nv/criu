@@ -4,11 +4,13 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <sys/mman.h>
+#include <pthread.h>
 
 #include "log.h"
 #include "util.h"
 #include "criu-log.h"
 #include "bfd.h"
+#include "worker-pool.h"
 
 int parse_statement(int i, char *line, char **configuration);
 
@@ -92,6 +94,77 @@ static void test_bwrite(void)
 	free(read_buf);
 }
 
+static pthread_mutex_t test_wp_lock = PTHREAD_MUTEX_INITIALIZER;
+static int test_wp_counter;
+
+static int test_wp_count(void *arg)
+{
+	pthread_mutex_lock(&test_wp_lock);
+	test_wp_counter++;
+	pthread_mutex_unlock(&test_wp_lock);
+	return 0;
+}
+
+static int test_wp_fail(void *arg)
+{
+	return -1;
+}
+
+static void test_worker_pool(void)
+{
+	const int N = 100;
+	struct worker_pool *w;
+	int i;
+
+	/* One worker drains every queued work item. */
+	test_wp_counter = 0;
+	w = worker_pool_create();
+	assert(w);
+	for (i = 0; i < N; i++)
+		assert(worker_pool_add(w, test_wp_count, NULL) == 0);
+	assert(worker_pool_run(w, 1) == 0);
+	assert(worker_pool_wait(w) == 0);
+	assert(test_wp_counter == N);
+	worker_pool_destroy(w);
+
+	/* More workers than items still runs each item exactly once. */
+	test_wp_counter = 0;
+	w = worker_pool_create();
+	assert(w);
+	for (i = 0; i < 4; i++)
+		assert(worker_pool_add(w, test_wp_count, NULL) == 0);
+	assert(worker_pool_run(w, 16) == 0);
+	assert(worker_pool_wait(w) == 0);
+	assert(test_wp_counter == 4);
+	worker_pool_destroy(w);
+
+	/* A single failing item makes wait() report an error; the rest still run. */
+	test_wp_counter = 0;
+	w = worker_pool_create();
+	assert(w);
+	for (i = 0; i < N; i++)
+		assert(worker_pool_add(w, test_wp_count, NULL) == 0);
+	assert(worker_pool_add(w, test_wp_fail, NULL) == 0);
+	assert(worker_pool_run(w, 8) == 0);
+	assert(worker_pool_wait(w) < 0);
+	assert(test_wp_counter == N);
+	worker_pool_destroy(w);
+
+	/* Empty queue: workers start and join cleanly. */
+	w = worker_pool_create();
+	assert(w);
+	assert(worker_pool_run(w, 4) == 0);
+	assert(worker_pool_wait(w) == 0);
+	worker_pool_destroy(w);
+
+	/* Destroy with queued-but-never-run items frees them without hanging. */
+	w = worker_pool_create();
+	assert(w);
+	for (i = 0; i < N; i++)
+		assert(worker_pool_add(w, test_wp_count, NULL) == 0);
+	worker_pool_destroy(w);
+}
+
 int main(int argc, char *argv[], char *envp[])
 {
 	char **configuration;
@@ -102,6 +175,7 @@ int main(int argc, char *argv[], char *envp[])
 
 	test_bfd();
 	test_bwrite();
+	test_worker_pool();
 
 	i = parse_statement(0, "", configuration);
 	assert(i == 0);
