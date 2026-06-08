@@ -240,6 +240,15 @@ static int crtools_prepare_shared(void)
 		return -1;
 
 	/*
+	 * Eager cache primer: fill + seal + donate every memfd inode to the cache,
+	 * then bail out of the restore (cr_restore_tasks stops before fork). The
+	 * image dir and page-read machinery are ready here and the fill helper is
+	 * self-contained, so this reuses the same known-good fill path as restore.
+	 */
+	if (opts.memfd_cache_prime)
+		return memfd_content_prime();
+
+	/*
 	 * Pre-fork: create and size every memfd inode, register it in the
 	 * fdstore, and queue its content fill. Runs after prepare_memfd_inodes()
 	 * and fdstore_init(); the fill workers start only after the fork barrier.
@@ -2209,6 +2218,13 @@ skip_ns_bouncing:
 		goto out_kill;
 
 	/*
+	 * Donate the now-sealed memfds to the node-local cache so the next
+	 * restore of this checkpoint on this node can borrow them. Best-effort
+	 * and a no-op unless the cache is active; it never fails the restore.
+	 */
+	memfd_content_donate();
+
+	/*
 	 * Zombies die after CR_STATE_RESTORE which is switched
 	 * by root task, not by us. See comment before CR_STATE_FORKING
 	 * in the header for details.
@@ -2489,6 +2505,16 @@ int cr_restore_tasks(void)
 
 	if (crtools_prepare_shared() < 0)
 		goto err;
+
+	if (opts.memfd_cache_prime) {
+		/*
+		 * crtools_prepare_shared() already filled + sealed + donated every
+		 * memfd inode to the cache. There is no task tree to restore, so stop
+		 * here with success (the err path just runs cr_plugin_fini + returns).
+		 */
+		ret = 0;
+		goto err;
+	}
 
 	if (prepare_cgroup())
 		goto clean_cgroup;

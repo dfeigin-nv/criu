@@ -32,6 +32,21 @@ extern int memfd_content_start(void);
 extern int memfd_content_drain(void);
 extern void memfd_content_fini(void);
 
+/*
+ * Node-local memfd cache donate pass. Runs after apply_memfd_seals(), so the
+ * donated fds are final (sealed). For each MISS inode that was eligible at
+ * prepare() time, hand the now-sealed populated fd to the cache server. No-op
+ * unless the cache is active. Best-effort: failures never fail the restore.
+ */
+extern int memfd_content_donate(void);
+
+/*
+ * Eager cache primer (--memfd-cache-prime): fill + seal + donate every eligible
+ * memfd inode in the image, then return so the caller stops before forking a
+ * task tree. Makes the first real restore a cache hit too.
+ */
+extern int memfd_content_prime(void);
+
 #ifdef CONFIG_HAS_MEMFD_CREATE
 #include <sys/mman.h>
 #else

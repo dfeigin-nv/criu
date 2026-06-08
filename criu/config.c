@@ -702,6 +702,9 @@ int parse_options(int argc, char **argv, bool *usage_error, bool *has_exec_cmd, 
 		{ "lsm-mount-context", required_argument, 0, 1099 },
 		{ "network-lock", required_argument, 0, 1100 },
 		BOOL_OPT("mntns-compat-mode", &opts.mntns_compat_mode),
+		BOOL_OPT("memfd-cache", &opts.memfd_cache),
+		BOOL_OPT("memfd-cache-prime", &opts.memfd_cache_prime),
+		{ "memfd-cache-id", required_argument, 0, 1101 },
 		BOOL_OPT("unprivileged", &opts.unprivileged),
 		BOOL_OPT("ghost-fiemap", &opts.ghost_fiemap),
 		BOOL_OPT(OPT_ALLOW_UPROBES, &opts.allow_uprobes),
@@ -1016,6 +1019,9 @@ int parse_options(int argc, char **argv, bool *usage_error, bool *has_exec_cmd, 
 			break;
 		case 1096:
 			SET_CHAR_OPTS(cgroup_yard, optarg);
+			break;
+		case 1101:
+			SET_CHAR_OPTS(memfd_cache_id, optarg);
 			break;
 		case 1097:
 			if (!strcmp("read", optarg)) {
