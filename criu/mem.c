@@ -22,6 +22,7 @@
 #include "stats.h"
 #include "vma.h"
 #include "shmem.h"
+#include "memfd.h"
 #include "uffd.h"
 #include "pstree.h"
 #include "restorer.h"
@@ -1562,6 +1563,20 @@ int prepare_vmas(struct pstree_item *t, struct task_restore_args *ta)
 		vme = rst_mem_alloc(sizeof(*vme), RM_PRIVATE);
 		if (!vme)
 			return -1;
+
+		/*
+		 * Node-local memfd cache COW: a shared (cache HIT, or COW-eligible
+		 * MISS) golden is sealed F_SEAL_FUTURE_WRITE, so this task must map it
+		 * MAP_PRIVATE (copy-on-write), not MAP_SHARED. Flip the flag before the
+		 * copy the restorer mmaps from. The VMA_FILE_SHARED status is left
+		 * as-is, so premap_priv_vmas() and the page-restore loop still skip it:
+		 * the content lives in the shared golden inode, not this task's pagemap.
+		 */
+		if (vma_area_is(vma, VMA_AREA_MEMFD) && vma->vmfd && (vma->e->flags & MAP_SHARED) &&
+		    memfd_inode_cow_remap(vma->vmfd)) {
+			vma->e->flags &= ~MAP_SHARED;
+			vma->e->flags |= MAP_PRIVATE;
+		}
 
 		/*
 		 * Copy VMAs to private rst memory so that it's able to

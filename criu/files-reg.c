@@ -2539,9 +2539,12 @@ int collect_filemap(struct vma_area *vma)
 			vma->e->fdflags = O_RDONLY;
 	}
 
-	if (vma->e->status & VMA_AREA_MEMFD)
+	if (vma->e->status & VMA_AREA_MEMFD) {
 		fd = collect_memfd(vma->e->shmid);
-	else
+		/* Feed the node-local memfd cache its per-inode VMA-sharing tally. */
+		if (fd)
+			memfd_note_vma_sharing(fd, vma->e->flags);
+	} else
 		fd = collect_special_file(vma->e->shmid);
 	if (!fd)
 		return -1;

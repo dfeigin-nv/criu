@@ -52,9 +52,22 @@ struct memfd_restore_inode {
 	/*
 	 * Set in memfd_content_prepare() for a cache-eligible inode that MISSed
 	 * the node-local cache and was therefore filled locally. After sealing,
-	 * memfd_content_donate() hands such inodes to the cache server.
+	 * memfd_content_donate() hands such inodes to the cache server. May be
+	 * cleared by memfd_finalize_cow() if the inode turns out not COW-safe.
 	 */
 	bool cache_donate;
+	/*
+	 * COW cache bookkeeping. nr_vmas / all_vmas_shared are accumulated by
+	 * memfd_note_vma_sharing() as VMAs are collected (root task, post-fork).
+	 * cow_remap is set when the inode is shared via the cache (a HIT, or a
+	 * COW-eligible MISS): every task remaps its MAP_SHARED VMAs of this inode
+	 * MAP_PRIVATE so the F_SEAL_FUTURE_WRITE golden is shared copy-on-write.
+	 * These structs live in shmalloc'd shared memory (COLLECT_SHARED), so the
+	 * root task's findings are visible to the coordinator's seal/donate pass.
+	 */
+	int nr_vmas;
+	bool all_vmas_shared;
+	bool cow_remap;
 };
 
 static LIST_HEAD(memfd_inodes);
@@ -244,6 +257,9 @@ static int collect_one_memfd_inode(void *o, ProtobufCMessage *base, struct cr_im
 	inode->was_opened_rw = false;
 	inode->perms_done = false;
 	inode->cache_donate = false;
+	inode->nr_vmas = 0;
+	inode->all_vmas_shared = true;
+	inode->cow_remap = false;
 
 	list_add_tail(&inode->list, &memfd_inodes);
 
@@ -261,6 +277,70 @@ static struct collect_image_info memfd_inode_cinfo = {
 int prepare_memfd_inodes(void)
 {
 	return collect_image(&memfd_inode_cinfo);
+}
+
+/*
+ * Node-local memfd cache: per-inode VMA-sharing accounting and the COW decision.
+ *
+ * memfd_content_prepare() picks HIT/MISS pre-fork, before any VMA is collected,
+ * so it cannot tell whether sharing the inode copy-on-write is safe. That needs
+ * every VMA referencing the inode: COW is safe (and semantically identical) only
+ * when the inode is mapped by exactly one MAP_SHARED VMA -- the verified
+ * weight-shadow pattern. collect_filemap() feeds those flags to memfd_note_vma_sharing() as
+ * VMAs are read (root task); memfd_finalize_cow() then commits the decision.
+ * The inode structs are shmalloc'd (COLLECT_SHARED), so what the root task
+ * writes here is visible to the coordinator's apply_memfd_seals()/donate() pass.
+ */
+void memfd_note_vma_sharing(struct file_desc *d, unsigned int vma_flags)
+{
+	struct memfd_info *mfi = container_of(d, struct memfd_info, d);
+
+	mfi->inode->nr_vmas++;
+	if (!(vma_flags & MAP_SHARED))
+		mfi->inode->all_vmas_shared = false;
+}
+
+/* True if this memfd VMA's inode is shared COW (flip its MAP_SHARED VMAs MAP_PRIVATE). */
+bool memfd_inode_cow_remap(struct file_desc *d)
+{
+	struct memfd_info *mfi = container_of(d, struct memfd_info, d);
+
+	return mfi->inode->cow_remap;
+}
+
+/*
+ * Commit the COW decision once all VMAs are collected (root task, right after
+ * the prepare_mm_pid() loop in root_prepare_shared()). For each locally-filled
+ * cache MISS, a COW-eligible inode (mapped by exactly one MAP_SHARED VMA) is
+ * shared: it is remapped MAP_PRIVATE and gains F_SEAL_FUTURE_WRITE so the
+ * donated golden is immutable. A non-eligible MISS is left untouched -- not
+ * donated, original seals preserved -- so it restores exactly as without the
+ * cache. HIT inodes already set cow_remap in memfd_content_prepare().
+ */
+void memfd_finalize_cow(void)
+{
+	struct memfd_restore_inode *inode;
+
+	list_for_each_entry(inode, &memfd_inodes, list) {
+		if (inode->cow_remap || !inode->cache_donate)
+			continue;
+
+		/*
+		 * COW-eligible only when the inode is mapped by exactly one
+		 * MAP_SHARED VMA. A single VMA has no peer to share writes with, so
+		 * remapping it MAP_PRIVATE is observationally identical -- this is the
+		 * verified weight-shadow pattern (~one VMA per memfd). With two or more
+		 * MAP_SHARED VMAs (mapped twice, or shared across a fork), MAP_PRIVATE
+		 * would split their write sharing, so fall back to a per-restore fill.
+		 */
+		if (inode->nr_vmas == 1 && inode->all_vmas_shared) {
+			inode->cow_remap = true;
+			inode->pending_seals |= F_SEAL_FUTURE_WRITE;
+		} else {
+			/* Not COW-safe: keep its own copy, original seals, no donate. */
+			inode->cache_donate = false;
+		}
+	}
 }
 
 /*
@@ -380,11 +460,13 @@ int memfd_content_prepare(void)
 		/*
 		 * Cache fast path: if a previous restore on this node already
 		 * filled and sealed this inode, borrow it instead of re-reading
-		 * and re-copying its pages. A HIT fd is kernel-state-identical to
-		 * what the fill+seal path below produces (a sealed, sized,
-		 * correctly-owned memfd in the fdstore), so every downstream
-		 * open/seal/mapping step is unchanged -- we only skip the fill,
-		 * the (already-applied) seal, and the (already-correct) chown.
+		 * and re-copying its pages. The borrowed golden is sealed
+		 * F_SEAL_FUTURE_WRITE, so it can only be mapped MAP_PRIVATE (COW):
+		 * cow_remap below makes every task flip its MAP_SHARED VMAs of this
+		 * inode to MAP_PRIVATE (see memfd_finalize_cow()/prepare_vmas()). A
+		 * golden is only ever donated for a COW-eligible (single MAP_SHARED
+		 * VMA) inode, so a HIT always flips. We skip the fill, the seal
+		 * (already sealed), and the chown (already correctly owned).
 		 */
 		if (cache_sock >= 0 && memfd_cache_eligible(mie)) {
 			int cfd;
@@ -397,6 +479,7 @@ int memfd_content_prepare(void)
 					return -1;
 				inode->pending_seals = 0;
 				inode->perms_done = true;
+				inode->cow_remap = true;
 				pr_debug("Borrowed cached memfd:%s (shmid %#lx)\n", mie->name,
 					 (unsigned long)mie->shmid);
 				continue;
@@ -412,13 +495,23 @@ int memfd_content_prepare(void)
 		}
 
 		/*
-		 * F_SEAL_SEAL means no further seals may be added, so create
-		 * the memfd without MFD_ALLOW_SEALING. Otherwise allow sealing
-		 * and defer the seals to apply_memfd_seals(), since
-		 * F_SEAL_FUTURE_WRITE must be applied only after every writable
-		 * mapping has been opened.
+		 * A cache MISS we will fill locally: keep the seal set open so
+		 * memfd_finalize_cow() can add F_SEAL_FUTURE_WRITE once VMA
+		 * collection confirms the inode is COW-eligible. Create with
+		 * MFD_ALLOW_SEALING and defer the original seals to
+		 * apply_memfd_seals(); for an F_SEAL_SEAL inode the end state is
+		 * identical to creating it sealed (memfd_create without
+		 * MFD_ALLOW_SEALING sets F_SEAL_SEAL implicitly).
+		 *
+		 * Otherwise (cache inactive or ineligible): F_SEAL_SEAL means no
+		 * further seals may be added, so create without MFD_ALLOW_SEALING.
+		 * Else allow sealing and defer the seals, since F_SEAL_FUTURE_WRITE
+		 * must be applied only after every writable mapping has been opened.
 		 */
-		if (mie->seals == F_SEAL_SEAL) {
+		if (inode->cache_donate) {
+			inode->pending_seals = mie->seals;
+			flags = MFD_ALLOW_SEALING;
+		} else if (mie->seals == F_SEAL_SEAL) {
 			inode->pending_seals = 0;
 			flags = 0;
 		} else {
@@ -816,11 +909,19 @@ int memfd_content_prime(void)
 			return -1;
 		}
 		/*
-		 * Apply the dumped seals (incl F_SEAL_FUTURE_WRITE) now: fill has
-		 * already munmap'd its writable mapping, so the future-write seal
-		 * can be set, producing the same final artifact as apply_memfd_seals.
+		 * Seal the golden F_SEAL_FUTURE_WRITE (in addition to the dumped
+		 * seals) so it matches what the COW restore path donates and passes
+		 * the agent's future-write donate gate. fill has already munmap'd its
+		 * writable mapping, so the seal applies cleanly. A restore HIT borrows
+		 * this golden and maps it MAP_PRIVATE (COW).
+		 *
+		 * Prime has no task tree, so unlike the restore path it cannot verify
+		 * that every VMA of the inode is MAP_SHARED. It assumes the primed
+		 * inodes follow the single-VMA weight-shadow pattern; priming a
+		 * checkpoint whose memfds are genuinely multiply-mapped shared memory
+		 * is not supported (the COW remap would split their write sharing).
 		 */
-		if (mie->seals && fcntl(fd, F_ADD_SEALS, mie->seals) < 0) {
+		if (fcntl(fd, F_ADD_SEALS, mie->seals | F_SEAL_FUTURE_WRITE) < 0) {
 			pr_perror("prime: can't seal memfd:%s", mie->name);
 			close(fd);
 			return -1;

@@ -26,11 +26,16 @@
  * SEQPACKET datagrams; an fd only ever crosses via SCM_RIGHTS, never on a MISS
  * (recv_fds cannot represent a zero-fd message).
  *
- * Sharing safety: only inodes sealed F_SEAL_FUTURE_WRITE are cached/borrowed.
- * The kernel then forbids any writable mapping of the inode, so the single
- * shared physical copy cannot be corrupted by any borrower. uid/gid are part of
- * the key, so a HIT fd is always already owned correctly (a memfd inode has one
- * owner); a different owner is a clean MISS that fills its own copy.
+ * Sharing safety (copy-on-write): the dumped weight shadows are writable
+ * (PROT_WRITE, MAP_SHARED, F_SEAL_SEAL), so they are not safe to share
+ * MAP_SHARED. Instead CRIU seals the donated golden F_SEAL_FUTURE_WRITE -- the
+ * kernel then forbids any *new* writable mapping of the inode -- and every
+ * borrower (and the donor) maps it MAP_PRIVATE. Reads share the single physical
+ * copy; each task's writes fault to private pages, so no borrower can corrupt
+ * another even across a later sleep()/re-offload. uid/gid are part of the key,
+ * so a HIT fd is always already owned correctly (a memfd inode has one owner);
+ * a different owner is a clean MISS that fills its own copy. The agent still
+ * gates donations on F_SEAL_FUTURE_WRITE, which the criu-sealed golden carries.
  */
 
 #define MEMFD_CACHE_ID_MAX 128
@@ -80,7 +85,11 @@ enum memfd_cache_result {
  */
 int memfd_cache_sock(void);
 
-/* True if this inode is shareable: sealed F_SEAL_FUTURE_WRITE and not hugetlb. */
+/*
+ * Structural pre-fork eligibility: true for any non-hugetlb memfd inode. COW
+ * safety (a single MAP_SHARED VMA) is decided post VMA collection in
+ * memfd_finalize_cow(), not here.
+ */
 bool memfd_cache_eligible(MemfdInodeEntry *mie);
 
 /*

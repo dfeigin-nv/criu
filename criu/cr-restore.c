@@ -363,6 +363,15 @@ static int root_prepare_shared(void)
 	if (ret < 0)
 		goto err;
 
+	/*
+	 * All VMAs are now collected, so the node-local memfd cache can decide
+	 * which inodes are COW-eligible (a single MAP_SHARED VMA) and seal/flip them.
+	 * Runs here, before the task tree forks, so children inherit the decision;
+	 * the inode structs are shmalloc'd, so the coordinator's later seal/donate
+	 * pass sees it too. No-op when the cache is inactive.
+	 */
+	memfd_finalize_cow();
+
 	prepare_cow_vmas();
 
 	ret = prepare_restorer_blob();

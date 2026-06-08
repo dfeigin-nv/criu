@@ -22,6 +22,17 @@ extern int apply_memfd_seals(void);
 extern int prepare_memfd_inodes(void);
 
 /*
+ * Node-local memfd cache COW support. memfd_note_vma_sharing() is fed each
+ * memfd VMA's flags during collection; memfd_finalize_cow() commits the COW
+ * decision once all VMAs are known; memfd_inode_cow_remap() tells prepare_vmas()
+ * whether to flip a VMA's MAP_SHARED to MAP_PRIVATE. No-ops when the cache is
+ * inactive. See memfd.c for the why (pre-fork decision vs post-fork VMA flags).
+ */
+extern void memfd_note_vma_sharing(struct file_desc *d, unsigned int vma_flags);
+extern bool memfd_inode_cow_remap(struct file_desc *d);
+extern void memfd_finalize_cow(void);
+
+/*
  * Coordinator-hoisted async memfd content restore. prepare() runs the cheap
  * structural half (create + size + fdstore_add) before fork and queues the
  * content fill; start()/drain() run and join the fill workers after the

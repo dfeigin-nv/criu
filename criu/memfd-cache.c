@@ -35,13 +35,21 @@ int memfd_cache_sock(void)
 bool memfd_cache_eligible(MemfdInodeEntry *mie)
 {
 	/*
-	 * Only a future-write-sealed inode is safe to share: the kernel then
-	 * forbids any writable mapping, so all borrowers see one immutable copy.
+	 * Structural pre-fork gate only: any non-hugetlb memfd inode may take part
+	 * in the cache. The seals are not checked here -- the dumped weight shadows
+	 * are writable (F_SEAL_SEAL, MAP_SHARED), not F_SEAL_FUTURE_WRITE.
+	 *
+	 * COW safety is decided later, once VMA collection has happened, in
+	 * memfd_finalize_cow(): an inode mapped by a single MAP_SHARED VMA is remapped
+	 * MAP_PRIVATE (copy-on-write) and its golden is sealed
+	 * F_SEAL_FUTURE_WRITE before donate. The golden is then never writable-mapped,
+	 * so the single shared physical copy cannot be corrupted and each borrower's
+	 * writes fault to private pages. This split is required because the GET/MISS
+	 * decision runs pre-fork (coordinator) while the VMA flags only become known
+	 * post-fork (root task) -- see memfd_finalize_cow().
+	 *
+	 * hugetlb memfds are excluded from caching in v1.
 	 */
-	if (!(mie->seals & F_SEAL_FUTURE_WRITE))
-		return false;
-
-	/* hugetlb memfds are excluded from caching in v1. */
 	if (mie->has_hugetlb_flag && (mie->hugetlb_flag & MFD_HUGETLB))
 		return false;
 
