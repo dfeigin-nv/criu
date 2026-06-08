@@ -145,3 +145,11 @@ Assisted-by: AGENT_NAME:MODEL_VERSION
 ```
 
 Do not add `Signed-off-by` tags on behalf of the user.
+
+## Memfd Restore Notes
+
+When changing memfd restore ownership or permissions, remember that `fchown`
+must run in the restoring task's user namespace. A coordinator-created memfd can
+fail with `EPERM` for an unmapped uid even when the same owner would be valid
+inside the task namespace. Set owner/mode from the task-side open path, or prove
+with a userns ZDTM case that the fd is already correctly owned.

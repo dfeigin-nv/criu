@@ -16,6 +16,9 @@
 #ifndef F_SEAL_FUTURE_WRITE
 #define F_SEAL_FUTURE_WRITE 0x0010
 #endif
+#ifndef F_SEAL_SEAL
+#define F_SEAL_SEAL 0x0001
+#endif
 
 int memfd_cache_sock(void)
 {
@@ -35,10 +38,13 @@ int memfd_cache_sock(void)
 bool memfd_cache_eligible(MemfdInodeEntry *mie)
 {
 	/*
-	 * Only a future-write-sealed inode is safe to share: the kernel then
-	 * forbids any writable mapping, so all borrowers see one immutable copy.
+	 * UNSAFE CEILING-MEASUREMENT MODE (branch memfd-cache-ceiling-test):
+	 * also accept F_SEAL_SEAL-only inodes (CUDA pinned host weight shadows are
+	 * F_SEAL_SEAL, not F_SEAL_FUTURE_WRITE) so we can measure the cache win.
+	 * F_SEAL_SEAL does NOT forbid writes, so MAP_SHARED sharing is only safe for
+	 * SEQUENTIAL restores (one live borrower at a time). DO NOT SHIP.
 	 */
-	if (!(mie->seals & F_SEAL_FUTURE_WRITE))
+	if (!(mie->seals & (F_SEAL_FUTURE_WRITE | F_SEAL_SEAL)))
 		return false;
 
 	/* hugetlb memfds are excluded from caching in v1. */
