@@ -86,7 +86,7 @@ enum memfd_cache_result {
 int memfd_cache_sock(void);
 
 /*
- * Structural pre-fork eligibility: true for any non-hugetlb memfd inode. COW
+ * Structural pre-fork eligibility: true for any non-hugetlb memfd inode. Share
  * safety (a single MAP_SHARED VMA) is decided post VMA collection in
  * memfd_finalize_cow(), not here.
  */

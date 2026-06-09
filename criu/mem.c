@@ -1565,17 +1565,22 @@ int prepare_vmas(struct pstree_item *t, struct task_restore_args *ta)
 			return -1;
 
 		/*
-		 * Node-local memfd cache COW: a shared (cache HIT, or COW-eligible
-		 * MISS) golden is sealed F_SEAL_FUTURE_WRITE, so this task must map it
-		 * MAP_PRIVATE (copy-on-write), not MAP_SHARED. Flip the flag before the
-		 * copy the restorer mmaps from. The VMA_FILE_SHARED status is left
-		 * as-is, so premap_priv_vmas() and the page-restore loop still skip it:
-		 * the content lives in the shared golden inode, not this task's pagemap.
+		 * Node-local memfd cache, read-only shared: a shared (cache HIT, or
+		 * eligible MISS) golden is sealed F_SEAL_FUTURE_WRITE, which forbids
+		 * future *writable* shared mappings but allows a read-only one. So keep
+		 * MAP_SHARED and drop PROT_WRITE: the task maps the golden
+		 * MAP_SHARED|PROT_READ, leaving its pages shared and pinned (fast DMA on
+		 * wake), and the seal makes the single shared copy uncorruptable.
+		 * VMA_NO_PROT_WRITE stops the restorer from re-adding PROT_WRITE (see
+		 * the map and final-prot passes in restorer.c), so no writable mprotect
+		 * ever hits the sealed golden. The content lives in the shared golden
+		 * inode, so premap_priv_vmas() and the page-restore loop still skip this
+		 * MAP_SHARED VMA.
 		 */
-		if (vma_area_is(vma, VMA_AREA_MEMFD) && vma->vmfd && (vma->e->flags & MAP_SHARED) &&
-		    memfd_inode_cow_remap(vma->vmfd)) {
-			vma->e->flags &= ~MAP_SHARED;
-			vma->e->flags |= MAP_PRIVATE;
+		if (vma_area_is(vma, VMA_AREA_MEMFD) && vma->vmfd && (vma->e->prot & PROT_WRITE) &&
+		    memfd_inode_share_ro(vma->vmfd)) {
+			vma->e->prot &= ~PROT_WRITE;
+			vma->e->status |= VMA_NO_PROT_WRITE;
 		}
 
 		/*

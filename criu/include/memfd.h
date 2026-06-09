@@ -22,14 +22,15 @@ extern int apply_memfd_seals(void);
 extern int prepare_memfd_inodes(void);
 
 /*
- * Node-local memfd cache COW support. memfd_note_vma_sharing() is fed each
- * memfd VMA's flags during collection; memfd_finalize_cow() commits the COW
- * decision once all VMAs are known; memfd_inode_cow_remap() tells prepare_vmas()
- * whether to flip a VMA's MAP_SHARED to MAP_PRIVATE. No-ops when the cache is
- * inactive. See memfd.c for the why (pre-fork decision vs post-fork VMA flags).
+ * Node-local memfd cache read-only-share support. memfd_note_vma_sharing() is
+ * fed each memfd VMA's flags during collection; memfd_finalize_cow() commits the
+ * share decision once all VMAs are known; memfd_inode_share_ro() tells
+ * prepare_vmas() whether to drop a VMA's PROT_WRITE and keep MAP_SHARED (mapping
+ * the sealed golden MAP_SHARED|PROT_READ). No-ops when the cache is inactive.
+ * See memfd.c for the why (pre-fork decision vs post-fork VMA flags).
  */
 extern void memfd_note_vma_sharing(struct file_desc *d, unsigned int vma_flags);
-extern bool memfd_inode_cow_remap(struct file_desc *d);
+extern bool memfd_inode_share_ro(struct file_desc *d);
 extern void memfd_finalize_cow(void);
 
 /*

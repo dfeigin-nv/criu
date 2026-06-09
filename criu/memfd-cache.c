@@ -39,14 +39,14 @@ bool memfd_cache_eligible(MemfdInodeEntry *mie)
 	 * in the cache. The seals are not checked here -- the dumped weight shadows
 	 * are writable (F_SEAL_SEAL, MAP_SHARED), not F_SEAL_FUTURE_WRITE.
 	 *
-	 * COW safety is decided later, once VMA collection has happened, in
-	 * memfd_finalize_cow(): an inode mapped by a single MAP_SHARED VMA is remapped
-	 * MAP_PRIVATE (copy-on-write) and its golden is sealed
-	 * F_SEAL_FUTURE_WRITE before donate. The golden is then never writable-mapped,
-	 * so the single shared physical copy cannot be corrupted and each borrower's
-	 * writes fault to private pages. This split is required because the GET/MISS
-	 * decision runs pre-fork (coordinator) while the VMA flags only become known
-	 * post-fork (root task) -- see memfd_finalize_cow().
+	 * Share safety is decided later, once VMA collection has happened, in
+	 * memfd_finalize_cow(): an inode mapped by a single MAP_SHARED VMA gets its
+	 * golden sealed F_SEAL_FUTURE_WRITE before donate, and every borrower maps
+	 * it MAP_SHARED|PROT_READ. The golden is then never writable-mapped, so the
+	 * single shared physical copy stays pinned and cannot be corrupted. This
+	 * split is required because the GET/MISS decision runs pre-fork
+	 * (coordinator) while the VMA flags only become known post-fork (root task)
+	 * -- see memfd_finalize_cow().
 	 *
 	 * hugetlb memfds are excluded from caching in v1.
 	 */
