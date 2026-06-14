@@ -227,6 +227,13 @@ extern int __userns_call(const char *func_name, uns_call_t call, int flags, void
 #define userns_call(__call, __flags, __arg, __arg_size, __fd) \
 	__userns_call(__stringify(__call), __call, __flags, __arg, __arg_size, __fd)
 
+extern int stop_asyncd(void);
+extern int start_asyncd(void);
+extern int __async_call(const char *func_name, uns_call_t call, int flags, void *arg, size_t arg_size, int fd);
+
+#define async_call(__call, __flags, __arg, __arg_size, __fd) \
+	__async_call(__stringify(__call), __call, __flags, __arg, __arg_size, __fd)
+
 extern int add_ns_shared_cb(int (*actor)(void *data), void *data);
 
 extern struct ns_id *get_socket_ns(int lfd);

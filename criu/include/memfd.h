@@ -20,6 +20,7 @@ extern struct file_desc *collect_memfd(u32 id);
 extern int apply_memfd_seals(void);
 
 extern int prepare_memfd_inodes(void);
+extern bool has_memfd_inodes(void);
 
 #ifdef CONFIG_HAS_MEMFD_CREATE
 #include <sys/mman.h>

@@ -1670,8 +1670,6 @@ static int __restore_task_with_children(void *_arg)
 	if (populate_pid_proc())
 		goto err;
 
-	sfds_protected = true;
-
 	if (unmap_guard_pages(current))
 		goto err;
 
@@ -1694,11 +1692,14 @@ static int __restore_task_with_children(void *_arg)
 		if (restore_wait_other_tasks())
 			goto err;
 		fini_restore_mntns();
+
 		__restore_switch_stage(CR_STATE_RESTORE);
 	} else {
 		if (restore_finish_stage(task_entries, CR_STATE_FORKING) < 0)
 			goto err;
 	}
+
+	sfds_protected = true;
 
 	if (restore_one_task(vpid(current), ca->core))
 		goto err;
@@ -2069,6 +2070,18 @@ static int restore_root_task(struct pstree_item *init)
 	if (prepare_namespace_before_tasks())
 		return -1;
 
+	/*
+	 * Start the async memfd-fill daemon here, in the coordinator, while we
+	 * are still in the host pid namespace and before fork_with_pid(init)
+	 * creates the restored pid namespace. The daemon and its worker threads
+	 * must not take TIDs in the restored pid namespace: the restorer later
+	 * recreates each application thread at its original TID via clone3(),
+	 * which fails with EEXIST if a worker already holds that TID. This
+	 * mirrors usernsd/cgroupd, which are likewise coordinator-forked.
+	 */
+	if (has_memfd_inodes() && !opts.stream && start_asyncd())
+		goto out;
+
 	if (vpid(init) == INIT_PID) {
 		if (!(root_ns_mask & CLONE_NEWPID)) {
 			pr_err("This process tree can only be restored "
@@ -2177,6 +2190,15 @@ skip_ns_bouncing:
 
 	ret = restore_wait_inprogress_tasks();
 	if (ret < 0)
+		goto out_kill;
+
+	/*
+	 * All tasks have finished CR_STATE_RESTORE, so every async_call that
+	 * fills memfd content has already been sent to the daemon. Drain and
+	 * reap it now, before apply_memfd_seals() seals the memfds whose
+	 * content the daemon just wrote.
+	 */
+	if (has_memfd_inodes() && !opts.stream && stop_asyncd())
 		goto out_kill;
 
 	ret = apply_memfd_seals();
@@ -2365,6 +2387,7 @@ out:
 	xfree(pids);
 	depopulate_roots_yard(mnt_ns_fd, true);
 	stop_usernsd();
+	stop_asyncd();
 	__restore_switch_stage(CR_STATE_FAIL);
 	pr_err("Restoring FAILED.\n");
 	return -1;
