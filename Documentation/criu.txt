@@ -449,6 +449,22 @@ The 'mode' may be one of the following:
                 build-ID cannot be obtained, 'chksm-first' method will be
                 used. This is the default if mode is unspecified.
 
+*--image-io-mode* ['mode']::
+    Set the I/O mode used when writing and reading the memory pages
+    image. It controls whether the host page cache is used. The mode is
+    selected independently for *dump* and *restore*; the image bytes are
+    identical either way.
++
+The 'mode' may be one of the following:
+
+    *writeback*:::
+                Buffered I/O via the host page cache. This is the default.
+
+    *direct*:::
+                Use O_DIRECT to bypass the host page cache. If the
+                filesystem does not support O_DIRECT, *criu* falls back to
+                buffered I/O.
+
 *--network-lock* ['mode']::
     Set the method to be used for network locking/unlocking. Locking is done
     to ensure that tcp packets are dropped between dump and restore. This is
@@ -712,6 +728,22 @@ The 'mode' may be one of the following:
                 To validate ELF files with their build-ID. If the
                 build-ID cannot be obtained, 'chksm-first' method will be
                 used. This is the default if mode is unspecified.
+
+*--image-io-mode* ['mode']::
+    Set the I/O mode used when writing and reading the memory pages
+    image. It controls whether the host page cache is used. The mode is
+    selected independently for *dump* and *restore*; the image bytes are
+    identical either way.
++
+The 'mode' may be one of the following:
+
+    *writeback*:::
+                Buffered I/O via the host page cache. This is the default.
+
+    *direct*:::
+                Use O_DIRECT to bypass the host page cache. If the
+                filesystem does not support O_DIRECT, *criu* falls back to
+                buffered I/O.
 
 *--skip-file-rwx-check*::
     Skip checking file permissions (r/w/x for u/g/o) on restore.

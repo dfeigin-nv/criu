@@ -55,6 +55,11 @@ enum criu_network_lock_method {
 
 enum criu_pre_dump_mode { CRIU_PRE_DUMP_SPLICE = 1, CRIU_PRE_DUMP_READ = 2 };
 
+enum criu_image_io_mode {
+	CRIU_IMAGE_IO_WRITEBACK = 0,
+	CRIU_IMAGE_IO_DIRECT = 1,
+};
+
 int criu_set_service_address(const char *path);
 void criu_set_service_fd(int fd);
 int criu_set_service_binary(const char *path);
@@ -74,6 +79,7 @@ void criu_set_leave_running(bool leave_running);
 void criu_set_ext_unix_sk(bool ext_unix_sk);
 int criu_add_unix_sk(unsigned int inode);
 void criu_set_tcp_established(bool tcp_established);
+int criu_set_image_io_mode(enum criu_image_io_mode mode);
 void criu_set_tcp_skip_in_flight(bool tcp_skip_in_flight);
 void criu_set_tcp_close(bool tcp_close);
 void criu_set_weak_sysctls(bool val);
@@ -237,6 +243,7 @@ void criu_local_set_leave_running(criu_opts *opts, bool leave_running);
 void criu_local_set_ext_unix_sk(criu_opts *opts, bool ext_unix_sk);
 int criu_local_add_unix_sk(criu_opts *opts, unsigned int inode);
 void criu_local_set_tcp_established(criu_opts *opts, bool tcp_established);
+int criu_local_set_image_io_mode(criu_opts *opts, enum criu_image_io_mode mode);
 void criu_local_set_tcp_skip_in_flight(criu_opts *opts, bool tcp_skip_in_flight);
 void criu_local_set_tcp_close(criu_opts *opts, bool tcp_close);
 void criu_local_set_weak_sysctls(criu_opts *opts, bool val);
