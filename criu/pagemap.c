@@ -841,7 +841,7 @@ int probe_pages_o_direct(int fd)
 		return -1;
 	}
 
-	pr_info("O_DIRECT rejected at read time on pages fd %d, using buffered I/O\n", fd);
+	pr_warn("O_DIRECT rejected at read time on pages fd %d, using buffered I/O\n", fd);
 	if (fcntl(fd, F_SETFL, fl) < 0) {
 		pr_perror("Failed to clear O_DIRECT on pages fd %d", fd);
 		return -1;
@@ -921,7 +921,7 @@ int open_page_read_at(int dfd, unsigned long img_id, struct page_read *pr, int p
 	{
 		int pfd = img_raw_fd(pr->pi);
 
-		if (pfd >= 0 && !opts.stream) {
+		if (pfd >= 0 && !opts.stream && opts.image_io_mode == IMAGE_IO_DIRECT) {
 			int direct = probe_pages_o_direct(pfd);
 
 			if (direct < 0) {

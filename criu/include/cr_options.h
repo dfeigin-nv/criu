@@ -104,6 +104,16 @@ enum FILE_VALIDATION_OPTIONS {
 /* This constant dictates which file validation method should be tried by default. */
 #define FILE_VALIDATION_DEFAULT FILE_VALIDATION_BUILD_ID
 
+enum IMAGE_IO_MODE {
+	/* Buffered I/O for the pages image; the host page cache is used. */
+	IMAGE_IO_WRITEBACK = 0,
+	/* O_DIRECT for the pages image; the host page cache is bypassed. */
+	IMAGE_IO_DIRECT
+};
+
+/* This constant dictates which I/O mode is used for the pages image by default. */
+#define IMAGE_IO_DEFAULT IMAGE_IO_WRITEBACK
+
 /* This constant dictates that criu use fiemap to copy ghost file by default.*/
 #define FIEMAP_DEFAULT 1
 
@@ -219,6 +229,9 @@ struct cr_options {
 
 	/* This stores which method to use for file validation. */
 	int file_validation_method;
+
+	/* This stores the I/O mode (writeback/direct) for the pages image. */
+	int image_io_mode;
 
 	/* Shows the mode criu is running at the moment: dump/pre-dump/restore/... */
 	enum criu_mode mode;

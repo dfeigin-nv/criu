@@ -1546,7 +1546,7 @@ static int prepare_vma_ios(struct pstree_item *t, struct task_restore_args *ta)
 		return -1;
 
 	ta->vma_ios_fd = img_raw_fd(pages);
-	if (ta->vma_ios_fd >= 0) {
+	if (ta->vma_ios_fd >= 0 && opts.image_io_mode == IMAGE_IO_DIRECT) {
 		int direct = probe_pages_o_direct(ta->vma_ios_fd);
 		if (direct < 0) {
 			close_image(pages);

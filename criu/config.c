@@ -430,6 +430,7 @@ void init_opts(void)
 	opts.log_level = DEFAULT_LOGLEVEL;
 	opts.pre_dump_mode = PRE_DUMP_SPLICE;
 	opts.file_validation_method = FILE_VALIDATION_DEFAULT;
+	opts.image_io_mode = IMAGE_IO_DEFAULT;
 	opts.network_lock_method = NETWORK_LOCK_DEFAULT;
 	opts.ghost_fiemap = FIEMAP_DEFAULT;
 }
@@ -593,6 +594,20 @@ Esyntax:
 	return -1;
 }
 
+static int parse_image_io_mode(struct cr_options *opts, const char *optarg)
+{
+	if (!strcmp(optarg, "writeback"))
+		opts->image_io_mode = IMAGE_IO_WRITEBACK;
+	else if (!strcmp(optarg, "direct"))
+		opts->image_io_mode = IMAGE_IO_DIRECT;
+	else {
+		pr_err("Unknown image I/O mode `%s' selected\n", optarg);
+		return -1;
+	}
+
+	return 0;
+}
+
 /*
  * parse_options() is the point where the getopt parsing happens. The CLI
  * parsing as well as the configuration file parsing happens here.
@@ -701,6 +716,7 @@ int parse_options(int argc, char **argv, bool *usage_error, bool *has_exec_cmd, 
 		BOOL_OPT("skip-file-rwx-check", &opts.skip_file_rwx_check),
 		{ "lsm-mount-context", required_argument, 0, 1099 },
 		{ "network-lock", required_argument, 0, 1100 },
+		{ "image-io-mode", required_argument, 0, 1101 },
 		BOOL_OPT("mntns-compat-mode", &opts.mntns_compat_mode),
 		BOOL_OPT("unprivileged", &opts.unprivileged),
 		BOOL_OPT("ghost-fiemap", &opts.ghost_fiemap),
@@ -1044,6 +1060,10 @@ int parse_options(int argc, char **argv, bool *usage_error, bool *has_exec_cmd, 
 				pr_err("Invalid value for --network-lock: %s\n", optarg);
 				return 1;
 			}
+			break;
+		case 1101:
+			if (parse_image_io_mode(&opts, optarg))
+				return 2;
 			break;
 		case 'V':
 			pr_msg("Version: %s\n", CRIU_VERSION);

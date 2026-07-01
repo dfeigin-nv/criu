@@ -500,6 +500,21 @@ void criu_set_tcp_established(bool tcp_established)
 	criu_local_set_tcp_established(global_opts, tcp_established);
 }
 
+int criu_local_set_image_io_mode(criu_opts *opts, enum criu_image_io_mode mode)
+{
+	if (mode == CRIU_IMAGE_IO_WRITEBACK || mode == CRIU_IMAGE_IO_DIRECT) {
+		opts->rpc->has_image_io_mode = true;
+		opts->rpc->image_io_mode = (CriuImageIoMode)mode;
+		return 0;
+	}
+	return -1;
+}
+
+int criu_set_image_io_mode(enum criu_image_io_mode mode)
+{
+	return criu_local_set_image_io_mode(global_opts, mode);
+}
+
 void criu_local_set_tcp_skip_in_flight(criu_opts *opts, bool tcp_skip_in_flight)
 {
 	opts->rpc->has_tcp_skip_in_flight = true;

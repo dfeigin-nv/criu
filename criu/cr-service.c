@@ -551,6 +551,19 @@ static int setup_opts_from_req(int sk, CriuOpts *req)
 		}
 	}
 
+	if (req->has_image_io_mode) {
+		switch (req->image_io_mode) {
+		case CRIU_IMAGE_IO_MODE__IMAGE_IO_WRITEBACK:
+			opts.image_io_mode = IMAGE_IO_WRITEBACK;
+			break;
+		case CRIU_IMAGE_IO_MODE__IMAGE_IO_DIRECT:
+			opts.image_io_mode = IMAGE_IO_DIRECT;
+			break;
+		default:
+			goto err;
+		}
+	}
+
 	if (req->ps) {
 		opts.port = (short)req->ps->port;
 
