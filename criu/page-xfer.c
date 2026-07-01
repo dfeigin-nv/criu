@@ -252,15 +252,52 @@ static int open_page_server_xfer(struct page_xfer *xfer, int fd_type, unsigned l
 }
 
 /* local xfer */
+/* Toggle O_DIRECT on the pages image fd. */
+static int set_o_direct(int fd)
+{
+	int fl = fcntl(fd, F_GETFL);
+
+	if (fl < 0)
+		return -1;
+	return fcntl(fd, F_SETFL, fl | O_DIRECT);
+}
+
+static int clear_o_direct(int fd)
+{
+	int fl = fcntl(fd, F_GETFL);
+
+	if (fl < 0)
+		return -1;
+	return fcntl(fd, F_SETFL, fl & ~O_DIRECT);
+}
+
 static int write_pages_loc(struct page_xfer *xfer, int p, unsigned long len)
 {
 	ssize_t ret;
 	ssize_t curr = 0;
+	int img_fd = img_raw_fd(xfer->pi);
 
 	while (1) {
-		ret = splice(p, NULL, img_raw_fd(xfer->pi), NULL, len - curr, SPLICE_F_MOVE);
+		ret = splice(p, NULL, img_fd, NULL, len - curr, SPLICE_F_MOVE);
 		if (ret == -1) {
-			pr_perror("Unable to spice data");
+			/*
+			 * splice() to an O_DIRECT fd performs direct I/O on
+			 * filesystems that support it (ext4, xfs) and fails with
+			 * EFAULT (or EINVAL) on those that do not. Recover by
+			 * clearing O_DIRECT and retrying the remainder buffered;
+			 * only whole pages were spliced so far, so the file
+			 * offset stays block-aligned across the switch.
+			 */
+			if (xfer->pi_use_direct && (errno == EFAULT || errno == EINVAL)) {
+				pr_warn("splice() rejected O_DIRECT on the pages image, falling back to buffered I/O\n");
+				if (clear_o_direct(img_fd) < 0) {
+					pr_perror("Unable to clear O_DIRECT on the pages image");
+					return -1;
+				}
+				xfer->pi_use_direct = false;
+				continue;
+			}
+			pr_perror("Unable to splice data");
 			return -1;
 		}
 		if (ret == 0) {
@@ -378,6 +415,14 @@ static int open_page_local_xfer(struct page_xfer *xfer, int fd_type, unsigned lo
 		goto err_pmi;
 
 	/*
+	 * Buffered by default. O_DIRECT (--image-io-mode=direct) is enabled
+	 * only for the genuine local dump in open_page_xfer(); the page-server
+	 * receive path reaches open_page_local_xfer() directly and stays
+	 * buffered.
+	 */
+	xfer->pi_use_direct = false;
+
+	/*
 	 * Open page-read for parent images (if it exists). It will
 	 * be used for two things:
 	 * 1) when writing a page, those from parent will be dedup-ed
@@ -431,13 +476,28 @@ err_pmi:
 
 int open_page_xfer(struct page_xfer *xfer, int fd_type, unsigned long img_id)
 {
+	int ret;
+
 	xfer->offset = 0;
 	xfer->transfer_lazy = true;
 
 	if (opts.use_page_server)
 		return open_page_server_xfer(xfer, fd_type, img_id);
-	else
-		return open_page_local_xfer(xfer, fd_type, img_id);
+
+	ret = open_page_local_xfer(xfer, fd_type, img_id);
+	if (ret)
+		return ret;
+
+	/*
+	 * direct mode, local non-streaming dump: set O_DIRECT on the pages
+	 * image fd so write_pages_loc() splices with direct I/O. splice()
+	 * honors O_DIRECT on filesystems that support it and falls back to
+	 * buffered I/O otherwise; if fcntl() fails the fd stays buffered.
+	 */
+	if (opts.image_io_mode == IMAGE_IO_DIRECT && !opts.stream)
+		xfer->pi_use_direct = (set_o_direct(img_raw_fd(xfer->pi)) == 0);
+
+	return 0;
 }
 
 static int page_xfer_dump_hole(struct page_xfer *xfer, struct iovec *hole, u32 flags)

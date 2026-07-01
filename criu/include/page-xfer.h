@@ -32,6 +32,13 @@ struct page_xfer {
 	unsigned long offset;
 	bool transfer_lazy;
 
+	/*
+	 * Local non-streaming dump only: the pages image fd was switched to
+	 * O_DIRECT (--image-io-mode=direct). write_pages_loc() splices with
+	 * O_DIRECT set and clears this if the filesystem rejects direct I/O.
+	 */
+	bool pi_use_direct;
+
 	/* private data for every page-xfer engine */
 	union {
 		struct /* local */ {
