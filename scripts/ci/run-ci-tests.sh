@@ -285,6 +285,9 @@ run_non_shardable_tests() {
 	./test/zdtm.py run -t zdtm/transition/maps007 --pre 2 --page-server --dedup
 	./test/zdtm.py run -t zdtm/transition/maps007 --pre 2 --pre-dump-mode read
 
+	./test/zdtm.py run -t zdtm/static/maps04 --image-io-mode direct
+	./test/zdtm.py run -t zdtm/static/maps00 --image-io-mode direct --rpc
+
 	./test/zdtm.py run -t zdtm/transition/pid_reuse --pre 2 # start time based pid reuse detection
 	./test/zdtm.py run -t zdtm/transition/pidfd_store_sk --rpc --pre 2 # pidfd based pid reuse detection
 
