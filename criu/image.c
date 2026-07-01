@@ -86,6 +86,9 @@ int check_img_inventory(bool restore)
 	case CRTOOLS_IMAGES_V1_1:
 		/* newer images with extra magic in the head */
 		break;
+	case CRTOOLS_IMAGES_V1_2:
+		/* images may contain compressed memory page payloads */
+		break;
 	default:
 		pr_err("Not supported images version %u\n", he->img_version);
 		goto out_err;
@@ -156,11 +159,16 @@ int check_img_inventory(bool restore)
 
 		/*
 		 * On restore the compression mode usually comes from the
-		 * image inventory rather than the command line, so it is
-		 * not known when check_options() runs. Re-validate the
-		 * restore-path constraints here, once the mode is known.
+		 * image inventory rather than the command line, so it is not
+		 * known when check_options() runs. Validate it here, once the
+		 * mode is known -- and for every consumer of the image, not
+		 * just the restore command: the lazy-pages daemon and the
+		 * page-server send path also adopt compress_mode here (via
+		 * prepare_dummy_pstree, with restore == false) and must reject
+		 * an image they cannot decode instead of failing later, after
+		 * the target task is already running.
 		 */
-		if (restore && opts.compress_mode) {
+		if (opts.compress_mode) {
 #ifndef CONFIG_LZ4
 			pr_err("Image uses memory page compression but CRIU was built without LZ4 support (CONFIG_LZ4)\n");
 			goto out_err;
@@ -170,10 +178,9 @@ int check_img_inventory(bool restore)
 				goto out_err;
 			}
 			/*
-			 * The image-streamer and page-server/remote restore
-			 * readers only understand the per-page wire format.
-			 * A region-compressed image must use the local
-			 * restore path.
+			 * The image-streamer and page-server/remote readers
+			 * only understand the per-page wire format. A
+			 * region-compressed image must use the local path.
 			 */
 			if (opts.compress_mode == COMPRESS_REGION) {
 				if (opts.stream) {
@@ -184,6 +191,17 @@ int check_img_inventory(bool restore)
 					pr_err("Region-compressed image cannot be restored via page-server\n");
 					goto out_err;
 				}
+			}
+			/*
+			 * fill_page_pipe() and the lazy-pages daemon splice raw
+			 * bytes straight from the pages image and do not
+			 * understand the variable-length compressed layout, so
+			 * they would serve corrupt (or short) pages. Reject
+			 * lazy migration of a compressed image up front.
+			 */
+			if (opts.lazy_pages) {
+				pr_err("Memory page compression is not supported with lazy migration\n");
+				goto out_err;
 			}
 #endif
 		}
@@ -301,7 +319,12 @@ int write_img_inventory(InventoryEntry *he)
 	struct cr_img *img;
 	int ret;
 
-	pr_info("Writing image inventory (version %u)\n", CRTOOLS_IMAGES_V1);
+	if (he->has_compress && he->compress)
+		he->img_version = CRTOOLS_IMAGES_V1_2;
+	else if (!he->img_version)
+		he->img_version = CRTOOLS_IMAGES_V1_1;
+
+	pr_info("Writing image inventory (version %u)\n", he->img_version);
 
 	img = open_image(CR_FD_INVENTORY, O_DUMP);
 	if (!img)
@@ -416,9 +439,9 @@ int prepare_inventory(InventoryEntry *he)
 		struct dmp_info d;
 	} crt = { .i.pid = &pid };
 
-	pr_info("Preparing image inventory (version %u)\n", CRTOOLS_IMAGES_V1);
-
-	he->img_version = CRTOOLS_IMAGES_V1_1;
+	he->img_version = opts.compress_mode ? CRTOOLS_IMAGES_V1_2 :
+					     CRTOOLS_IMAGES_V1_1;
+	pr_info("Preparing image inventory (version %u)\n", he->img_version);
 	he->fdinfo_per_id = true;
 	he->has_fdinfo_per_id = true;
 	he->ns_per_id = true;
