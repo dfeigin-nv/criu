@@ -434,14 +434,14 @@ void init_opts(void)
 	opts.ghost_fiemap = FIEMAP_DEFAULT;
 
 	/*
-	 * stream-restore-async: Step A async overlap (2-fd [memfd, pipe]
-	 * handshake). Requires the async streamer (dynamo 17cdff4c96) that
-	 * sends 2 fds. The current dynamo streamer branch ships the sync
-	 * prefetch streamer (1 fd), so default OFF to match; criu expecting
-	 * 2 fds against a 1-fd streamer fails at mem.c recv_streamer_private_fd.
-	 * Enable with --stream-restore-async once the async streamer is paired.
+	 * stream-restore-async defaults ON: Step A async overlap. The streamer
+	 * hands over [memfd, pipe_rfd] + an immediate 'A' ack, so CRIU's
+	 * prep/fork overlaps the still-running S3 fill; PIE blocks on the pipe
+	 * before consuming the memfd. Requires the async streamer (2-fd send +
+	 * pipe signal). Kill switch: --no-stream-restore-async (must pair with
+	 * the streamer's STREAM_RESTORE_ASYNC=0).
 	 */
-	opts.stream_restore_async = 0;
+	opts.stream_restore_async = 1;
 }
 
 bool deprecated_ok(char *what)
