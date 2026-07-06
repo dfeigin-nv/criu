@@ -1,10 +1,13 @@
 #include <unistd.h>
 #include <stdio.h>
 #include <sys/mman.h>
+#include <sys/socket.h>
+#include <sys/stat.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <sys/syscall.h>
 #include <sys/prctl.h>
+#include <pthread.h>
 
 #include "types.h"
 #include "cr_options.h"
@@ -27,14 +30,33 @@
 #include "bitmap.h"
 #include "sk-packet.h"
 #include "files-reg.h"
+#include "memfd.h"
 #include "pagemap-cache.h"
 #include "fault-injection.h"
 #include "prctl.h"
 #include "compel/infect-util.h"
 #include "pidfd-store.h"
+#include "common/scm.h"
+#include "common/lock.h"
 
 #include "protobuf.h"
 #include "images/pagemap.pb-c.h"
+
+/*
+ * Pipeline C: shmalloc'd cross-process mutex serializing the
+ * write(id) + recv_fds(memfd) + read(ack) trio on the shared streamer
+ * private socket. Allocated in cr-restore.c:cr_restore_tasks() before
+ * fork; visible in all forked task processes via inherited shmem.
+ */
+mutex_t *streamer_private_sock_lock;
+
+/*
+ * Pipeline C Stage 2c: parallel mutex for the shmem memfd side channel.
+ * Each open_shmem() call serializes write(shmid) + recv_fds(memfd) (no
+ * ack) on this socket. Allocated in cr_restore_tasks() when the agent
+ * passes CRIU_STREAMER_SHMEM_SOCK; NULL otherwise (private-only restore).
+ */
+mutex_t *streamer_shmem_sock_lock;
 
 static int task_reset_dirty_track(int pid)
 {
@@ -1185,7 +1207,17 @@ static int restore_priv_vma_content(struct pstree_item *t, struct page_read *pr)
 				goto err_addr;
 			}
 
-			if (!vma_area_is(vma, VMA_PREMMAPED)) {
+			/*
+			 * In stream-restore mode every private-VMA page goes
+			 * through the per-task streamer memfd via vma_io / PIE
+			 * io_submit. There is no pages-*.img on disk to feed
+			 * pr->async / process_async_reads, so route premmaped
+			 * VMAs through the same enqueue path as non-premmaped
+			 * ones. The premapped target address is identical, so
+			 * PIE writes land in the right place. COW (snapshot-
+			 * chain) reads are not supported under stream_restore.
+			 */
+			if (opts.stream_restore || !vma_area_is(vma, VMA_PREMMAPED)) {
 				unsigned long len = min_t(unsigned long, (nr_pages - i) * PAGE_SIZE, vma->e->end - va);
 
 				if (vma->e->status & VMA_NO_PROT_WRITE) {
@@ -1448,14 +1480,253 @@ int unmap_guard_pages(struct pstree_item *t)
 	return 0;
 }
 
+/*
+ * One unique (vmfd, flags) for opening. fd is filled by open_vmas_unique_open.
+ */
+struct open_vma_unique {
+	struct file_desc *vmfd;
+	u32 flags;
+	struct vma_area *rep_vma;
+	int fd;
+	bool is_memfd;
+};
+
+#define OPEN_VMAS_MEMFD_WORKERS_MAX 8
+
+struct memfd_open_plan {
+	struct open_vma_unique **jobs;
+	int nr_jobs;
+	int next_job;
+	int stop;
+	int ret;
+	pthread_mutex_t lock;
+};
+
+static int memfd_open_jobs_collect(struct open_vma_unique *unique, int nr_unique, struct open_vma_unique ***jobs_out)
+{
+	struct open_vma_unique **jobs = NULL;
+	int nr_jobs = 0, cap_jobs = 0;
+	int i, j;
+
+	for (i = 0; i < nr_unique; i++) {
+		void *inode_key;
+
+		if (!unique[i].is_memfd)
+			continue;
+		if (inherited_fd(unique[i].vmfd, NULL))
+			continue;
+
+		inode_key = memfd_inode_cookie(unique[i].vmfd);
+		for (j = 0; j < nr_jobs; j++) {
+			if (memfd_inode_cookie(jobs[j]->vmfd) == inode_key)
+				break;
+		}
+		if (j < nr_jobs)
+			continue;
+
+		if (nr_jobs >= cap_jobs) {
+			int new_cap = cap_jobs ? cap_jobs * 2 : 32;
+			struct open_vma_unique **new_jobs;
+
+			new_jobs = xrealloc(jobs, new_cap * sizeof(*new_jobs));
+			if (!new_jobs) {
+				xfree(jobs);
+				return -1;
+			}
+			jobs = new_jobs;
+			cap_jobs = new_cap;
+		}
+
+		jobs[nr_jobs++] = &unique[i];
+	}
+
+	*jobs_out = jobs;
+	return nr_jobs;
+}
+
+static void *memfd_open_worker(void *arg)
+{
+	struct memfd_open_plan *plan = arg;
+
+	while (1) {
+		struct open_vma_unique *job;
+		int idx;
+		int fd;
+
+		pthread_mutex_lock(&plan->lock);
+		if (plan->stop || plan->next_job >= plan->nr_jobs) {
+			pthread_mutex_unlock(&plan->lock);
+			break;
+		}
+		idx = plan->next_job++;
+		job = plan->jobs[idx];
+		pthread_mutex_unlock(&plan->lock);
+
+		if (!inherited_fd(job->vmfd, &fd))
+			fd = memfd_open(job->vmfd, &job->flags, true);
+		if (fd < 0) {
+			pthread_mutex_lock(&plan->lock);
+			plan->stop = 1;
+			plan->ret = -1;
+			pthread_mutex_unlock(&plan->lock);
+			break;
+		}
+
+		job->fd = fd;
+	}
+
+	return NULL;
+}
+
+static int memfd_open_parallel(struct open_vma_unique *unique, int nr_unique)
+{
+	struct open_vma_unique **jobs = NULL;
+	struct memfd_open_plan plan;
+	pthread_t workers[OPEN_VMAS_MEMFD_WORKERS_MAX];
+	long cpus;
+	int nr_jobs, nr_workers, i;
+
+	nr_jobs = memfd_open_jobs_collect(unique, nr_unique, &jobs);
+	if (nr_jobs < 0)
+		return -1;
+	if (nr_jobs <= 1) {
+		int ret = 0;
+
+		if (nr_jobs == 1) {
+			int fd;
+
+			if (!inherited_fd(jobs[0]->vmfd, &fd))
+				fd = memfd_open(jobs[0]->vmfd, &jobs[0]->flags, true);
+			if (fd < 0)
+				ret = -1;
+			else
+				jobs[0]->fd = fd;
+		}
+
+		xfree(jobs);
+		return ret;
+	}
+
+	cpus = sysconf(_SC_NPROCESSORS_ONLN);
+	if (cpus < 1)
+		cpus = 1;
+	nr_workers = min_t(int, nr_jobs, cpus);
+	nr_workers = min_t(int, nr_workers, OPEN_VMAS_MEMFD_WORKERS_MAX);
+	if (nr_workers < 2) {
+		int ret = 0;
+
+		for (i = 0; i < nr_jobs; i++) {
+			int fd;
+
+			if (!inherited_fd(jobs[i]->vmfd, &fd))
+				fd = memfd_open(jobs[i]->vmfd, &jobs[i]->flags, true);
+			if (fd < 0) {
+				ret = -1;
+				break;
+			}
+			jobs[i]->fd = fd;
+		}
+
+		xfree(jobs);
+		return ret;
+	}
+
+	memzero(&plan, sizeof(plan));
+	plan.jobs = jobs;
+	plan.nr_jobs = nr_jobs;
+	pthread_mutex_init(&plan.lock, NULL);
+
+	pr_info("open_vmas: opening %d unique memfd inodes with %d workers\n", nr_jobs, nr_workers);
+	for (i = 0; i < nr_workers; i++) {
+		if (pthread_create(&workers[i], NULL, memfd_open_worker, &plan) != 0) {
+			int j, k;
+
+			plan.stop = 1;
+			for (j = 0; j < i; j++)
+				pthread_join(workers[j], NULL);
+			for (k = 0; k < nr_jobs; k++) {
+				if (jobs[k]->fd >= 0) {
+					close(jobs[k]->fd);
+					jobs[k]->fd = -1;
+				}
+			}
+			pthread_mutex_destroy(&plan.lock);
+			xfree(jobs);
+			pr_err("pthread_create failed for memfd open worker\n");
+			return -1;
+		}
+	}
+
+	for (i = 0; i < nr_workers; i++)
+		pthread_join(workers[i], NULL);
+
+	if (plan.ret < 0) {
+		for (i = 0; i < nr_jobs; i++) {
+			if (jobs[i]->fd >= 0) {
+				close(jobs[i]->fd);
+				jobs[i]->fd = -1;
+			}
+		}
+	}
+
+	pthread_mutex_destroy(&plan.lock);
+	xfree(jobs);
+	return plan.ret;
+}
+
+static int open_vmas_unique_open(struct open_vma_unique *unique, int nr_unique)
+{
+	int i, fd;
+
+	if (nr_unique <= 0)
+		return 0;
+
+	if (memfd_open_parallel(unique, nr_unique) < 0)
+		return -1;
+
+	for (i = 0; i < nr_unique; i++) {
+		struct open_vma_unique *u = &unique[i];
+
+		if (u->fd >= 0)
+			continue;
+
+		if (u->is_memfd) {
+			if (!inherited_fd(u->vmfd, &fd))
+				fd = memfd_open(u->vmfd, &u->flags, true);
+		} else
+			fd = open_file_for_vma(u->rep_vma, u->flags);
+
+		if (fd < 0) {
+			/* close fds opened so far in this loop */
+			for (int j = 0; j < i; j++)
+				if (unique[j].fd >= 0) {
+					close(unique[j].fd);
+					unique[j].fd = -1;
+				}
+			return -1;
+		}
+		u->fd = fd;
+	}
+	return 0;
+}
+
 int open_vmas(struct pstree_item *t)
 {
 	int pid = vpid(t);
 	struct vma_area *vma;
 	struct vm_area_list *vmas = &rsti(t)->vmas;
+	struct open_vma_unique *unique = NULL;
+	int nr_unique = 0, cap_unique = 0;
+	struct vma_area **parallel_vmas = NULL;
+	int nr_parallel = 0, cap_parallel = 0;
+	struct {
+		int fd;
+		struct vma_area *vma;
+	} *last_per_fd = NULL;
+	int nr_last = 0, cap_last = 0;
+	int i, ret = -1;
 
-	filemap_ctx_init(false);
-
+	/* Phase 1: non-filemap VMAs (shmem, socket) + plugin; collect filemap + memfd for parallel open */
 	list_for_each_entry(vma, &vmas->h, list) {
 		if (!vma_area_is(vma, VMA_AREA_REGULAR) || !vma->vm_open)
 			continue;
@@ -1463,23 +1734,296 @@ int open_vmas(struct pstree_item *t)
 		pr_info("Opening %#016" PRIx64 "-%#016" PRIx64 " %#016" PRIx64 " (%x) vma\n", vma->e->start,
 			vma->e->end, vma->e->pgoff, vma->e->status);
 
-		if (vma->vm_open(pid, vma)) {
-			pr_err("`- Can't open vma\n");
-			return -1;
-		}
+		if (vma_area_is(vma, VMA_FILE_PRIVATE) || vma_area_is(vma, VMA_FILE_SHARED)) {
+			bool is_plugin = !!(vma->e->status & VMA_EXT_PLUGIN);
+			bool is_memfd = !!(vma->e->status & VMA_AREA_MEMFD);
 
-		/*
-		 * File mappings have vm_open set to open_filemap which, in
-		 * turn, puts the VMA_CLOSE bit itself. For all the rest we
-		 * need to put it by hands, so that the restorer closes the fd
-		 */
-		if (!(vma_area_is(vma, VMA_FILE_PRIVATE) || vma_area_is(vma, VMA_FILE_SHARED)))
-			vma->e->status |= VMA_CLOSE;
+			if (is_plugin) {
+				if (vma->vm_open(pid, vma)) {
+					pr_err("`- Can't open vma\n");
+					goto out;
+				}
+				continue;
+			}
+
+			/* Collect for parallel open: ensure unique (vmfd, flags) with rep_vma */
+			for (i = 0; i < nr_unique; i++)
+				if (unique[i].vmfd == vma->vmfd && unique[i].flags == vma->e->fdflags)
+					break;
+			if (i >= nr_unique) {
+				if (nr_unique >= cap_unique) {
+					int new_cap = cap_unique ? cap_unique * 2 : 64;
+					struct open_vma_unique *nu = xrealloc(unique,
+						new_cap * sizeof(*unique));
+					if (!nu)
+						goto out;
+					unique = nu;
+					cap_unique = new_cap;
+				}
+				unique[nr_unique].vmfd = vma->vmfd;
+				unique[nr_unique].flags = vma->e->fdflags;
+				unique[nr_unique].rep_vma = vma;
+				unique[nr_unique].fd = -1;
+				unique[nr_unique].is_memfd = is_memfd;
+				nr_unique++;
+			}
+
+			if (nr_parallel >= cap_parallel) {
+				int new_cap = cap_parallel ? cap_parallel * 2 : 128;
+				struct vma_area **np = xrealloc(parallel_vmas,
+					new_cap * sizeof(*parallel_vmas));
+				if (!np)
+					goto out;
+				parallel_vmas = np;
+				cap_parallel = new_cap;
+			}
+			parallel_vmas[nr_parallel++] = vma;
+		} else {
+			if (vma->vm_open(pid, vma)) {
+				pr_err("`- Can't open vma\n");
+				goto out;
+			}
+			if (!(vma_area_is(vma, VMA_FILE_PRIVATE) || vma_area_is(vma, VMA_FILE_SHARED)))
+				vma->e->status |= VMA_CLOSE;
+		}
 	}
 
-	filemap_ctx_fini();
+	/* Phase 2: open unique files (AIO used for reads in restorer) */
+	if (nr_unique > 0)
+		pr_info("open_vmas: %d unique files, %d file-backed VMAs\n",
+			nr_unique, nr_parallel);
+	if (open_vmas_unique_open(unique, nr_unique) < 0) {
+		pr_err("Open VMAs failed\n");
+		goto out;
+	}
 
-	return 0;
+	/* Phase 3: assign fds to VMAs */
+	for (i = 0; i < nr_parallel; i++) {
+		int j, fd;
+
+		vma = parallel_vmas[i];
+		for (j = 0; j < nr_unique; j++)
+			if (unique[j].vmfd == vma->vmfd && unique[j].flags == vma->e->fdflags)
+				break;
+		if (j >= nr_unique)
+			goto out;
+		fd = unique[j].fd;
+		vma->e->fd = fd;
+	}
+
+	/* Phase 4: in list order, track last VMA per fd; then set VMA_CLOSE on each */
+	list_for_each_entry(vma, &vmas->h, list) {
+		int fd, j;
+
+		if (!vma_area_is(vma, VMA_AREA_REGULAR) || !vma->vm_open)
+			continue;
+		if (!(vma_area_is(vma, VMA_FILE_PRIVATE) || vma_area_is(vma, VMA_FILE_SHARED)))
+			continue;
+		fd = vma->e->fd;
+		for (j = 0; j < nr_last; j++)
+			if (last_per_fd[j].fd == fd)
+				break;
+		if (j < nr_last)
+			last_per_fd[j].vma = vma;
+		else {
+			if (nr_last >= cap_last) {
+				int new_cap = cap_last ? cap_last * 2 : 64;
+				void *np = xrealloc(last_per_fd, new_cap * sizeof(*last_per_fd));
+				if (!np)
+					goto out;
+				last_per_fd = np;
+				cap_last = new_cap;
+			}
+			last_per_fd[nr_last].fd = fd;
+			last_per_fd[nr_last].vma = vma;
+			nr_last++;
+		}
+	}
+
+	for (i = 0; i < nr_last; i++)
+		last_per_fd[i].vma->e->status |= VMA_CLOSE;
+
+	ret = 0;
+out:
+	xfree(unique);
+	xfree(parallel_vmas);
+	xfree(last_per_fd);
+	return ret;
+}
+
+/*
+ * Pipeline C: streamer-fed scratch memfd for private VMA pages.
+ *
+ * In --stream-restore mode the agent pre-creates a control socket pair
+ * (its end + CRIU's end). The CRIU-side fd number is passed in via the
+ * CRIU_STREAMER_PRIVATE_SOCK environment variable. CRIU then receives
+ * one memfd per task over that socket via SCM_RIGHTS. The streamer fills
+ * the memfd in parallel with PIE setup; PIE waits on the per-iov futex
+ * word before consuming each restore_vma_io.
+ *
+ * The full streamer/agent wiring lands in P5. Until then, this code path
+ * is unreachable unless the user sets both --stream-restore and the env
+ * var; without those it stays inert.
+ */
+/*
+ * Pipeline C wire protocol on the per-task private-pages socket:
+ *   1) CRIU -> streamer: 4-byte uint32 pages_img_id (host byte order),
+ *                        one request per task's prepare_vma_ios call.
+ *                        Lets the streamer dispatch the right memfd
+ *                        when tasks have distinct pages_img_id values.
+ *   2) streamer -> CRIU: SCM_RIGHTS carrying [pages_memfd] in one
+ *                        sendmsg, with a 1-byte dummy payload.
+ *   3) streamer -> CRIU: 1 plain byte ('A') after the streamer finishes
+ *                        writing all private-VMA bytes to the memfd.
+ *                        CRIU blocks reading this byte before letting
+ *                        PIE run, so the memfd content is complete by
+ *                        the time PIE's io_submit reads it.
+ *
+ * Cross-process futex signalling (the original two-fd design with a
+ * separate futex_memfd) was rejected because the streamer-mmap'd
+ * region is in the criu restore process address space, but PIE's
+ * unmap_old_vmas nukes everything outside the bootstrap + premapped
+ * regions. The shmalloc-backed PIE futex array (alloc_streamer_futex
+ * _array) IS preserved across unmap; we keep it for forward-compat
+ * with the async streamer, but mem.c pre-fills the words to 1 right
+ * after the ack so PIE never has to wait.
+ */
+/*
+ * Async-overlap mode: streamer sends [memfd, pipe_rfd] via SCM_RIGHTS and
+ * the 'A' byte immediately on memfd handover. CRIU returns without waiting
+ * for fill. PIE blocks on sys_read(pipe_rfd) at AIO entry. Pipe writer
+ * close (streamer death) gives PIE EOF → clean abort. Sync mode: legacy
+ * single-fd handover + 'A' after fill (out_pipe_fd set to -1).
+ */
+static int recv_streamer_private_fd(uint32_t pages_img_id, int *out_pages_fd,
+				    int *out_pipe_fd)
+{
+	int sock, fds[2] = { -1, -1 }, rc = -1;
+	int nfds;
+	bool async;
+	char ack = 0;
+
+	sock = get_service_fd(STREAM_PRIVATE_SK_OFF);
+	if (sock < 0) {
+		pr_err("--stream-restore set but STREAM_PRIVATE_SK_OFF service fd is missing\n");
+		return -1;
+	}
+	if (!streamer_private_sock_lock) {
+		pr_err("streamer_private_sock_lock not initialized\n");
+		return -1;
+	}
+
+	async = opts.stream_restore_async != 0;
+	nfds = async ? 2 : 1;
+	*out_pipe_fd = -1;
+
+	/*
+	 * Serialize the write/recv_fds/read trio across forked tasks.
+	 * The streamer protocol assumes one in-flight request per socket;
+	 * without this lock concurrent tasks interleave bytes and
+	 * recv_fds() picks up the wrong SCM_RIGHTS payload (ENOENT).
+	 */
+	mutex_lock(streamer_private_sock_lock);
+
+	if (write(sock, &pages_img_id, sizeof(pages_img_id)) != (ssize_t)sizeof(pages_img_id)) {
+		pr_perror("Failed to send pages_img_id=%u to streamer", pages_img_id);
+		goto out;
+	}
+	pr_info("[stream-diag] task=%d id=%u sock=%d locked async=%d\n",
+		(int)getpid(), pages_img_id, sock, async ? 1 : 0);
+	if (recv_fds(sock, fds, nfds, NULL, 0) < 0) {
+		pr_perror("Failed to receive streamer private fds (n=%d) for id=%u on sock %d",
+			  nfds, pages_img_id, sock);
+		goto out;
+	}
+	if (read(sock, &ack, 1) != 1 || ack != 'A') {
+		pr_perror("Failed to receive streamer ack for id=%u (got 0x%02x)",
+			  pages_img_id, (unsigned)ack);
+		close(fds[0]);
+		if (nfds > 1)
+			close(fds[1]);
+		goto out;
+	}
+	*out_pages_fd = fds[0];
+	if (async)
+		*out_pipe_fd = fds[1];
+	rc = 0;
+out:
+	mutex_unlock(streamer_private_sock_lock);
+	return rc;
+}
+
+/*
+ * Stage 2c shmem zero-copy: ask the streamer for the shmem memfd that
+ * matches `shmid`. Wire protocol differs from the private side: write
+ * the 8-byte shmid LE, recv SCM_RIGHTS(memfd), and DO NOT wait for an
+ * ack. The streamer fills asynchronously via NIXL; the lazy-pages daemon
+ * gates user-visible reads on streamer_ready_futex per range. Caller
+ * uses the returned memfd as the backing inode for the shmem VMA mmap.
+ */
+int recv_streamer_shmem_memfd(uint64_t shmid, int *out_memfd)
+{
+	int sock, fd, rc = -1;
+
+	sock = get_service_fd(STREAM_SHMEM_SK_OFF);
+	if (sock < 0) {
+		pr_err("--stream-restore set but STREAM_SHMEM_SK_OFF service fd is missing\n");
+		return -1;
+	}
+	if (!streamer_shmem_sock_lock) {
+		pr_err("streamer_shmem_sock_lock not initialized\n");
+		return -1;
+	}
+
+	mutex_lock(streamer_shmem_sock_lock);
+
+	if (write(sock, &shmid, sizeof(shmid)) != (ssize_t)sizeof(shmid)) {
+		pr_perror("Failed to send shmid=0x%" PRIx64 " to streamer", shmid);
+		goto out;
+	}
+	if (recv_fds(sock, &fd, 1, NULL, 0) < 0) {
+		pr_err("Failed to receive streamer shmem memfd for shmid=0x%" PRIx64 "\n",
+		       shmid);
+		goto out;
+	}
+	*out_memfd = fd;
+	rc = 0;
+out:
+	mutex_unlock(streamer_shmem_sock_lock);
+	return rc;
+}
+
+/*
+ * Allocate the per-vma_io readiness futex array in shmalloc'd memory so
+ * the words survive fork() AND unmap_old_vmas() into the PIE restorer.
+ * shmalloc'd memory is in the rst-malloc MAP_SHARED|MAP_ANONYMOUS pool
+ * mapped at restorer-fixed addresses preserved across unmap.
+ *
+ * NOTE: not called by the current synchronous Pipeline C protocol —
+ * the streamer ack on the private socket already guarantees the memfd
+ * is filled, so PIE's NULL-gated wait-loops just no-op. shmalloc()
+ * here also BUGs at rst-malloc.c:169 because RM_SHARED is disabled by
+ * the time prepare_vma_ios runs. Keep this allocator around for the
+ * async overlap follow-on (per-range eventfd + FUTEX_WAKE) once it
+ * either moves the allocation earlier or switches to a PIE-mapped
+ * slab.
+ */
+__attribute__((unused))
+static unsigned int *alloc_streamer_futex_array(unsigned int n)
+{
+	unsigned int *fut;
+	size_t bytes;
+
+	if (n == 0)
+		return NULL;
+	bytes = (size_t)n * sizeof(unsigned int);
+	fut = shmalloc(bytes);
+	if (!fut) {
+		pr_err("Failed to shmalloc %u-entry streamer futex array\n", n);
+		return NULL;
+	}
+	memset(fut, 0, bytes);
+	return fut;
 }
 
 static int prepare_vma_ios(struct pstree_item *t, struct task_restore_args *ta)
@@ -1497,8 +2041,56 @@ static int prepare_vma_ios(struct pstree_item *t, struct task_restore_args *ta)
 		ta->vma_ios = NULL;
 		ta->vma_ios_n = 0;
 		ta->vma_ios_fd = -1;
+		ta->streamer_private_pages_fd = -1;
+		ta->streamer_private_ready_futex = NULL;
+		ta->streamer_private_ready_futex_n = 0;
+		ta->streamer_ready_pipe_fd = -1;
 		return 0;
 	}
+
+	if (opts.stream_restore) {
+		int pages_fd = -1, pipe_fd = -1;
+
+		if (recv_streamer_private_fd(rsti(t)->pages_img_id, &pages_fd, &pipe_fd) < 0)
+			return -1;
+
+		ta->vma_ios_fd = pages_fd;
+		ta->streamer_private_pages_fd = pages_fd;
+		ta->streamer_ready_pipe_fd = pipe_fd;
+
+		if (pagemap_render_iovec(&rsti(t)->vma_io, ta) < 0)
+			return -1;
+
+		/*
+		 * Pipeline C synchronization model (Plan v4):
+		 *
+		 *  - sync mode (opts.stream_restore_async = 0): streamer's 'A'
+		 *    ack on the private socket already gated this function on
+		 *    full memfd fill. streamer_ready_pipe_fd is -1; PIE's AIO
+		 *    loop reads zero bytes and proceeds.
+		 *  - async mode (default): 'A' ack arrived on memfd handover;
+		 *    streamer is still filling. streamer_ready_pipe_fd points
+		 *    at a pipe the streamer will write one byte to when fill
+		 *    completes (or close on abort). PIE blocks on sys_read
+		 *    before issuing io_submit.
+		 *
+		 * Per-pagemap-range futex scaffolding stays NULL-gated and
+		 * dormant; reserved for Step B if overlap measurement shows
+		 * room for sub-memfd parallelism.
+		 */
+		ta->streamer_private_ready_futex = NULL;
+		ta->streamer_private_ready_futex_n = 0;
+		return 0;
+	}
+
+	/*
+	 * Default (non-stream) path: keep the existing pages-{N}.img + AIO
+	 * setup unchanged, and leave the stream fields cleared.
+	 */
+	ta->streamer_private_pages_fd = -1;
+	ta->streamer_private_ready_futex = NULL;
+	ta->streamer_private_ready_futex_n = 0;
+	ta->streamer_ready_pipe_fd = -1;
 
 	/*
 	 * If auto-dedup is on we need RDWR mode to be able to punch holes in
@@ -1509,6 +2101,42 @@ static int prepare_vma_ios(struct pstree_item *t, struct task_restore_args *ta)
 		return -1;
 
 	ta->vma_ios_fd = img_raw_fd(pages);
+	if (ta->vma_ios_fd >= 0) {
+		int fl = fcntl(ta->vma_ios_fd, F_GETFL);
+		if (fl >= 0) {
+			int ret = fcntl(ta->vma_ios_fd, F_SETFL, fl | O_DIRECT);
+			if (ret < 0) {
+				pr_warn("Failed to set O_DIRECT on pages fd: %s\n", strerror(errno));
+			} else {
+				/*
+				 * Probe: some NFS servers (e.g. Azure) accept O_DIRECT via
+				 * fcntl but reject it at pread time with EINVAL. Fall back
+				 * to buffered I/O in that case.
+				 */
+				char probe[4096] __attribute__((aligned(4096)));
+				if (pread(ta->vma_ios_fd, probe, sizeof(probe), 0) < 0 && errno == EINVAL) {
+					pr_info("O_DIRECT rejected at read time on pages fd %d (NFS?), using buffered I/O\n",
+						ta->vma_ios_fd);
+					if (fcntl(ta->vma_ios_fd, F_SETFL, fl) < 0) {
+						pr_err("Failed to clear O_DIRECT on pages fd %d: %s"
+						      " -- all subsequent reads will fail with EINVAL\n",
+						      ta->vma_ios_fd, strerror(errno));
+						return -1;
+					}
+					/*
+					 * Hint the kernel to use large sequential read-ahead.
+					 * Linux 5.4+ reduced the default NFS read_ahead_kb from
+					 * ~15 MB to 128 KB, which severely hurts sequential
+					 * throughput on Azure NFS. POSIX_FADV_SEQUENTIAL asks
+					 * the kernel to double the read-ahead window automatically.
+					 */
+					posix_fadvise(ta->vma_ios_fd, 0, 0, POSIX_FADV_SEQUENTIAL);
+				} else {
+					pr_info("O_DIRECT enabled on pages fd %d\n", ta->vma_ios_fd);
+				}
+			}
+		}
+	}
 	return pagemap_render_iovec(&rsti(t)->vma_io, ta);
 }
 

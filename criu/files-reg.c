@@ -12,6 +12,7 @@
 #include <sched.h>
 #include <sys/capability.h>
 #include <sys/ioctl.h>
+#include <pthread.h>
 #include <elf.h>
 #include <linux/fiemap.h>
 #include <linux/fs.h>
@@ -83,22 +84,69 @@ struct ghost_file {
 static u32 ghost_file_ids = 1;
 static LIST_HEAD(ghost_files);
 
+struct reg_file_runtime {
+	struct list_head list;
+	u32 id;
+	bool size_mode_checked;
+	int remap_cached_fd;
+	pthread_mutex_t lock;
+};
+
+static LIST_HEAD(reg_file_runtimes);
+static pthread_mutex_t reg_file_runtimes_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static struct reg_file_runtime *get_reg_file_runtime(struct reg_file_info *rfi)
+{
+	struct reg_file_runtime *rt;
+
+	pthread_mutex_lock(&reg_file_runtimes_lock);
+	list_for_each_entry(rt, &reg_file_runtimes, list) {
+		if (rt->id == rfi->d.id) {
+			pthread_mutex_unlock(&reg_file_runtimes_lock);
+			return rt;
+		}
+	}
+
+	rt = xmalloc(sizeof(*rt));
+	if (!rt) {
+		pthread_mutex_unlock(&reg_file_runtimes_lock);
+		return NULL;
+	}
+
+	rt->id = rfi->d.id;
+	rt->size_mode_checked = false;
+	rt->remap_cached_fd = -1;
+	pthread_mutex_init(&rt->lock, NULL);
+	list_add_tail(&rt->list, &reg_file_runtimes);
+	pthread_mutex_unlock(&reg_file_runtimes_lock);
+	return rt;
+}
+
 /*
  * When opening remaps we first create a link on the remap
  * target, then open one, then unlink. In case the remap
  * source has more than one instance, these three steps
  * should be serialized with each other.
+ * Per-rfi lock: only same-file opens serialize; different files open in parallel.
  */
-static mutex_t *remap_open_lock;
+struct remap_rfi_lock {
+	struct list_head list;
+	u32 id;
+	mutex_t *m;
+};
 
-static inline int init_remap_lock(void)
+static struct list_head *remap_rfi_locks_head;
+
+static mutex_t *get_remap_lock(u32 rfi_id)
 {
-	remap_open_lock = shmalloc(sizeof(*remap_open_lock));
-	if (!remap_open_lock)
-		return -1;
+	struct remap_rfi_lock *l;
 
-	mutex_init(remap_open_lock);
-	return 0;
+	if (!remap_rfi_locks_head)
+		return NULL;
+	list_for_each_entry(l, remap_rfi_locks_head, list)
+		if (l->id == rfi_id)
+			return l->m;
+	return NULL;
 }
 
 static LIST_HEAD(remaps);
@@ -364,8 +412,13 @@ static int mkreg_ghost(char *path, GhostFileEntry *gfe, struct cr_img *img)
 	int gfd, ret;
 
 	gfd = open(path, O_WRONLY | O_CREAT | O_EXCL, gfe->mode);
-	if (gfd < 0)
+	if (gfd < 0) {
+		if (errno == EEXIST) {
+			pr_info("Ghost %s already created by sibling restorer, skipping\n", path);
+			return 0;
+		}
 		return -1;
+	}
 
 	if (gfe->chunks) {
 		if (!gfe->has_size) {
@@ -798,12 +851,42 @@ out:
 	return ret;
 }
 
+static inline int init_remap_locks(void)
+{
+	struct remap_info *ri;
+	struct remap_rfi_lock *l;
+
+	remap_rfi_locks_head = shmalloc(sizeof(*remap_rfi_locks_head));
+	if (!remap_rfi_locks_head)
+		return -1;
+	INIT_LIST_HEAD(remap_rfi_locks_head);
+
+	list_for_each_entry(ri, &remaps, list) {
+		u32 id = ri->rfi->d.id;
+
+		/* Dedup: same rfi may appear in multiple remap_infos in theory */
+		if (get_remap_lock(id))
+			continue;
+
+		l = shmalloc(sizeof(*l));
+		if (!l)
+			return -1;
+		l->id = id;
+		l->m = shmalloc(sizeof(*l->m));
+		if (!l->m)
+			return -1;
+		mutex_init(l->m);
+		list_add_tail(&l->list, remap_rfi_locks_head);
+	}
+	return 0;
+}
+
 int prepare_remaps(void)
 {
 	struct remap_info *ri;
 	int ret = 0;
 
-	ret = init_remap_lock();
+	ret = init_remap_locks();
 	if (ret)
 		return ret;
 
@@ -2192,15 +2275,21 @@ int open_path(struct file_desc *d, int (*open_cb)(int mntns_root, struct reg_fil
 {
 	int tmp = -1, mntns_root, level = 0;
 	struct reg_file_info *rfi;
+	struct reg_file_runtime *rt;
 	char *orig_path = NULL;
 	char path[PATH_MAX];
 	int inh_fd = -1;
+	bool remap_lock_held = false;
+	mutex_t *remap_lock = NULL;
 	int ret;
 
 	if (inherited_fd(d, &tmp))
 		return tmp;
 
 	rfi = container_of(d, struct reg_file_info, d);
+	rt = get_reg_file_runtime(rfi);
+	if (!rt)
+		return -1;
 
 	if (rfi->rfe->ext) {
 		tmp = inherit_fd_lookup_id(rfi->rfe->name);
@@ -2219,12 +2308,20 @@ int open_path(struct file_desc *d, int (*open_cb)(int mntns_root, struct reg_fil
 	}
 
 	if (rfi->remap) {
+		mutex_t *m;
+
 		if (fault_injected(FI_RESTORE_OPEN_LINK_REMAP)) {
 			pr_info("fault: Open link-remap failure!\n");
 			kill(getpid(), SIGKILL);
 		}
 
-		mutex_lock(remap_open_lock);
+		m = get_remap_lock(rfi->d.id);
+		if (!m)
+			goto err;
+		remap_lock = m;
+		pr_info("open_path remap lock: %s\n", rfi->path);
+		mutex_lock(m);
+		remap_lock_held = true;
 		if (rfi->remap->is_dir) {
 			/*
 			 * FIXME Can't make directory under new name.
@@ -2232,18 +2329,71 @@ int open_path(struct file_desc *d, int (*open_cb)(int mntns_root, struct reg_fil
 			 */
 			orig_path = rfi->path;
 			rfi->path = rfi->remap->rpath;
-		} else if ((ret = rfi_remap(rfi, &level)) == 1) {
-			static char tmp_path[PATH_MAX];
+			mutex_unlock(m);
+			remap_lock_held = false;
+			mntns_root = mntns_get_root_by_mnt_id(rfi->rfe->mnt_id);
+			goto ext;
+		}
+		pthread_mutex_lock(&rt->lock);
+		if (rt->remap_cached_fd >= 0) {
+			int cached = rt->remap_cached_fd;
+			int fl;
 
 			/*
-			 * The file whose name we're trying to create
-			 * exists. Need to pick some other one, we're
-			 * going to remove it anyway.
+			 * The cached fd may have been opened with flags that
+			 * differ from what this caller needs (e.g. a VMA open
+			 * used O_RDONLY but an fd-descriptor restore needs
+			 * O_RDWR). After the first open_path call, rfi->path
+			 * (the hard link) has been unlinked; the underlying
+			 * file is reachable only via the cached fd itself.
 			 *
-			 * Strictly speaking, this is cheating, file
-			 * name shouldn't change. But since NFS with
-			 * its silly-rename doesn't care, why should we?
+			 * If the access mode matches, dup() is sufficient.
+			 * If it differs, reopen via /proc/self/fd/<cached>
+			 * with the required flags.
+			 *
+			 * dup()/open() must happen while rt->lock is held.
+			 * The slow-path invalidation path also holds rt->lock
+			 * before closing the cached fd, so there is no window
+			 * in which we could dup a fd that another thread is
+			 * about to close.
 			 */
+			mutex_unlock(m);
+			remap_lock_held = false;
+			fl = fcntl(cached, F_GETFL);
+			if (fl >= 0 && (fl & O_ACCMODE) == (rfi->rfe->flags & O_ACCMODE)) {
+				tmp = dup(cached);
+			} else {
+				char proc_path[64];
+				snprintf(proc_path, sizeof(proc_path),
+					 "/proc/self/fd/%d", cached);
+				tmp = open(proc_path, rfi->rfe->flags & ~O_CREAT);
+				if (tmp >= 0 && !(rfi->rfe->flags & O_PATH) &&
+				    rfi->rfe->pos != (u64)-1ULL &&
+				    lseek(tmp, rfi->rfe->pos, SEEK_SET) < 0) {
+					pr_perror("Can't restore file pos for remap");
+					close(tmp);
+					tmp = -1;
+				}
+			}
+			pthread_mutex_unlock(&rt->lock);
+			if (tmp < 0) {
+				pr_perror("reopen remap_cached_fd");
+				return -1;
+			}
+			if (restore_fown(tmp, rfi->rfe->fown)) {
+				close(tmp);
+				return -1;
+			}
+			return tmp;
+		}
+		pthread_mutex_unlock(&rt->lock);
+		/*
+		 * First open of this remap in this process: create link,
+		 * open, cache fd, then unlink while still holding the lock.
+		 * Subsequent opens in the same process will dup the cached fd.
+		 */
+		if ((ret = rfi_remap(rfi, &level)) == 1) {
+			static char tmp_path[PATH_MAX];
 
 			orig_path = rfi->path;
 			rfi->path = tmp_path;
@@ -2270,16 +2420,20 @@ ext:
 	}
 	close_safe(&inh_fd);
 
-	if ((rfi->rfe->has_size || rfi->rfe->has_mode) && !rfi->size_mode_checked) {
+	pthread_mutex_lock(&rt->lock);
+	if ((rfi->rfe->has_size || rfi->rfe->has_mode) && !rt->size_mode_checked) {
 		struct stat st;
 
 		if (fstat(tmp, &st) < 0) {
+			pthread_mutex_unlock(&rt->lock);
 			pr_perror("Can't fstat opened file");
 			goto err;
 		}
 
-		if (!validate_file(tmp, &st, rfi))
+		if (!validate_file(tmp, &st, rfi)) {
+			pthread_mutex_unlock(&rt->lock);
 			goto err;
+		}
 
 		if (rfi->rfe->has_mode) {
 			mode_t curr_mode = st.st_mode;
@@ -2291,6 +2445,7 @@ ext:
 			}
 
 			if (curr_mode != saved_mode) {
+				pthread_mutex_unlock(&rt->lock);
 				pr_err("File %s has bad mode 0%o (expect 0%o)\n"
 				       "File r/w/x checks can be skipped with the --skip-file-rwx-check option\n",
 				       rfi->path, (int)curr_mode, saved_mode);
@@ -2298,13 +2453,9 @@ ext:
 			}
 		}
 
-		/*
-		 * This is only visible in the current process, so
-		 * change w/o locks. Other tasks sharing the same
-		 * file will get one via unix sockets.
-		 */
-		rfi->size_mode_checked = true;
+		rt->size_mode_checked = true;
 	}
+	pthread_mutex_unlock(&rt->lock);
 
 	if (rfi->remap) {
 		if (!rfi->remap->is_dir) {
@@ -2320,22 +2471,40 @@ ext:
 			}
 			if (rm_parent_dirs(mntns_root, rfi->path, level))
 				goto err;
+
+			pthread_mutex_lock(&rt->lock);
+			rt->remap_cached_fd = tmp;
+			pthread_mutex_unlock(&rt->lock);
 		}
 
-		mutex_unlock(remap_open_lock);
+		if (remap_lock_held) {
+			mutex_unlock(remap_lock);
+			remap_lock_held = false;
+		}
 	}
 	if (orig_path)
 		rfi->path = orig_path;
 
 	if (restore_fown(tmp, rfi->rfe->fown)) {
+		/*
+		 * Invalidate the fd cache before closing tmp so that a
+		 * concurrent fast-path caller (which holds rt->lock while
+		 * dup()-ing) cannot dup a fd we are about to close.
+		 */
+		if (rfi->remap) {
+			pthread_mutex_lock(&rt->lock);
+			if (rt->remap_cached_fd == tmp)
+				rt->remap_cached_fd = -1;
+			pthread_mutex_unlock(&rt->lock);
+		}
 		close(tmp);
 		return -1;
 	}
 
 	return tmp;
 err:
-	if (rfi->remap)
-		mutex_unlock(remap_open_lock);
+	if (remap_lock_held)
+		mutex_unlock(remap_lock);
 	close_safe(&tmp);
 	return -1;
 }
@@ -2525,6 +2694,17 @@ static int open_filemap(int pid, struct vma_area *vma)
 	return 0;
 }
 
+/*
+ * Open one file for a VMA (normal open_path path only).
+ * Used by open_vmas; does not touch filemap_ctx.
+ * Caller must ensure vma is not VMA_EXT_PLUGIN or VMA_AREA_MEMFD.
+ */
+int open_file_for_vma(struct vma_area *vma, u32 flags)
+{
+	BUG_ON((vma->vmfd == NULL) || !vma->e->has_fdflags);
+	return open_path(vma->vmfd, do_open_reg_noseek_flags, &flags);
+}
+
 int collect_filemap(struct vma_area *vma)
 {
 	struct file_desc *fd;
@@ -2608,7 +2788,6 @@ static int collect_one_regfile(void *o, ProtobufCMessage *base, struct cr_img *i
 	else
 		rfi->path = rfi->rfe->name + 1;
 	rfi->remap = NULL;
-	rfi->size_mode_checked = false;
 
 	pr_info("Collected [%s] ID %#x\n", rfi->path, rfi->rfe->id);
 	return file_desc_add(&rfi->d, rfi->rfe->id, &reg_desc_ops);

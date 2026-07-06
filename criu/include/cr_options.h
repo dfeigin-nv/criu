@@ -207,6 +207,8 @@ struct cr_options {
 	int status_fd;
 	bool orphan_pts_master;
 	int stream;
+	int stream_restore;
+	int stream_restore_async;	/* Plan v4 async overlap (default on). */
 	pid_t tree_id;
 	int log_level;
 	char *imgs_dir;

@@ -207,6 +207,40 @@ conservative; real workloads show 1–19 ios per process.
 when `args->auto_dedup` is set, at `cb->aio_offset` for `events[k].res`
 bytes.
 
+### 4. AIO vs io_uring review guidance
+
+When explaining PR #3022, be precise:
+
+- Do not claim `io_uring_queue_exit()` synchronously removes all helper
+  threads. `close(ring_fd)` starts teardown; worker TIDs can remain visible
+  until the queued exit work runs and any in-flight syscall returns.
+- Do not say the AIO path falls back to `preadv`. The restorer still uses
+  `io_submit`; if `O_DIRECT` is unavailable, buffered Linux AIO can execute
+  synchronously in-kernel, which is the same blocking class as the old `preadv`
+  path.
+- SQPOLL is not a fix for this restorer problem. It changes submission and can
+  add an `iou-sqp-*` thread; it does not remove `iou-wrk-*` workers for reads
+  that cannot complete inline.
+
+### 5. Pipeline C private-page overlap (`add-stream-restore-async`)
+
+For stream-restore private VMAs, do not revive the old shared-futex design
+without re-proving the address-space lifetime. PIE's `unmap_old_vmas` does
+not preserve arbitrary `RM_SHARED` mappings, so a shmalloc-backed futex array
+allocated late in `prepare_vma_ios()` is not a safe cross-process handoff.
+
+The current overlap path uses a per-memfd readiness pipe instead:
+`recv_streamer_private_fd()` receives `SCM_RIGHTS(memfd, pipe_rfd)` and an
+immediate `'A'` ack, then PIE blocks on `sys_read(pipe_rfd, 1)` immediately
+before consuming the memfd. Streamer close-without-write is the abort signal.
+
+For UFFD minor-fault zero-copy, remember that `UFFDIO_CONTINUE` has no source
+fd argument. The kernel resolves bytes from the faulting VMA's own
+`vm_file + vm_pgoff`, so it only avoids copies when that VMA is already backed
+by the memfd inode containing the bytes. It cannot populate a fresh CRIU-created
+memfd inode from a different streamer memfd without some separate page-cache
+clone or byte copy.
+
 ## Key Design Concepts
 
 ### The Restore Stage Barrier
@@ -263,6 +297,31 @@ server rejects O_DIRECT at read time (Azure NFS accepts `F_SETFL` but returns
 
 `bool use_direct` is cached in `struct page_read` to avoid a `fcntl(F_GETFL)`
 syscall per page read.
+
+**Same-host warm-cache regression (CRIU #3053).** When dump and restore run on
+the same host, O_DIRECT restore is *slower*, not faster: dump writes
+`pages-N.img` buffered (`page-xfer.c` `write_pages_loc`), leaving the data dirty
+in the page cache; restore reopens the same inode and flips the fd to O_DIRECT
+(`probe_pages_o_direct`, `pagemap.c:803`), which bypasses that warm cache and
+forces disk reads. Measured on `maps04`: buffered ~1.24s vs O_DIRECT ~8.3s
+(~6.7×); `fsync` before the O_DIRECT read does not help (it is a cache-bypass,
+not a writeback stall). Keep O_DIRECT for the cold cross-host/NVMe case but
+prefer buffered + AIO when the image was just written on the same host.
+
+**Fix (upstream PR #3066).** O_DIRECT is now opt-in via an `--image-io-mode`
+option (renamed from `--cache`) that applies to both dump and restore, over CLI
+or RPC: `--image-io-mode=writeback` (default) = buffered, byte-for-byte the
+pre-#3022 behavior; `--image-io-mode=direct` = O_DIRECT on both dump write and
+restore read. The restore side gates at the probe's *callers*
+(`open_page_read_at()` and the vma-io builder in `mem.c`), not inside
+`probe_pages_o_direct_read` itself. The dump side sets O_DIRECT on the
+pages-image fd so the existing `splice()` in `write_pages_loc()` does zero-copy
+direct I/O (`iter_file_splice_write` → `->write_iter` honors O_DIRECT on
+ext4/xfs — this is *not* a 6.5-only feature; the 6.5 `ITER_PIPE` work was the
+splice *read* path); a filesystem that can't do it returns `EFAULT`/`EINVAL`,
+which triggers a buffered fallback. No bounce buffer and no kernel-version
+check (the earlier `write_pages_o_direct` / `probe_pages_o_direct_write` bounce
+buffer was deleted per avagin's review). Pushed as `d858d2503`.
 
 ### `open_path` Locking (`criu/files-reg.c`)
 

@@ -168,6 +168,28 @@ struct task_restore_args {
 	struct restore_vma_io *vma_ios;
 	unsigned int vma_ios_n;
 
+	/*
+	 * Stream-mode (Pipeline C) fields. When stream_restore is off,
+	 * streamer_private_pages_fd is -1 and the PIE restorer falls back
+	 * to the existing pages-{N}.img + AIO path via vma_ios_fd. When set,
+	 * it points at a scratch memfd that the streamer fills in parallel
+	 * with PIE setup; PIE must futex_wait on streamer_private_ready_futex
+	 * before consuming each vma_ios[i].
+	 */
+	int streamer_private_pages_fd;
+	unsigned int *streamer_private_ready_futex;
+	unsigned int streamer_private_ready_futex_n;
+
+	/*
+	 * Pipe-per-memfd async-overlap signal (Plan v4). When ≥ 0, PIE reads
+	 * one byte from this pipe before issuing io_submit, blocking until
+	 * the streamer either writes '1' (memfd filled) or closes the pipe
+	 * (abort → reader EOF). Streamer fills the memfd in parallel with
+	 * CRIU C prep + PIE setup. -1 means sync mode (legacy 'A' ack on
+	 * private socket already gated prepare_vma_ios return).
+	 */
+	int streamer_ready_pipe_fd;
+
 	struct restore_posix_timer *posix_timers;
 	unsigned int posix_timers_n;
 	bool posix_timer_cr_ids;

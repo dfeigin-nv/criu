@@ -432,6 +432,14 @@ void init_opts(void)
 	opts.file_validation_method = FILE_VALIDATION_DEFAULT;
 	opts.network_lock_method = NETWORK_LOCK_DEFAULT;
 	opts.ghost_fiemap = FIEMAP_DEFAULT;
+
+	/*
+	 * stream-restore-async defaults ON: Pipeline C streamer hands the memfd
+	 * over and acks immediately, overlapping the S3 download with CRIU's
+	 * post-handover prep work. Kill switch: --no-stream-restore-async or
+	 * STREAM_RESTORE_ASYNC=0 env (consumed in mem.c).
+	 */
+	opts.stream_restore_async = 1;
 }
 
 bool deprecated_ok(char *what)
@@ -687,6 +695,8 @@ int parse_options(int argc, char **argv, bool *usage_error, bool *has_exec_cmd, 
 		{ "verbosity", optional_argument, 0, 'v' },
 		{ "ps-socket", required_argument, 0, 1091 },
 		BOOL_OPT("stream", &opts.stream),
+		BOOL_OPT("stream-restore", &opts.stream_restore),
+		BOOL_OPT("stream-restore-async", &opts.stream_restore_async),
 		{ "config", required_argument, 0, 1089 },
 		{ "no-default-config", no_argument, 0, 1090 },
 		{ "tls-cacert", required_argument, 0, 1092 },

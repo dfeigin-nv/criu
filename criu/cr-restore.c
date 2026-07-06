@@ -1725,12 +1725,19 @@ static int attach_to_tasks(bool root_seized)
 		if (!task_alive(item))
 			continue;
 
-		if (item->nr_threads == 1) {
-			item->threads[0].real = item->pid->real;
-		} else {
-			if (parse_threads(item->pid->real, &item->threads, &item->nr_threads))
-				return -1;
-		}
+		/* Parse threads for ptrace attach */
+		if (parse_threads(item->pid->real, &item->threads, &item->nr_threads))
+			return -1;
+
+		/*
+		 * nr_threads must equal nr_threads_image: all pthread workers
+		 * from open_vmas are joined before sigreturn_restore(), which
+		 * decrements the RESTORE stage counter. The coordinator only
+		 * reaches attach_to_tasks() after that counter hits zero.
+		 * core[] and rseqe[] are sized by nr_threads_image; a mismatch
+		 * here means something broke that ordering guarantee.
+		 */
+		BUG_ON(item->nr_threads != item->nr_threads_image);
 
 		for (i = 0; i < item->nr_threads; i++) {
 			pid_t pid = item->threads[i].real;
@@ -1765,7 +1772,8 @@ static int attach_to_tasks(bool root_seized)
 				pr_perror("Unable to set PTRACE_O_TRACESYSGOOD for %d", pid);
 				return -1;
 			}
-			if (arch_ptrace_restore(pid, item))
+			/* Only restore regs for image threads; workers have no core */
+			if (i < item->nr_threads_image && arch_ptrace_restore(pid, item))
 				return -1;
 			/*
 			 * Suspend seccomp if necessary. We need to do this because
@@ -1797,16 +1805,8 @@ static int restore_rseq_cs(void)
 		if (!task_alive(item))
 			continue;
 
-		if (item->nr_threads == 1) {
-			item->threads[0].real = item->pid->real;
-		} else {
-			if (parse_threads(item->pid->real, &item->threads, &item->nr_threads)) {
-				pr_err("restore_rseq_cs: parse_threads failed\n");
-				return -1;
-			}
-		}
-
-		for (i = 0; i < item->nr_threads; i++) {
+		/* threads[] populated by attach_to_tasks; no re-parse needed */
+		for (i = 0; i < item->nr_threads_image; i++) {
 			pid_t pid = item->threads[i].real;
 			struct rst_rseq *rseqe = rsti(item)->rseqe;
 
@@ -1938,11 +1938,22 @@ static int finalize_restore_detach(void)
 				continue;
 			}
 
-			if (arch_set_thread_regs_nosigrt(&item->threads[i])) {
-				pr_perror("Restoring regs for %d failed", pid);
-				return -1;
+			/* Restore regs for image threads only */
+			if (i < item->nr_threads_image) {
+				if (arch_set_thread_regs_nosigrt(&item->threads[i])) {
+					if (errno == ESRCH) {
+						pr_warn("Thread %d already exited, skipping\n", pid);
+						continue;
+					}
+					pr_perror("Restoring regs for %d failed", pid);
+					return -1;
+				}
 			}
 			if (ptrace(PTRACE_DETACH, pid, NULL, 0)) {
+				if (errno == ESRCH) {
+					pr_warn("Thread %d already exited, skipping detach\n", pid);
+					continue;
+				}
 				pr_perror("Unable to detach %d", pid);
 				return -1;
 			}
@@ -2394,12 +2405,70 @@ int prepare_dummy_task_state(struct pstree_item *pi)
 	return 0;
 }
 
+extern mutex_t *streamer_private_sock_lock;
+extern mutex_t *streamer_shmem_sock_lock;
+
 int cr_restore_tasks(void)
 {
 	int ret = -1;
 
 	if (init_service_fd())
 		return 1;
+
+	/*
+	 * Pipeline C: the agent passes an inherited Unix-socket fd via
+	 * CRIU_STREAMER_PRIVATE_SOCK. Move it into the service-fd slot so
+	 * close_old_fds() (called per-task after fork) leaves it alone;
+	 * mem.c:recv_streamer_private_fds will retrieve it from the slot.
+	 *
+	 * Allocate a shmalloc'd mutex_t that all forked tasks serialize on
+	 * around the write(id)+recv_fds(memfd)+read(ack) trio. The socket
+	 * is a single shared SOCK_STREAM endpoint inherited by every task;
+	 * without a cross-process lock, concurrent task writes interleave
+	 * and recv_fds pulls the wrong SCM_RIGHTS payload (errno=ENOENT).
+	 */
+	if (opts.stream_restore) {
+		const char *env = getenv("CRIU_STREAMER_PRIVATE_SOCK");
+		if (env) {
+			int fd = atoi(env);
+			if (fd >= 0) {
+				if (install_service_fd(STREAM_PRIVATE_SK_OFF, fd) < 0) {
+					pr_err("Failed to install streamer private sock as service fd\n");
+					return -1;
+				}
+			}
+		}
+		streamer_private_sock_lock = shmalloc(sizeof(mutex_t));
+		if (!streamer_private_sock_lock) {
+			pr_err("Failed to shmalloc streamer private sock lock\n");
+			return -1;
+		}
+		mutex_init(streamer_private_sock_lock);
+
+		/*
+		 * Stage 2c: a parallel side channel for shmem memfds. open_shmem
+		 * sends 8-byte shmid LE and recvs SCM_RIGHTS(memfd). No ack — the
+		 * streamer fills asynchronously; the daemon-side UFFD CONTINUE
+		 * path gates visibility via streamer_ready_futex. Optional: when
+		 * unset (private-only restore), the slot stays uninstalled.
+		 */
+		env = getenv("CRIU_STREAMER_SHMEM_SOCK");
+		if (env) {
+			int fd = atoi(env);
+			if (fd >= 0) {
+				if (install_service_fd(STREAM_SHMEM_SK_OFF, fd) < 0) {
+					pr_err("Failed to install streamer shmem sock as service fd\n");
+					return -1;
+				}
+			}
+			streamer_shmem_sock_lock = shmalloc(sizeof(mutex_t));
+			if (!streamer_shmem_sock_lock) {
+				pr_err("Failed to shmalloc streamer shmem sock lock\n");
+				return -1;
+			}
+			mutex_init(streamer_shmem_sock_lock);
+		}
+	}
 
 	if (check_img_inventory(/* restore = */ true) < 0)
 		return -1;

@@ -2552,7 +2552,6 @@ int parse_threads(int pid, struct pid **_t, int *_n)
 	while ((de = readdir(dir))) {
 		struct pid *tmp;
 
-		/* We expect numbers only here */
 		if (de->d_name[0] == '.')
 			continue;
 

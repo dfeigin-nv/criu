@@ -1083,7 +1083,8 @@ static void rst_tcp_socks_all(struct task_restore_args *ta)
 		rst_tcp_repair_off(&ta->tcp_socks[i]);
 }
 
-static int enable_uffd(int uffd, unsigned long addr, unsigned long len)
+static int enable_uffd(int uffd, unsigned long addr, unsigned long len,
+		       unsigned long mode)
 {
 	int rc;
 	struct uffdio_register uffdio_register;
@@ -1098,9 +1099,9 @@ static int enable_uffd(int uffd, unsigned long addr, unsigned long len)
 
 	uffdio_register.range.start = addr;
 	uffdio_register.range.len = len;
-	uffdio_register.mode = UFFDIO_REGISTER_MODE_MISSING;
+	uffdio_register.mode = mode;
 
-	pr_info("lazy-pages: register: %lx, len %lx\n", addr, len);
+	pr_info("lazy-pages: register: %lx, len %lx, mode %lx\n", addr, len, mode);
 
 	rc = sys_ioctl(uffd, UFFDIO_REGISTER, (unsigned long)&uffdio_register);
 	if (rc != 0) {
@@ -1108,10 +1109,21 @@ static int enable_uffd(int uffd, unsigned long addr, unsigned long len)
 		return -1;
 	}
 
-	expected_ioctls = (1 << _UFFDIO_WAKE) | (1 << _UFFDIO_COPY) | (1 << _UFFDIO_ZEROPAGE);
+	/*
+	 * Expected ioctls depend on the registration mode. MISSING-mode
+	 * faults are serviced via UFFDIO_COPY/UFFDIO_ZEROPAGE; MINOR-mode
+	 * faults are serviced via UFFDIO_CONTINUE (Pipeline C). In either
+	 * case UFFDIO_WAKE must be supported on the range.
+	 */
+	if (mode & UFFDIO_REGISTER_MODE_MINOR)
+		expected_ioctls = (1 << _UFFDIO_WAKE) | (1 << _UFFDIO_CONTINUE);
+	else
+		expected_ioctls = (1 << _UFFDIO_WAKE) | (1 << _UFFDIO_COPY) |
+				  (1 << _UFFDIO_ZEROPAGE);
 
 	if ((uffdio_register.ioctls & expected_ioctls) != expected_ioctls) {
-		pr_err("lazy-pages: unexpected missing uffd ioctl for anon memory\n");
+		pr_err("lazy-pages: unexpected missing uffd ioctl for range %lx (mode %lx)\n",
+		       addr, mode);
 	}
 
 	return 0;
@@ -1216,7 +1228,7 @@ static int vma_remap(VmaEntry *vma_entry, int uffd)
 	 * injected via userfaultfd.
 	 */
 	if (vma_entry_can_be_lazy(vma_entry))
-		if (enable_uffd(uffd, dst, len) != 0)
+		if (enable_uffd(uffd, dst, len, UFFDIO_REGISTER_MODE_MISSING) != 0)
 			return -1;
 
 	return 0;
@@ -1586,37 +1598,39 @@ static int fd_poll(int inotify_fd)
 }
 
 /*
- * Call preadv() but limit size of the read. Zero `max_to_read` skips the limit.
+ * Advance restore_vma_io by 'res' bytes consumed. Updates rio in place.
+ * Returns the new (iov_ptr, nr_iovs) for resubmission, or 0 if fully done.
+ * Used when AIO returns a short read (kernel MAX_RW_COUNT = 0x7FFFF000 limit).
  */
-static ssize_t preadv_limited(int fd, struct iovec *iovs, int nr, off_t offs, size_t max_to_read)
+static void advance_vma_io_retry(struct restore_vma_io *rio, ssize_t res,
+				 struct iovec **iov_out, unsigned int *nr_out)
 {
-	size_t saved_last_iov_len = 0;
-	ssize_t ret;
+	size_t remaining = (size_t)res;
+	unsigned int j = 0;
 
-	if (max_to_read) {
-		for (int i = 0; i < nr; ++i) {
-			if (iovs[i].iov_len <= max_to_read) {
-				max_to_read -= iovs[i].iov_len;
-				continue;
-			}
+	rio->off += (off_t)res;
 
-			if (!max_to_read) {
-				nr = i;
-				break;
-			}
-
-			saved_last_iov_len = iovs[i].iov_len;
-			iovs[i].iov_len = max_to_read;
-			nr = i + 1;
+	while (j < (unsigned int)rio->nr_iovs && remaining > 0) {
+		size_t len = (size_t)rio->iovs[j].iov_len;
+		if (len <= remaining) {
+			remaining -= len;
+			rio->iovs[j].iov_len = 0;
+			j++;
+		} else {
+			rio->iovs[j].iov_base = (char *)rio->iovs[j].iov_base + remaining;
+			rio->iovs[j].iov_len = len - remaining;
+			remaining = 0;
 			break;
 		}
 	}
-
-	ret = sys_preadv(fd, iovs, nr, offs);
-	if (saved_last_iov_len)
-		iovs[nr - 1].iov_len = saved_last_iov_len;
-
-	return ret;
+	while (j < (unsigned int)rio->nr_iovs && rio->iovs[j].iov_len == 0)
+		j++;
+	*nr_out = 0;
+	for (unsigned int k = j; k < (unsigned int)rio->nr_iovs; k++) {
+		if (rio->iovs[k].iov_len > 0)
+			(*nr_out)++;
+	}
+	*iov_out = (j < (unsigned int)rio->nr_iovs) ? &rio->iovs[j] : NULL;
 }
 
 /*
@@ -1875,6 +1889,49 @@ __visible long __export_restore_task(struct task_restore_args *args)
 		goto core_restore_end;
 	}
 
+	/*
+	 * Pipeline C (stream-restore): before the uffd is closed below,
+	 * walk the VMA table and UFFDIO_REGISTER each memfd-backed shmem
+	 * mapping with MODE_MINOR. This lets the daemon (criu/uffd.c)
+	 * install streamer-filled bytes via UFFDIO_CONTINUE when the
+	 * restored process touches the page.
+	 *
+	 * Predicate: VMA_ANON_SHARED && fd != -1 — matches the existing
+	 * line-889 test in restore_mapping() that drops MAP_ANONYMOUS for
+	 * file-backed shared mappings, i.e. the exact set whose backing
+	 * memfd is created+ftruncated by CRIU before PIE runs and (in
+	 * stream mode, per commit 3) left unfilled for the streamer to
+	 * fill asynchronously.
+	 *
+	 * VMA_FILE_SHARED (real file-backed) deliberately NOT included —
+	 * those have a different fill path and would mis-route their
+	 * faults to the daemon. If P4c smoke surfaces over- or
+	 * under-classification (e.g. SysV shmem leaking into this
+	 * branch), tighten the predicate or add a capture-side flag.
+	 *
+	 * Gate: args->streamer_private_ready_futex — same single-source
+	 * runtime gate as commit 7. Default path stays byte-equivalent.
+	 */
+	if (args->streamer_private_ready_futex && args->uffd > -1) {
+		for (i = 0; i < args->vmas_n; i++) {
+			VmaEntry *e = args->vmas + i;
+			unsigned long len;
+
+			if (!vma_entry_is(e, VMA_ANON_SHARED))
+				continue;
+			if (e->fd == -1UL)
+				continue;
+
+			len = vma_entry_len(e);
+			if (enable_uffd(args->uffd, e->start, len,
+					UFFDIO_REGISTER_MODE_MINOR) != 0) {
+				pr_err("stream: MINOR register %"PRIx64" len %lx failed\n",
+				       e->start, len);
+				goto core_restore_end;
+			}
+		}
+	}
+
 	if (args->uffd > -1) {
 		pr_debug("lazy-pages: closing uffd %d\n", args->uffd);
 		/*
@@ -1906,66 +1963,325 @@ __visible long __export_restore_task(struct task_restore_args *args)
 	}
 
 	/*
-	 * Now read the contents (if any)
+	 * Now read the contents (if any).
+	 * Use Native AIO (io_submit + O_DIRECT) for high-throughput page reads.
+	 * Handles short reads (MAX_RW_COUNT 0x7FFFF000) by advancing and resubmitting.
 	 */
+	if (args->vma_ios_n > 0 && args->vma_ios_fd != -1) {
+		size_t vma_restore_len = 0;
+		struct timeval tv0, tv1;
+		unsigned int n = args->vma_ios_n;
+		int fd = args->vma_ios_fd;
+		aio_context_t aio_ctx = 0;
+		long aio_ret;
+		struct iocb *iocbs;
+		struct iocb **iocbps;
+		struct restore_vma_io **rio_ptrs;
+		struct io_event *events;
+		unsigned long alloc_sz;
+		unsigned int submitted = 0, completed = 0;
 
-	rio = args->vma_ios;
-	for (i = 0; i < args->vma_ios_n; i++) {
-		struct iovec *iovs = rio->iovs;
-		int nr = rio->nr_iovs;
-		ssize_t r;
+#define AIO_BATCH 128
 
-		while (nr) {
-			pr_debug("Preadv %lx:%d... (%d iovs)\n", (unsigned long)iovs->iov_base, (int)iovs->iov_len, nr);
-			/*
-			 * If we're requested to punch holes in the file after reading we do
-			 * it to save memory. Limit the reads then to an arbitrary block size.
-			 */
-			r = preadv_limited(args->vma_ios_fd, iovs, nr, rio->off,
-					   args->auto_dedup ? AUTO_DEDUP_OVERHEAD_BYTES : 0);
-			if (r < 0) {
-				pr_err("Can't read pages data (%d)\n", (int)r);
+		sys_gettimeofday(&tv0, NULL);
+
+		/*
+		 * Pipeline C async overlap (Plan v4): if the streamer handed
+		 * back a ready-pipe fd, block here until the streamer has
+		 * fully filled the scratch memfd. One-byte read; reader EOF
+		 * (writer-side close) indicates streamer abort → bail before
+		 * touching unfilled memfd pages.
+		 *
+		 * Sync mode left streamer_ready_pipe_fd = -1; recv_streamer_
+		 * private_fd already gated on the streamer's 'A' ack so the
+		 * memfd was complete by the time we got here. No-op in that
+		 * mode.
+		 */
+		if (args->streamer_ready_pipe_fd >= 0) {
+			char ready_byte = 0;
+			long rd = sys_read(args->streamer_ready_pipe_fd,
+					   &ready_byte, 1);
+
+			if (rd != 1) {
+				pr_err("stream: ready-pipe read returned %ld (fd=%d)\n",
+				       rd, args->streamer_ready_pipe_fd);
+				sys_close(args->streamer_ready_pipe_fd);
 				goto core_restore_end;
 			}
-
-			if (r == 0) {
-				pr_err("Unexpected EOF reading pages data at offset %ld (%d iovs remaining)\n",
-				       (long)rio->off, nr);
-				goto core_restore_end;
-			}
-
-			pr_debug("`- returned %ld\n", (long)r);
-			/* If the file is open for writing, then it means we should punch holes
-			 * in it. */
-			if (r > 0 && args->auto_dedup) {
-				int fr = sys_fallocate(args->vma_ios_fd, FALLOC_FL_KEEP_SIZE | FALLOC_FL_PUNCH_HOLE,
-						       rio->off, r);
-				if (fr < 0) {
-					pr_debug("Failed to punch holes with fallocate: %d\n", fr);
-				}
-			}
-			rio->off += r;
-			/* Advance the iovecs */
-			do {
-				if (iovs->iov_len <= r) {
-					pr_debug("   `- skip pagemap\n");
-					r -= iovs->iov_len;
-					iovs++;
-					nr--;
-					continue;
-				}
-
-				iovs->iov_base += r;
-				iovs->iov_len -= r;
-				break;
-			} while (nr > 0);
+			sys_close(args->streamer_ready_pipe_fd);
 		}
 
-		rio = ((void *)rio) + RIO_SIZE(rio->nr_iovs);
-	}
+		/*
+		 * Stream-restore zero-copy fast path. When vma_ios_fd is the
+		 * streamer's memfd (opts.stream_restore on), replace each
+		 * pagemap range's anon mapping with MAP_PRIVATE|MAP_FIXED on
+		 * the memfd at the matching file offset. Pages stay shared
+		 * with the streamer's page cache via CoW; first write triggers
+		 * a per-page copy, but for read-mostly workloads (model
+		 * weights) the copy never happens. Eliminates the io_submit
+		 * memcpy ceiling (~16 Gbps on AWS A100) on the critical path.
+		 *
+		 * Discriminator: streamer_private_pages_fd >= 0. Default
+		 * (non-stream) restores keep the AIO path below.
+		 */
+		if (args->streamer_private_pages_fd >= 0) {
+			struct restore_vma_io *zr = args->vma_ios;
+			unsigned int zc_n = args->vma_ios_n;
+			int zc_fd = args->vma_ios_fd;
+			unsigned int zi;
+			struct timeval ztv0, ztv1;
+			size_t zc_total = 0;
 
-	if (args->vma_ios_fd != -1)
-		sys_close(args->vma_ios_fd);
+			sys_gettimeofday(&ztv0, NULL);
+			for (zi = 0; zi < zc_n; zi++) {
+				off_t cur_off = zr->off;
+				int zj;
+				for (zj = 0; zj < zr->nr_iovs; zj++) {
+					unsigned long va = (unsigned long)zr->iovs[zj].iov_base;
+					size_t len = zr->iovs[zj].iov_len;
+					unsigned long m;
+
+					m = sys_mmap((void *)va, len,
+						     PROT_READ | PROT_WRITE,
+						     MAP_PRIVATE | MAP_FIXED,
+						     zc_fd, cur_off);
+					if (IS_ERR_VALUE(m) || m != va) {
+						pr_err("stream-zcopy: mmap vaddr=%lx len=%lx off=%lx failed: %ld\n",
+						       va, (unsigned long)len,
+						       (unsigned long)cur_off,
+						       IS_ERR_VALUE(m) ? (long)m : 0L);
+						sys_close(zc_fd);
+						args->vma_ios_fd = -1;
+						goto core_restore_end;
+					}
+					cur_off += len;
+					zc_total += len;
+				}
+				zr = (struct restore_vma_io *)((void *)zr +
+							       RIO_SIZE(zr->nr_iovs));
+			}
+			sys_gettimeofday(&ztv1, NULL);
+			pr_info("VMA restore stream-zcopy %lu ms (range %zu MiB, %u ios)\n",
+				(unsigned long)((ztv1.tv_sec - ztv0.tv_sec) * 1000 +
+						(ztv1.tv_usec - ztv0.tv_usec) / 1000),
+				zc_total / (1024 * 1024), zc_n);
+			sys_close(zc_fd);
+			args->vma_ios_fd = -1;
+			goto skip_aio_block;
+		}
+
+		/* Compute total range for logging */
+		{
+			struct restore_vma_io *r = args->vma_ios;
+			unsigned int k;
+			off_t first_off = r->off, last_end = r->off;
+
+			for (k = 0; k < n; k++) {
+				size_t rio_len = 0;
+				for (int j = 0; j < r->nr_iovs; j++)
+					rio_len += (size_t)r->iovs[j].iov_len;
+				if (r->off < first_off)
+					first_off = r->off;
+				if ((off_t)(r->off + (off_t)rio_len) > last_end)
+					last_end = (off_t)(r->off + (off_t)rio_len);
+				r = (struct restore_vma_io *)((void *)r + RIO_SIZE(r->nr_iovs));
+			}
+			vma_restore_len = (size_t)(last_end - first_off);
+		}
+
+		aio_ret = sys_io_setup(AIO_BATCH, &aio_ctx);
+		if (aio_ret < 0) {
+			pr_err("io_setup(%d) failed: %ld\n", AIO_BATCH, aio_ret);
+			goto core_restore_end;
+		}
+
+		alloc_sz = n * sizeof(struct iocb)
+			 + n * sizeof(struct iocb *)
+			 + n * sizeof(struct restore_vma_io *)
+			 + AIO_BATCH * sizeof(struct io_event);
+		iocbs = (void *)sys_mmap(NULL, alloc_sz, PROT_READ | PROT_WRITE,
+					 MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+		if (IS_ERR(iocbs)) {
+			pr_err("Can't mmap AIO buffers: %ld\n", PTR_ERR(iocbs));
+			sys_io_destroy(aio_ctx);
+			goto core_restore_end;
+		}
+		iocbps = (struct iocb **)((void *)iocbs + n * sizeof(struct iocb));
+		rio_ptrs = (struct restore_vma_io **)((void *)iocbps + n * sizeof(struct iocb *));
+		events = (struct io_event *)((void *)rio_ptrs + n * sizeof(struct restore_vma_io *));
+
+		/* Build all iocbs from vma_ios */
+		rio = args->vma_ios;
+		for (i = 0; i < (int)n; i++) {
+			struct iocb *cb = &iocbs[i];
+			size_t expected = 0;
+
+			for (int j = 0; j < rio->nr_iovs; j++)
+				expected += rio->iovs[j].iov_len;
+
+			memset(cb, 0, sizeof(*cb));
+			cb->aio_fildes = fd;
+			cb->aio_lio_opcode = IOCB_CMD_PREADV;
+			cb->aio_buf = (unsigned long)rio->iovs;
+			cb->aio_nbytes = rio->nr_iovs;
+			cb->aio_offset = rio->off;
+			cb->aio_data = expected;
+			iocbps[i] = cb;
+			rio_ptrs[i] = rio;
+
+			rio = (void *)rio + RIO_SIZE(rio->nr_iovs);
+		}
+
+		/* Submit and reap in batches */
+		while (submitted < n || completed < n) {
+			while (submitted < n && (submitted - completed) < AIO_BATCH) {
+				unsigned int batch = n - submitted;
+				if (batch > AIO_BATCH - (submitted - completed))
+					batch = AIO_BATCH - (submitted - completed);
+				/*
+				 * Stream-restore (Pipeline C): the streamer fills
+				 * the scratch memfd in parallel with PIE setup, one
+				 * pagemap range per vma_ios[] entry. Each range gets
+				 * a futex word that the daemon flips to 1 when the
+				 * range is ready, or to 0xFFFFFFFFu on streamer abort
+				 * (handled in criu/uffd.c). Block here until the next
+				 * range we'd submit is marked ready; abort the whole
+				 * AIO loop if the streamer poisoned the futex.
+				 *
+				 * iocbps[submitted] was built 1:1 with
+				 * args->vma_ios[submitted] in the loop above, so the
+				 * submission index doubles as the futex index.
+				 */
+				if (args->streamer_private_ready_futex) {
+					unsigned int idx = submitted;
+					unsigned int *fut =
+						&args->streamer_private_ready_futex[idx];
+
+					for (;;) {
+						unsigned int v = __atomic_load_n(
+							fut, __ATOMIC_ACQUIRE);
+						if (v == 1)
+							break;
+						if (v == 0xFFFFFFFFu) {
+							pr_err("stream: streamer aborted at idx %u\n",
+							       idx);
+							goto aio_error;
+						}
+						sys_futex(fut, FUTEX_WAIT, 0, NULL,
+							  NULL, 0);
+					}
+				}
+				aio_ret = sys_io_submit(aio_ctx, batch, &iocbps[submitted]);
+				if (aio_ret <= 0) {
+					pr_err("io_submit failed: %ld (submitted %u/%u)\n",
+					       aio_ret, submitted, n);
+					goto aio_error;
+				}
+				submitted += aio_ret;
+			}
+
+			if (completed < n) {
+				/* min_nr=1 to block until at least one event; nr=AIO_BATCH to reap all (incl. retries) */
+				aio_ret = sys_io_getevents(aio_ctx, 1, AIO_BATCH, events, NULL);
+				if (aio_ret <= 0) {
+					pr_err("io_getevents failed: %ld\n", aio_ret);
+					goto aio_error;
+				}
+				for (long k = 0; k < aio_ret; k++) {
+					if (events[k].res < 0) {
+						pr_err("AIO read failed: %lld\n",
+						       events[k].res);
+						goto aio_error;
+					}
+					{
+						struct iocb *cb = (struct iocb *)(unsigned long)events[k].obj;
+
+						if (args->auto_dedup && events[k].res > 0)
+							sys_fallocate(fd,
+								      FALLOC_FL_KEEP_SIZE | FALLOC_FL_PUNCH_HOLE,
+								      (off_t)cb->aio_offset, (off_t)events[k].res);
+					}
+					if ((__u64)events[k].res == events[k].data) {
+						completed++;
+						continue;
+					}
+					/* Short read (e.g. MAX_RW_COUNT 0x7FFFF000): advance and retry */
+					if (events[k].res == 0) {
+						pr_err("AIO zero read (expected %llu)\n",
+						       events[k].data);
+						goto aio_error;
+					}
+					{
+						struct iocb *cb = (struct iocb *)(unsigned long)events[k].obj;
+						unsigned int idx = cb - iocbs;
+						struct restore_vma_io *r = rio_ptrs[idx];
+						struct iovec *iov_next;
+						unsigned int nr_next;
+
+						advance_vma_io_retry(r, events[k].res,
+								   &iov_next, &nr_next);
+						if (!iov_next || nr_next == 0) {
+							completed++;
+							continue;
+						}
+						cb->aio_buf = (unsigned long)iov_next;
+						cb->aio_nbytes = nr_next;
+						cb->aio_offset = r->off;
+						cb->aio_data -= (__u64)events[k].res;
+						/*
+						 * In stream-restore mode, the range's
+						 * futex word was already 1 when the
+						 * original submit went through. Re-check
+						 * for the abort sentinel only — no need
+						 * to wait, since the range data is on
+						 * the memfd already. If the streamer
+						 * aborted between submit and reap, fail
+						 * the AIO loop instead of looping forever.
+						 */
+						if (args->streamer_private_ready_futex) {
+							unsigned int *fut =
+								&args->streamer_private_ready_futex[idx];
+							unsigned int v = __atomic_load_n(
+								fut, __ATOMIC_ACQUIRE);
+							if (v == 0xFFFFFFFFu) {
+								pr_err("stream: streamer aborted at idx %u during retry\n",
+								       idx);
+								goto aio_error;
+							}
+						}
+						{
+							long ret2 = sys_io_submit(aio_ctx, 1, &cb);
+							if (ret2 != 1) {
+								pr_err("AIO retry submit failed: %ld\n",
+								       ret2);
+								goto aio_error;
+							}
+						}
+					}
+				}
+			}
+		}
+
+		goto aio_done;
+	aio_error:
+		sys_io_destroy(aio_ctx);
+		sys_munmap(iocbs, alloc_sz);
+		sys_close(fd);
+		args->vma_ios_fd = -1;
+		goto core_restore_end;
+	aio_done:
+		sys_io_destroy(aio_ctx);
+		sys_munmap(iocbs, alloc_sz);
+		sys_gettimeofday(&tv1, NULL);
+		pr_info("VMA restore AIO %lu ms (range %zu MiB, %u ios)\n",
+			(unsigned long)((tv1.tv_sec - tv0.tv_sec) * 1000 + (tv1.tv_usec - tv0.tv_usec) / 1000),
+			vma_restore_len / (1024 * 1024), n);
+		sys_close(fd);
+		args->vma_ios_fd = -1;
+	skip_aio_block:
+		;
+#undef AIO_BATCH
+	}
 
 	/*
 	 * Proxify vDSO.

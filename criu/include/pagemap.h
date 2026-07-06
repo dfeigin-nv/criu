@@ -61,6 +61,11 @@ struct page_read {
 	/* Whether or not disable image deduplication*/
 	bool disable_dedup;
 
+	/* Whether O_DIRECT is active on the pages fd. Set once during
+	 * open_page_read_fd_at() after the NFS probe; never changes after
+	 * that. Cached here to avoid a fcntl(F_GETFL) syscall per page read. */
+	bool use_direct;
+
 	/* Private data of reader */
 	struct cr_img *pmi;
 	struct cr_img *pi;
@@ -75,6 +80,9 @@ struct page_read {
 	struct iovec bunch;   /* record consequent neighbour iovecs to punch together */
 	unsigned id;	      /* for logging */
 	unsigned long img_id; /* pagemap image file ID */
+	unsigned long direct_pages;
+	unsigned long direct_misaligned_pages;
+	unsigned long direct_misaligned_reads;
 
 	PagemapEntry **pmes;
 	int nr_pmes;

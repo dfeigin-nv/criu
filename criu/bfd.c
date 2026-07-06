@@ -6,6 +6,7 @@
 #include <fcntl.h>
 #include <sys/uio.h>
 #include <errno.h>
+#include <pthread.h>
 
 #include "int.h"
 #include "log.h"
@@ -31,6 +32,7 @@ struct bfd_buf {
 };
 
 static LIST_HEAD(bufs);
+static pthread_mutex_t bufs_lock = PTHREAD_MUTEX_INITIALIZER;
 
 #define BUFBATCH (16)
 
@@ -38,12 +40,15 @@ static int buf_get(struct xbuf *xb)
 {
 	struct bfd_buf *b;
 
+	pthread_mutex_lock(&bufs_lock);
+
 	if (list_empty(&bufs)) {
 		void *mem;
 		int i;
 
 		mem = mmap(NULL, BUFBATCH * BUFSIZE, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, 0, 0);
 		if (mem == MAP_FAILED) {
+			pthread_mutex_unlock(&bufs_lock);
 			pr_perror("No buf");
 			return -1;
 		}
@@ -52,6 +57,7 @@ static int buf_get(struct xbuf *xb)
 			b = xmalloc(sizeof(*b));
 			if (!b) {
 				if (i == 0) {
+					pthread_mutex_unlock(&bufs_lock);
 					pr_err("No buffer for bfd\n");
 					return -1;
 				}
@@ -72,6 +78,7 @@ static int buf_get(struct xbuf *xb)
 	xb->data = xb->mem;
 	xb->sz = 0;
 	xb->buf = b;
+	pthread_mutex_unlock(&bufs_lock);
 	return 0;
 }
 
@@ -81,7 +88,9 @@ static void buf_put(struct xbuf *xb)
 	 * Don't unmap buffer back, it will get reused
 	 * by next bfdopen call
 	 */
+	pthread_mutex_lock(&bufs_lock);
 	list_add(&xb->buf->l, &bufs);
+	pthread_mutex_unlock(&bufs_lock);
 	xb->buf = NULL;
 	xb->mem = NULL;
 	xb->data = NULL;

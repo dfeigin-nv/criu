@@ -22,7 +22,6 @@ struct reg_file_info {
 	struct file_desc d;
 	RegFileEntry *rfe;
 	struct file_remap *remap;
-	bool size_mode_checked;
 	bool is_dir;
 	char *path;
 };
@@ -40,6 +39,8 @@ extern struct file_remap *lookup_ghost_remap(u32 dev, u32 ino);
 extern struct file_desc *try_collect_special_file(u32 id, int optional);
 #define collect_special_file(id) try_collect_special_file(id, 0)
 extern int collect_filemap(struct vma_area *);
+/* Open one file for VMA (open_path path only; for parallel open_vmas). */
+extern int open_file_for_vma(struct vma_area *vma, u32 flags);
 extern void filemap_ctx_init(bool auto_close);
 extern void filemap_ctx_fini(void);
 

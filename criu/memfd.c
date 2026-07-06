@@ -19,9 +19,17 @@
 #include "namespaces.h"
 #include "shmem.h"
 #include "hugetlb.h"
+#include "cr_options.h"
+#include "servicefd.h"
 
 #include "protobuf.h"
 #include "images/memfd.pb-c.h"
+
+/* Pipeline C Stage 2c: defined in mem.c, used here to adopt the
+ * streamer-owned memfd as the backing inode for memfd-restored
+ * shmem so the lazy-pages daemon UFFDIO_CONTINUE-installs from the
+ * same shmem page cache the streamer fills. */
+extern int recv_streamer_shmem_memfd(uint64_t shmid, int *out_memfd);
 
 #define MEMFD_PREFIX	 "/memfd:"
 #define MEMFD_PREFIX_LEN (sizeof(MEMFD_PREFIX) - 1)
@@ -274,10 +282,26 @@ static int memfd_open_inode_nocache(struct memfd_restore_inode *inode)
 	if (mie->has_hugetlb_flag)
 		flags |= mie->hugetlb_flag;
 
-	fd = memfd_create(mie->name, flags);
-	if (fd < 0) {
-		pr_perror("Can't create memfd:%s", mie->name);
-		goto out;
+	/*
+	 * Stage 2c: adopt the streamer-owned memfd as the backing file so the
+	 * lazy-pages daemon's UFFDIO_CONTINUE installs page cache pages from
+	 * the same shmem inode the streamer fills. Hugetlb shmem is excluded
+	 * since UFFD MODE_MINOR doesn't support it; fall through to the normal
+	 * memfd_create + restore_memfd_shmem_content path in that case.
+	 */
+	if (opts.stream_restore && !mie->has_hugetlb_flag &&
+	    get_service_fd(STREAM_SHMEM_SK_OFF) >= 0) {
+		if (recv_streamer_shmem_memfd(mie->shmid, &fd) < 0) {
+			pr_err("Failed to recv shmem memfd from streamer for shmid=0x%lx\n",
+			       (unsigned long)mie->shmid);
+			goto out;
+		}
+	} else {
+		fd = memfd_create(mie->name, flags);
+		if (fd < 0) {
+			pr_perror("Can't create memfd:%s", mie->name);
+			goto out;
+		}
 	}
 
 	if (restore_memfd_shmem_content(fd, mie->shmid, mie->size))
@@ -321,6 +345,14 @@ static int memfd_open_inode(struct memfd_restore_inode *inode)
 	mutex_unlock(&inode->lock);
 
 	return fd;
+}
+
+void *memfd_inode_cookie(struct file_desc *d)
+{
+	struct memfd_info *mfi;
+
+	mfi = container_of(d, struct memfd_info, d);
+	return mfi->inode;
 }
 
 int memfd_open(struct file_desc *d, u32 *fdflags, bool filemap)
