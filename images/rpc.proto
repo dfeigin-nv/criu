@@ -148,15 +148,18 @@ message criu_opts {
 	/*
 	 * Memory page compression mode (enum compress_mode):
 	 *   0 = off, 1 = per-page, 2 = region. Default 0.
+	 * Tags remapped from upstream PR #2895's 72-75 to 75-78 to stay
+	 * consistent with the dfeigin-nv/go-criu fork, which already assigns
+	 * 72=stream_restore, 73=memfd_cache, 74=memfd_cache_id.
 	 */
-	optional uint32			compress		= 72;
-	optional uint32			compress_acceleration	= 73;
-	optional uint32			compress_region_size	= 74;
+	optional uint32			compress		= 75;
+	optional uint32			compress_acceleration	= 76;
+	optional uint32			compress_region_size	= 77;
 	/*
 	 * Number of worker threads used to decompress memory pages on
 	 * restore. 0 or 1 means serial decompression. Restore-time only.
 	 */
-	optional uint32			decompress_threads	= 75;
+	optional uint32			decompress_threads	= 78;
 /*	optional bool			check_mounts		= 128;	*/
 }
 
