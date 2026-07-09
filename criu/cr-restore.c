@@ -3593,6 +3593,9 @@ static int sigreturn_restore(pid_t pid, struct task_restore_args *task_args, uns
 	task_args->vdso_rt_size = vdso_rt_size;
 	task_args->can_map_vdso = kdat.can_map_vdso;
 	task_args->has_clone3_set_tid = kdat.has_clone3_set_tid;
+	task_args->downgrade_shared_memfd = (getenv("CRIU_DOWNGRADE_SHARED_MEMFD") != NULL);
+	if (task_args->downgrade_shared_memfd)
+		pr_info("stream/cache spike: memfd VMA_FILE_SHARED downgrade to MAP_PRIVATE enabled\n");
 
 	new_sp = restorer_stack(task_args->t->mz);
 

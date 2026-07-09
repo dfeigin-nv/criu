@@ -891,7 +891,7 @@ unsigned long arch_shmat(int shmid, void *shmaddr, int shmflg, unsigned long siz
 }
 #endif
 
-static unsigned long restore_mapping(VmaEntry *vma_entry)
+static unsigned long restore_mapping(VmaEntry *vma_entry, bool downgrade_shared_memfd)
 {
 	int prot = vma_entry->prot;
 	int flags = vma_entry->flags | MAP_FIXED;
@@ -930,6 +930,22 @@ static unsigned long restore_mapping(VmaEntry *vma_entry)
 	/* See comment in premap_private_vma() for this flag change */
 	if (vma_entry_is(vma_entry, VMA_AREA_AIORING))
 		flags |= MAP_ANONYMOUS;
+
+	/*
+	 * Spike: downgrade a memfd-backed shared mapping to MAP_PRIVATE.
+	 * The memfd content is already filled by the restore/cache path, so
+	 * a MAP_PRIVATE (CoW) mapping reads the same bytes while isolating
+	 * writes into per-process copies. prot already carries PROT_WRITE for
+	 * these RW weight VMAs, so CoW works on first write. Gated + limited
+	 * to fd-backed VMA_FILE_SHARED so default restores are unchanged.
+	 */
+	if (downgrade_shared_memfd && (vma_entry->fd != -1UL) && (flags & MAP_SHARED) &&
+	    vma_entry_is(vma_entry, VMA_FILE_SHARED)) {
+		flags &= ~MAP_SHARED;
+		flags |= MAP_PRIVATE;
+		pr_info("downgrade: memfd VMA %" PRIx64 "-%" PRIx64 " MAP_SHARED->MAP_PRIVATE\n",
+			vma_entry->start, vma_entry->end);
+	}
 
 	/* A mapping of file with MAP_SHARED is up to date */
 	if ((vma_entry->fd == -1 || !(vma_entry->flags & MAP_SHARED)) && !(vma_entry->status & VMA_NO_PROT_WRITE))
@@ -2243,7 +2259,7 @@ __visible long __export_restore_task(struct task_restore_args *args)
 		if (vma_entry_is(vma_entry, VMA_PREMMAPED))
 			continue;
 
-		va = restore_mapping(vma_entry);
+		va = restore_mapping(vma_entry, args->downgrade_shared_memfd);
 
 		if (va != vma_entry->start) {
 			pr_err("Can't restore %" PRIx64 " mapping with %lx\n", vma_entry->start, va);

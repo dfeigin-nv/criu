@@ -243,6 +243,17 @@ struct task_restore_args {
 	bool has_clone3_set_tid;
 
 	/*
+	 * Spike gate (CRIU_DOWNGRADE_SHARED_MEMFD): map memfd-backed
+	 * VMA_FILE_SHARED weight VMAs MAP_PRIVATE instead of MAP_SHARED.
+	 * The memfd is already content-filled, so MAP_PRIVATE gives
+	 * per-process CoW isolation (writes never reach the shared/cached
+	 * memfd) while clean pages stay physically shared. Safe only for
+	 * single-mapper memfds (vLLM weight pools). Default false =
+	 * byte-equivalent to the existing MAP_SHARED path.
+	 */
+	bool downgrade_shared_memfd;
+
+	/*
 	 * info about rseq from libc used to
 	 * unregister it before memory restoration procedure
 	 */
