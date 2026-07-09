@@ -289,6 +289,7 @@ int prepare_memfd_inodes(void)
 struct memfd_restore_data_job {
 	struct memfd_restore_inode *inode;
 	int fd;
+	int src_fd; /* copy-on-hit: cached master to copy from, else -1 (fill from image) */
 	bool failed;
 	int saved_errno;
 };
@@ -312,12 +313,17 @@ static int memfd_restore_data(void *arg)
 	MemfdInodeEntry *mie = j->inode->mie;
 	int ret;
 
-	ret = memfd_shmem_fill_content(j->fd, mie->shmid, mie->size);
+	if (j->src_fd >= 0)
+		ret = memfd_copy_content(j->fd, j->src_fd, mie->size);
+	else
+		ret = memfd_shmem_fill_content(j->fd, mie->shmid, mie->size);
 	if (ret < 0) {
 		j->saved_errno = errno;
 		j->failed = true;
 	}
 
+	if (j->src_fd >= 0)
+		close(j->src_fd);
 	close(j->fd);
 	return ret;
 }
@@ -349,6 +355,14 @@ int memfd_content_prepare(void)
 	const char *cache_id = NULL;
 	int cache_sock = -1;
 	int n = 0, i = 0;
+	/*
+	 * Copy-on-hit prototype: on a cache HIT, copy the cached master into a
+	 * fresh per-process memfd instead of sharing the borrowed fd. Each
+	 * restore gets its own writable copy, so cuda-checkpoint's weight
+	 * rewrite neither corrupts a shared cache fd nor triggers MAP_PRIVATE
+	 * CoW. Gated by CRIU_MEMFD_CACHE_COPY.
+	 */
+	bool copy_on_hit = (getenv("CRIU_MEMFD_CACHE_COPY") != NULL);
 
 	list_for_each_entry(inode, &memfd_inodes, list)
 		n++;
@@ -391,6 +405,48 @@ int memfd_content_prepare(void)
 
 			switch (memfd_cache_get(cache_sock, mie, cache_id, &cfd)) {
 			case MEMFD_CACHE_R_HIT:
+				if (copy_on_hit) {
+					/*
+					 * Copy the cached master into a fresh, unsealed,
+					 * per-process memfd. The worker does the memcpy in
+					 * parallel; perms_done stays false so memfd_open()
+					 * chowns it in the task userns. cuda-checkpoint can
+					 * then rewrite the pages in this private-to-the-pod
+					 * copy without corrupting the shared cache fd.
+					 */
+					int nfd = memfd_create(mie->name, 0);
+
+					if (nfd < 0) {
+						pr_perror("Can't create copy memfd:%s", mie->name);
+						close(cfd);
+						return -1;
+					}
+					if (memfd_shmem_set_size(nfd, mie->shmid, mie->size) < 0) {
+						close(nfd);
+						close(cfd);
+						return -1;
+					}
+					inode->fdstore_id = fdstore_add(nfd);
+					if (inode->fdstore_id < 0) {
+						close(nfd);
+						close(cfd);
+						return -1;
+					}
+					inode->pending_seals = 0;
+					j = &memfd_jobs[i];
+					j->inode = inode;
+					j->fd = nfd;
+					j->src_fd = cfd;
+					if (worker_pool_queue(memfd_restore_data, j) < 0) {
+						close(nfd);
+						close(cfd);
+						return -1;
+					}
+					i++;
+					pr_debug("Copy-on-hit memfd:%s (shmid %#lx)\n", mie->name,
+						 (unsigned long)mie->shmid);
+					continue;
+				}
 				inode->fdstore_id = fdstore_add(cfd);
 				close(cfd);
 				if (inode->fdstore_id < 0)
@@ -456,6 +512,7 @@ int memfd_content_prepare(void)
 		j = &memfd_jobs[i];
 		j->inode = inode;
 		j->fd = fd;
+		j->src_fd = -1;
 
 		if (worker_pool_queue(memfd_restore_data, j) < 0) {
 			close(fd);

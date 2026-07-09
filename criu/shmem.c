@@ -541,6 +541,38 @@ int memfd_shmem_set_size(int fd, unsigned long shmid, unsigned long size)
  * must have run memfd_shmem_set_size(fd, ...) first. Returns 0 on success,
  * -1 on failure.
  */
+/*
+ * Copy-on-hit prototype: fill dst_fd (a fresh per-process memfd) from src_fd
+ * (the node-local cached master) with a plain memcpy. Gives each restore its
+ * own writable copy so cuda-checkpoint can rewrite the weight pages without
+ * cross-pod corruption (MAP_SHARED share) or per-page CoW (MAP_PRIVATE). Runs
+ * on a coordinator worker thread; cross-memfd parallelism comes from the pool.
+ */
+int memfd_copy_content(int dst_fd, int src_fd, unsigned long size)
+{
+	void *s, *d;
+	int ret = 0;
+
+	if (size == 0)
+		return 0;
+
+	s = mmap(NULL, size, PROT_READ, MAP_SHARED, src_fd, 0);
+	if (s == MAP_FAILED) {
+		pr_perror("copy: can't mmap src size=%ld", size);
+		return -1;
+	}
+	d = mmap(NULL, size, PROT_WRITE | PROT_READ, MAP_SHARED, dst_fd, 0);
+	if (d == MAP_FAILED) {
+		pr_perror("copy: can't mmap dst size=%ld", size);
+		munmap(s, size);
+		return -1;
+	}
+	memcpy(d, s, size);
+	munmap(d, size);
+	munmap(s, size);
+	return ret;
+}
+
 int memfd_shmem_fill_content(int fd, unsigned long shmid, unsigned long size)
 {
 	void *addr;
