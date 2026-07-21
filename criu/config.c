@@ -716,7 +716,7 @@ int parse_options(int argc, char **argv, bool *usage_error, bool *has_exec_cmd, 
 		BOOL_OPT("skip-file-rwx-check", &opts.skip_file_rwx_check),
 		{ "lsm-mount-context", required_argument, 0, 1099 },
 		{ "network-lock", required_argument, 0, 1100 },
-		{ "image-io-mode", required_argument, 0, 1101 },
+		{ "image-io-mode", required_argument, 0, 1102 },
 		BOOL_OPT("mntns-compat-mode", &opts.mntns_compat_mode),
 		BOOL_OPT("memfd-cache", &opts.memfd_cache),
 		BOOL_OPT("memfd-cache-prime", &opts.memfd_cache_prime),
@@ -1067,7 +1067,7 @@ int parse_options(int argc, char **argv, bool *usage_error, bool *has_exec_cmd, 
 				return 1;
 			}
 			break;
-		case 1101:
+		case 1102:
 			if (parse_image_io_mode(&opts, optarg))
 				return 2;
 			break;
