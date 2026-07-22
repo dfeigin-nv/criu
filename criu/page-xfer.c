@@ -889,8 +889,12 @@ int open_page_xfer(struct page_xfer *xfer, int fd_type, unsigned long img_id)
 	 * image fd so write_pages_loc() splices with direct I/O. splice()
 	 * honors O_DIRECT on filesystems that support it and falls back to
 	 * buffered I/O otherwise; if fcntl() fails the fd stays buffered.
+	 *
+	 * Never with compression: write_pages_loc_compressed() writes
+	 * variable-length compressed blocks with write_fd_full() at unaligned
+	 * sizes and has no buffered fallback, so O_DIRECT would fail EINVAL.
 	 */
-	if (opts.image_io_mode == IMAGE_IO_DIRECT && !opts.stream)
+	if (opts.image_io_mode == IMAGE_IO_DIRECT && !opts.stream && !opts.compress_mode)
 		xfer->pi_use_direct = (set_o_direct(img_raw_fd(xfer->pi)) == 0);
 
 	return 0;

@@ -2018,26 +2018,6 @@ int open_page_read_at(int dfd, unsigned long img_id, struct page_read *pr, int p
 		return -1;
 	}
 
-	{
-		int pfd = img_raw_fd(pr->pi);
-
-		/*
-		 * Compressed pages are variable-length blocks read at
-		 * unaligned offsets, so O_DIRECT would fail with EINVAL;
-		 * keep such images on buffered I/O.
-		 */
-		if (pfd >= 0 && !opts.stream && opts.image_io_mode == IMAGE_IO_DIRECT &&
-		    !opts.compress_mode) {
-			int direct = probe_pages_o_direct(pfd);
-
-			if (direct < 0) {
-				close_page_read(pr);
-				return -1;
-			}
-			pr->use_direct = (direct == 1);
-		}
-	}
-
 	/*
 	 * Hint the kernel to use aggressive readahead on the pages
 	 * image. pread() does not advance the file offset, so the
@@ -2107,12 +2087,15 @@ int open_page_read_at(int dfd, unsigned long img_id, struct page_read *pr, int p
 	 * an uncompressed final dump), which is only known once the
 	 * pagemaps have been parsed -- hence the probe sits after
 	 * init_pagemaps() rather than right after the image is opened.
+	 *
+	 * O_DIRECT is opt-in via --image-io-mode=direct; gate on it so the
+	 * default (IMAGE_IO_WRITEBACK) never forces O_DIRECT (issue #3053).
 	 */
 	{
 		int pfd = img_raw_fd(pr->pi);
 
-		if (pfd >= 0 && !opts.stream && !opts.compress_mode &&
-		    !img_has_compressed) {
+		if (pfd >= 0 && !opts.stream && opts.image_io_mode == IMAGE_IO_DIRECT &&
+		    !opts.compress_mode && !img_has_compressed) {
 			int direct = probe_pages_o_direct(pfd);
 
 			if (direct < 0) {
