@@ -242,6 +242,10 @@ static int crtools_prepare_shared(void)
 	if (prepare_memfd_inodes())
 		return -1;
 
+	/* --memfd-cache-prime: fill+seal+donate the cache, then stop (no task tree). */
+	if (opts.memfd_cache_prime)
+		return memfd_content_prime();
+
 	if (prepare_files())
 		return -1;
 
@@ -2205,6 +2209,13 @@ skip_ns_bouncing:
 		goto out_kill;
 
 	/*
+	 * Donate the now-sealed memfds to the node-local cache so the next
+	 * restore of this checkpoint on this node borrows them. Best-effort,
+	 * a no-op unless the cache is active; it never fails the restore.
+	 */
+	memfd_content_donate();
+
+	/*
 	 * Zombies die after CR_STATE_PRE_RESTORER which is switched
 	 * by root task, not by us. See comment before CR_STATE_FORKING
 	 * in the header for details.
@@ -2482,6 +2493,12 @@ int cr_restore_tasks(void)
 
 	if (crtools_prepare_shared() < 0)
 		goto err;
+
+	if (opts.memfd_cache_prime) {
+		/* prime already filled+sealed+donated the cache; no tasks to restore. */
+		ret = 0;
+		goto err;
+	}
 
 	if (prepare_cgroup())
 		goto clean_cgroup;

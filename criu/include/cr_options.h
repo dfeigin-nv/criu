@@ -293,6 +293,21 @@ struct cr_options {
 	 * explicitly request it as it comes with many limitations.
 	 */
 	int unprivileged;
+
+	/*
+	 * Node-local memfd content cache (see memfd-cache.h). Enabled by the RPC
+	 * client (snapshot-agent); the cache socket fd rides the
+	 * CRIU_MEMFD_CACHE_SOCK env var, not this struct. memfd_cache_id scopes
+	 * the cache to one checkpoint image ("checkpointID:version").
+	 */
+	int memfd_cache;
+	char *memfd_cache_id;
+	/*
+	 * Eager cache primer mode: fill + seal + donate every memfd inode in the
+	 * image to the cache, then stop without restoring a task tree, so the
+	 * first real restore is also a cache hit. CLI-only (--memfd-cache-prime).
+	 */
+	int memfd_cache_prime;
 };
 
 extern struct cr_options opts;

@@ -19,6 +19,14 @@ extern struct collect_image_info memfd_cinfo;
 extern struct file_desc *collect_memfd(u32 id);
 extern int apply_memfd_seals(void);
 
+/*
+ * Node-local memfd cache: donate the sealed MISS fds to the cache server after
+ * apply_memfd_seals() (no-op unless the cache is active; never fails restore),
+ * and the eager primer (--memfd-cache-prime) that fills+seals+donates then bails.
+ */
+extern int memfd_content_donate(void);
+extern int memfd_content_prime(void);
+
 extern int prepare_memfd_inodes(void);
 
 #ifdef CONFIG_HAS_MEMFD_CREATE

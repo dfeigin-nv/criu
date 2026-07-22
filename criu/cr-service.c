@@ -523,6 +523,14 @@ static int setup_opts_from_req(int sk, CriuOpts *req)
 		opts.lazy_pages = req->lazy_pages;
 	}
 
+	if (req->has_memfd_cache)
+		opts.memfd_cache = req->memfd_cache;
+	if (req->memfd_cache_id) {
+		opts.memfd_cache_id = xstrdup(req->memfd_cache_id);
+		if (!opts.memfd_cache_id)
+			goto err;
+	}
+
 	if (req->has_pre_dump_mode) {
 		switch (req->pre_dump_mode) {
 		case CRIU_PRE_DUMP_MODE__SPLICE:

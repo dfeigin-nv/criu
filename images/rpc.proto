@@ -167,6 +167,13 @@ message criu_opts {
 	 * through 1024. Restore-time only.
 	 */
 	optional uint32			decompress_threads	= 76 [default = 1];
+	/*
+	 * Fork memfd-cache fields, renumbered from the fork's original 73/74
+	 * (now upstream compress/compress_acceleration) to 77/78. go-criu must
+	 * match these tags exactly. stream_restore lives only in go-criu at 79.
+	 */
+	optional bool			memfd_cache		= 77;	/* node-local memfd content cache: share sealed populated memfds across restores */
+	optional string			memfd_cache_id		= 78;	/* cache scope key "checkpointID:version" */
 /*	optional bool			check_mounts		= 128;	*/
 }
 

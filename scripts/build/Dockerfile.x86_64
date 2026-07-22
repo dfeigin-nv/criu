@@ -1,0 +1,31 @@
+FROM docker.io/library/ubuntu:24.04
+
+COPY contrib/apt-install /bin/apt-install
+
+RUN apt-install gcc-multilib
+ARG CC=gcc
+
+# On Ubuntu, kernel modules such as ip_tables and xt_mark may not be loaded by default
+# We need to install kmod to enable iptables to load these modules for us.
+COPY contrib/dependencies/apt-packages.sh /criu/contrib/dependencies/apt-packages.sh
+COPY contrib/apt-install /criu/contrib/apt-install
+WORKDIR /criu
+RUN /criu/contrib/apt-install "$CC" && /criu/contrib/dependencies/apt-packages.sh
+
+COPY . /criu
+
+RUN git clean -dfx && date && \
+# Check single object build
+	make -j $(nproc) CC="$CC" criu/parasite-syscall.o && \
+# Compile criu
+	make -j $(nproc) CC="$CC" && \
+	date && \
+# Check that "make mrproper" works
+	make mrproper && ! git clean -ndx --exclude=scripts/build \
+	--exclude=.config --exclude=test | grep .
+
+# Re-compile criu and compile tests for 'make docker-test'
+RUN make -j $(nproc) CC="$CC" && \
+	date &&  make -j $(nproc) CC="$CC" -C test/zdtm && date
+
+#RUN make test/compel/handle_binary && ./test/compel/handle_binary

@@ -16,6 +16,7 @@
 #include "files-reg.h"
 #include "rst-malloc.h"
 #include "fdstore.h"
+#include "memfd-cache.h"
 #include "file-ids.h"
 #include "namespaces.h"
 #include "asyncd.h"
@@ -49,6 +50,7 @@ struct memfd_restore_inode {
 	unsigned int pending_seals;
 	MemfdInodeEntry *mie;
 	bool was_opened_rw;
+	bool cache_donate; /* memfd-cache MISS: donate this sealed fd after restore */
 };
 
 static LIST_HEAD(memfd_inodes);
@@ -237,6 +239,7 @@ static int collect_one_memfd_inode(void *o, ProtobufCMessage *base, struct cr_im
 	inode->fdstore_id = -1;
 	inode->pending_seals = 0;
 	inode->was_opened_rw = false;
+	inode->cache_donate = false;
 
 	list_add_tail(&inode->list, &memfd_inodes);
 
@@ -264,6 +267,43 @@ static int memfd_open_inode_nocache(struct memfd_restore_inode *inode)
 	int flags;
 
 	mie = inode->mie;
+
+	/*
+	 * Node-local memfd content cache (opt-in via the snapshot-agent; the
+	 * socket fd rides CRIU_MEMFD_CACHE_SOCK, scoped by memfd_cache_id). If a
+	 * previous restore on this node already filled and sealed this inode,
+	 * borrow the sealed fd instead of re-creating, re-filling and re-sealing.
+	 * A HIT fd is kernel-state-identical to what the fill+seal path produces
+	 * (sealed, sized, correctly-owned -- uid/gid are in the cache key), so
+	 * every downstream open/seal/mapping step is unchanged; we skip the fill,
+	 * the (later) seal, and the (already-correct) chown. MISS fills now and
+	 * donates the sealed fd after restore; a broken socket just fills locally.
+	 */
+	if (opts.memfd_cache && opts.memfd_cache_id && opts.memfd_cache_id[0] && memfd_cache_eligible(mie)) {
+		int cache_sock = memfd_cache_sock();
+		int cfd;
+
+		if (cache_sock >= 0) {
+			switch (memfd_cache_get(cache_sock, mie, opts.memfd_cache_id, &cfd)) {
+			case MEMFD_CACHE_R_HIT:
+				inode->fdstore_id = fdstore_add(cfd);
+				if (inode->fdstore_id < 0) {
+					close(cfd);
+					return -1;
+				}
+				inode->pending_seals = 0;
+				pr_debug("Borrowed cached memfd:%s (shmid %#lx)\n", mie->name, (unsigned long)mie->shmid);
+				return cfd;
+			case MEMFD_CACHE_R_MISS:
+				inode->cache_donate = true;
+				break;
+			case MEMFD_CACHE_R_ERR:
+			default:
+				break;
+			}
+		}
+	}
+
 	if (mie->seals == F_SEAL_SEAL) {
 		inode->pending_seals = 0;
 		flags = 0;
@@ -512,5 +552,121 @@ int apply_memfd_seals(void)
 		}
 	}
 
+	return 0;
+}
+
+int memfd_content_donate(void)
+{
+	struct memfd_restore_inode *inode;
+	const char *cache_id;
+	int cache_sock;
+
+	if (!opts.memfd_cache || !opts.memfd_cache_id || !opts.memfd_cache_id[0])
+		return 0;
+
+	cache_sock = memfd_cache_sock();
+	if (cache_sock < 0)
+		return 0;
+	cache_id = opts.memfd_cache_id;
+
+	/*
+	 * Runs after apply_memfd_seals(), so every cache_donate inode now holds a
+	 * sealed (F_SEAL_FUTURE_WRITE) populated fd -- the final artifact a future
+	 * HIT will borrow. Donation is pure cache population: the restore has
+	 * already succeeded, so a failure here is logged and never propagated.
+	 */
+	list_for_each_entry(inode, &memfd_inodes, list) {
+		int fd;
+
+		if (!inode->cache_donate)
+			continue;
+
+		fd = memfd_open_inode(inode);
+		if (fd < 0) {
+			pr_warn("memfd-cache: can't open inode to donate (shmid %#lx)\n",
+				(unsigned long)inode->mie->shmid);
+			break;
+		}
+
+		if (memfd_cache_donate(cache_sock, fd, inode->mie, cache_id) < 0) {
+			/* Broken socket: stop, but never fail the restore. */
+			close(fd);
+			break;
+		}
+		close(fd);
+	}
+
+	return 0;
+}
+
+/*
+ * Eager cache primer (--memfd-cache-prime). Synchronously fill, seal and donate
+ * every eligible memfd inode in the image, then return so the caller can stop
+ * without forking a task tree, making the first real restore a cache hit too.
+ * Runs right after prepare_memfd_inodes() in crtools_prepare_shared(), where the
+ * image dir and page-read machinery are ready and memfd_shmem_fill_content() is
+ * known-good (it is self-contained, no task/pid/ns dependency).
+ */
+int memfd_content_prime(void)
+{
+	struct memfd_restore_inode *inode;
+	const char *cache_id;
+	int cache_sock, primed = 0, warm = 0;
+
+	cache_sock = memfd_cache_sock();
+	if (cache_sock < 0 || !opts.memfd_cache_id || !opts.memfd_cache_id[0]) {
+		pr_err("memfd-cache prime needs CRIU_MEMFD_CACHE_SOCK and --memfd-cache-id\n");
+		return -1;
+	}
+	cache_id = opts.memfd_cache_id;
+
+	list_for_each_entry(inode, &memfd_inodes, list) {
+		MemfdInodeEntry *mie = inode->mie;
+		int fd, flags, cfd;
+
+		if (!memfd_cache_eligible(mie))
+			continue;
+
+		/* Already warm from an earlier prime/restore: skip the fill. */
+		if (memfd_cache_get(cache_sock, mie, cache_id, &cfd) == MEMFD_CACHE_R_HIT) {
+			close(cfd);
+			warm++;
+			continue;
+		}
+
+		flags = MFD_ALLOW_SEALING;
+		if (mie->has_hugetlb_flag)
+			flags |= mie->hugetlb_flag;
+
+		fd = memfd_create(mie->name, flags);
+		if (fd < 0) {
+			pr_perror("prime: can't create memfd:%s", mie->name);
+			return -1;
+		}
+		if (memfd_shmem_set_size(fd, mie->shmid, mie->size) < 0 ||
+		    memfd_shmem_fill_content(fd, mie->shmid, mie->size) < 0) {
+			close(fd);
+			return -1;
+		}
+		/*
+		 * Apply the dumped seals (incl F_SEAL_FUTURE_WRITE) now: fill has
+		 * already munmap'd its writable mapping, so the future-write seal
+		 * can be set, producing the same final artifact as apply_memfd_seals.
+		 */
+		if (mie->seals && fcntl(fd, F_ADD_SEALS, mie->seals) < 0) {
+			pr_perror("prime: can't seal memfd:%s", mie->name);
+			close(fd);
+			return -1;
+		}
+		if (memfd_cache_donate(cache_sock, fd, mie, cache_id) < 0) {
+			close(fd);
+			pr_warn("prime: donate failed (socket down); stopping\n");
+			break;
+		}
+		close(fd);
+		primed++;
+	}
+
+	pr_info("memfd-cache prime: %d donated, %d already warm\n", primed, warm);
 	return 0;
 }
