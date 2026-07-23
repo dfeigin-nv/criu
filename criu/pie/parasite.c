@@ -72,6 +72,50 @@ static int mprotect_vmas(struct parasite_dump_pages_args *args)
 	return ret;
 }
 
+static int memfd_private_anon(struct parasite_memfd_private_anon_args *args)
+{
+	unsigned int i;
+
+	for (i = 0; i < args->nr_vmas; i++) {
+		struct parasite_memfd_private_anon_vma *vma = &args->vmas[i];
+		unsigned long size = vma->len + (vma->pgoff << PAGE_SHIFT);
+		void *tmp, *src = (void *)vma->start;
+		int fd, old_prot = vma->prot;
+		unsigned char zero = 0;
+		unsigned long j;
+
+		fd = sys_memfd_create("criu-private-anon", 0);
+		if (fd < 0)
+			continue;
+		if (sys_lseek(fd, size - 1, SEEK_SET) < 0 || sys_write(fd, &zero, 1) != 1)
+			goto fail_fd;
+
+		tmp = (void *)sys_mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+		if ((long)tmp < 0)
+			goto fail_fd;
+		if (sys_mprotect(src, vma->len, old_prot | PROT_READ | PROT_WRITE) < 0) {
+			sys_munmap(tmp, size);
+			goto fail_fd;
+		}
+		for (j = 0; j < vma->len; j++)
+			((unsigned char *)tmp)[(vma->pgoff << PAGE_SHIFT) + j] = ((unsigned char *)src)[j];
+		sys_munmap(tmp, size);
+
+		if ((long)sys_mmap(src, vma->len, old_prot, MAP_PRIVATE | MAP_FIXED, fd,
+				   vma->pgoff << PAGE_SHIFT) < 0) {
+			sys_mprotect(src, vma->len, old_prot);
+			goto fail_fd;
+		}
+		sys_close(fd);
+		continue;
+
+fail_fd:
+		sys_close(fd);
+	}
+
+	return 0;
+}
+
 static int dump_pages(struct parasite_dump_pages_args *args)
 {
 	int p, ret, tsock;
@@ -919,6 +963,9 @@ int parasite_daemon_cmd(int cmd, void *args)
 		break;
 	case PARASITE_CMD_DUMP_CGROUP:
 		ret = parasite_dump_cgroup(args);
+		break;
+	case PARASITE_CMD_MEMFD_PRIVATE_ANON:
+		ret = memfd_private_anon(args);
 		break;
 	default:
 		pr_err("Unknown command in parasite daemon thread leader: %d\n", cmd);

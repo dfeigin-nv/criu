@@ -38,6 +38,7 @@ extern void parasite_ensure_args_size(unsigned long sz);
 extern unsigned long get_exec_start(struct vm_area_list *);
 
 extern int parasite_dump_cgroup(struct parasite_ctl *ctl, struct parasite_dump_cgroup_args *cgroup);
+extern int parasite_memfd_private_anon(struct parasite_ctl *ctl, struct vm_area_list *vmas);
 
 extern struct parasite_tty_args *parasite_dump_tty(struct parasite_ctl *ctl, int fd, int type);
 

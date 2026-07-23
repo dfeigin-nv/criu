@@ -615,6 +615,8 @@ static int handle_vma(pid_t pid, struct vma_area *vma_area, const char *file_pat
 		   !strcmp(file_path, "[vvar_vclock]")) {
 		if (handle_vvar_vma(vma_area))
 			goto err;
+	} else if (!strncmp(file_path, "[stack", 6)) {
+		vma_area->e->status |= VMA_AREA_REGULAR | VMA_AREA_STACK;
 	} else if (!strcmp(file_path, "[heap]")) {
 		vma_area->e->status |= VMA_AREA_REGULAR | VMA_AREA_HEAP;
 	} else if (!strcmp(file_path, "[uprobes]")) {

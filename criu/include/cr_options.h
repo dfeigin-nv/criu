@@ -204,6 +204,7 @@ struct cr_options {
 	int network_lock_method;
 	int skip_file_rwx_check;
 	int allow_uprobes;
+	int memfd_private_anon;
 
 	/*
 	 * When we scheduler for removal some functionality we first

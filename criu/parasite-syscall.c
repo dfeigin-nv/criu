@@ -145,6 +145,51 @@ static void init_parasite_rseq_arg(struct parasite_check_rseq *rseq)
 	rseq->rseq_inited = false;
 }
 
+int parasite_memfd_private_anon(struct parasite_ctl *ctl, struct vm_area_list *vmas)
+{
+	struct parasite_memfd_private_anon_args *args;
+	struct vma_area *vma;
+	unsigned int nr = 0;
+	int ret;
+
+	list_for_each_entry(vma, &vmas->h, list) {
+		if (!vma_area_is(vma, VMA_ANON_PRIVATE) || !(vma->e->flags & MAP_PRIVATE) ||
+		    vma_area_is(vma, VMA_AREA_STACK) || vma_area_is(vma, VMA_AREA_VDSO) ||
+		    vma_area_is(vma, VMA_AREA_VVAR) || vma_area_is(vma, VMA_AREA_VSYSCALL) ||
+		    vma_area_is(vma, VMA_AREA_MEMFD) ||
+		    (vma->e->flags & (MAP_HUGETLB | MAP_GROWSDOWN | MAP_STACK | MAP_LOCKED)) ||
+		    !vma->e->prot || vma->e->pgoff)
+			continue;
+		nr++;
+	}
+
+	if (!nr)
+		return 0;
+
+	args = compel_parasite_args_s(ctl, sizeof(*args) + nr * sizeof(args->vmas[0]));
+	args->nr_vmas = nr;
+	nr = 0;
+	list_for_each_entry(vma, &vmas->h, list) {
+		if (!vma_area_is(vma, VMA_ANON_PRIVATE) || !(vma->e->flags & MAP_PRIVATE) ||
+		    vma_area_is(vma, VMA_AREA_STACK) || vma_area_is(vma, VMA_AREA_VDSO) ||
+		    vma_area_is(vma, VMA_AREA_VVAR) || vma_area_is(vma, VMA_AREA_VSYSCALL) ||
+		    vma_area_is(vma, VMA_AREA_MEMFD) ||
+		    (vma->e->flags & (MAP_HUGETLB | MAP_GROWSDOWN | MAP_STACK | MAP_LOCKED)) ||
+		    !vma->e->prot || vma->e->pgoff)
+			continue;
+		args->vmas[nr].start = vma->e->start;
+		args->vmas[nr].len = vma_area_len(vma);
+		args->vmas[nr].pgoff = vma->e->pgoff;
+		args->vmas[nr].prot = vma->e->prot;
+		nr++;
+	}
+
+	ret = compel_rpc_call_sync(PARASITE_CMD_MEMFD_PRIVATE_ANON, ctl);
+	if (ret < 0)
+		pr_warn("Private anonymous memfd conversion failed; using anonymous mappings\n");
+	return ret;
+}
+
 int parasite_dump_thread_leader_seized(struct parasite_ctl *ctl, int pid, CoreEntry *core)
 {
 	ThreadCoreEntry *tc = core->thread_core;
@@ -436,6 +481,8 @@ struct parasite_ctl *parasite_infect_seized(pid_t pid, struct pstree_item *item,
 
 	parasite_ensure_args_size(dump_pages_args_size(vma_area_list));
 	parasite_ensure_args_size(aio_rings_args_size(vma_area_list));
+	parasite_ensure_args_size(sizeof(struct parasite_memfd_private_anon_args) +
+				  vma_area_list->nr * sizeof(struct parasite_memfd_private_anon_vma));
 
 	if (compel_infect(ctl, item->nr_threads, parasite_args_size) < 0) {
 		if (compel_cure(ctl))

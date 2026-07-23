@@ -37,6 +37,7 @@ enum {
 	PARASITE_CMD_CHECK_VDSO_MARK,
 	PARASITE_CMD_CHECK_AIOS,
 	PARASITE_CMD_DUMP_CGROUP,
+	PARASITE_CMD_MEMFD_PRIVATE_ANON,
 
 	PARASITE_CMD_MAX,
 };
@@ -64,6 +65,18 @@ struct parasite_dump_pages_args {
 	unsigned int off;
 	unsigned int nr_segs;
 	unsigned long nr_pages;
+};
+
+struct parasite_memfd_private_anon_vma {
+	unsigned long start;
+	unsigned long len;
+	unsigned long pgoff;
+	int prot;
+};
+
+struct parasite_memfd_private_anon_args {
+	unsigned int nr_vmas;
+	struct parasite_memfd_private_anon_vma vmas[0];
 };
 
 static inline struct parasite_vma_entry *pargs_vmas(struct parasite_dump_pages_args *a)

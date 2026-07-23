@@ -1515,6 +1515,18 @@ static int dump_one_task(struct pstree_item *item, InventoryEntry *parent_ie)
 		goto err_cure;
 	}
 
+	if (opts.memfd_private_anon) {
+		ret = parasite_memfd_private_anon(parasite_ctl, &vmas);
+		if (ret < 0)
+			goto err_cure;
+		free_mappings(&vmas);
+		ret = collect_mappings(pid, &vmas, dump_filemap);
+		if (ret) {
+			pr_err("Can't recollect mappings after private anonymous conversion (pid: %d)\n", pid);
+			goto err_cure;
+		}
+	}
+
 	ret = parasite_dump_misc_seized(parasite_ctl, &misc);
 	if (ret) {
 		pr_err("Can't dump misc (pid: %d)\n", pid);
