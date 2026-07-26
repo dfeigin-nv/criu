@@ -18,6 +18,7 @@
 #include "parasite-syscall.h"
 #include "parasite.h"
 #include "crtools.h"
+#include "cr_options.h"
 #include "namespaces.h"
 #include "kerndat.h"
 #include "pstree.h"
