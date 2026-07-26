@@ -1457,6 +1457,9 @@ static int dump_one_task(struct pstree_item *item, InventoryEntry *parent_ie)
 		}
 
 		parasite_ensure_args_size(drain_fds_size(dfds));
+		if (opts.memfd_private_anon)
+			parasite_ensure_args_size(sizeof(*dfds) + PARASITE_MAX_FDS *
+					(sizeof(dfds->fds[0]) + sizeof(struct fd_opts)));
 	}
 
 	ret = parse_posix_timers(pid, &proc_args);
