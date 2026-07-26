@@ -106,7 +106,7 @@ static int memfd_private_anon(struct parasite_memfd_private_anon_args *args)
 			sys_mprotect(src, vma->len, old_prot);
 			goto fail_fd;
 		}
-		sys_close(fd);
+		/* Keep the descriptor reachable for CRIU's normal file collection. */
 		continue;
 
 fail_fd:
