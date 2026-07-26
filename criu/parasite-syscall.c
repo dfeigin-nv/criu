@@ -480,6 +480,8 @@ struct parasite_ctl *parasite_infect_seized(pid_t pid, struct pstree_item *item,
 	parasite_setup_c_header(ctl);
 
 	parasite_ensure_args_size(dump_pages_args_size(vma_area_list));
+	if (opts.memfd_private_anon)
+		parasite_ensure_args_size(2 * dump_pages_args_size(vma_area_list));
 	parasite_ensure_args_size(aio_rings_args_size(vma_area_list));
 	parasite_ensure_args_size(sizeof(struct parasite_memfd_private_anon_args) +
 				  vma_area_list->nr * sizeof(struct parasite_memfd_private_anon_vma));
