@@ -146,6 +146,20 @@ static void init_parasite_rseq_arg(struct parasite_check_rseq *rseq)
 	rseq->rseq_inited = false;
 }
 
+static bool memfd_private_anon_eligible(struct vma_area *vma)
+{
+	unsigned long fork_madv = (1ul << MADV_DONTFORK) | (1ul << MADV_WIPEONFORK);
+
+	return vma_area_is(vma, VMA_ANON_PRIVATE) && (vma->e->flags & MAP_PRIVATE) &&
+		!(vma->e->flags & (MAP_HUGETLB | MAP_GROWSDOWN | MAP_STACK | MAP_LOCKED |
+				   MAP_NORESERVE | MAP_DROPPABLE)) &&
+		!(vma->e->madv & fork_madv) && !(vma->e->madv & (1ul << MADV_DONTDUMP)) &&
+		!(vma->e->status & (VMA_AREA_STACK | VMA_AREA_VDSO | VMA_AREA_VVAR |
+				    VMA_AREA_VSYSCALL | VMA_AREA_MEMFD | VMA_AREA_NOT_ACCOUNTABLE |
+				    VMA_AREA_AIORING | VMA_AREA_SHSTK | VMA_EXT_PLUGIN | VMA_UNSUPP)) &&
+		vma->e->prot && !vma->e->pgoff;
+}
+
 int parasite_memfd_private_anon(struct parasite_ctl *ctl, struct vm_area_list *vmas)
 {
 	struct parasite_memfd_private_anon_args *args;
@@ -154,12 +168,7 @@ int parasite_memfd_private_anon(struct parasite_ctl *ctl, struct vm_area_list *v
 	int ret;
 
 	list_for_each_entry(vma, &vmas->h, list) {
-		if (!vma_area_is(vma, VMA_ANON_PRIVATE) || !(vma->e->flags & MAP_PRIVATE) ||
-		    vma_area_is(vma, VMA_AREA_STACK) || vma_area_is(vma, VMA_AREA_VDSO) ||
-		    vma_area_is(vma, VMA_AREA_VVAR) || vma_area_is(vma, VMA_AREA_VSYSCALL) ||
-		    vma_area_is(vma, VMA_AREA_MEMFD) ||
-		    (vma->e->flags & (MAP_HUGETLB | MAP_GROWSDOWN | MAP_STACK | MAP_LOCKED)) ||
-		    !vma->e->prot || vma->e->pgoff)
+		if (!memfd_private_anon_eligible(vma))
 			continue;
 		nr++;
 	}
@@ -171,12 +180,7 @@ int parasite_memfd_private_anon(struct parasite_ctl *ctl, struct vm_area_list *v
 	args->nr_vmas = nr;
 	nr = 0;
 	list_for_each_entry(vma, &vmas->h, list) {
-		if (!vma_area_is(vma, VMA_ANON_PRIVATE) || !(vma->e->flags & MAP_PRIVATE) ||
-		    vma_area_is(vma, VMA_AREA_STACK) || vma_area_is(vma, VMA_AREA_VDSO) ||
-		    vma_area_is(vma, VMA_AREA_VVAR) || vma_area_is(vma, VMA_AREA_VSYSCALL) ||
-		    vma_area_is(vma, VMA_AREA_MEMFD) ||
-		    (vma->e->flags & (MAP_HUGETLB | MAP_GROWSDOWN | MAP_STACK | MAP_LOCKED)) ||
-		    !vma->e->prot || vma->e->pgoff)
+		if (!memfd_private_anon_eligible(vma))
 			continue;
 		args->vmas[nr].start = vma->e->start;
 		args->vmas[nr].len = vma_area_len(vma);
