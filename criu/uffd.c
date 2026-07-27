@@ -416,7 +416,7 @@ out:
 
 int lazy_pages_setup_zombie(int pid)
 {
-	if (!opts.lazy_pages && !opts.stream_restore)
+	if (!opts.lazy_pages && (!opts.stream_restore || lazy_pages_sk_id < 0))
 		return 0;
 
 	if (send_uffd(0, -pid))
@@ -482,7 +482,7 @@ int setup_uffd(int pid, struct task_restore_args *task_args)
 	unsigned long features = kdat.uffd_features & NEED_UFFD_API_FEATURES;
 	int err = 0;
 
-	if (!opts.lazy_pages && !opts.stream_restore) {
+	if (!opts.lazy_pages && (!opts.stream_restore || lazy_pages_sk_id < 0)) {
 		task_args->uffd = -1;
 		return 0;
 	}
@@ -544,6 +544,23 @@ int prepare_lazy_pages_socket(void)
 
 	len = offsetof(struct sockaddr_un, sun_path) + strlen(sun.sun_path);
 	if (connect(fd, (struct sockaddr *)&sun, len) < 0) {
+		/*
+		 * With --lazy-pages the daemon is mandatory, so a failed
+		 * connect is fatal. Under --stream-restore alone it is not:
+		 * the daemon is only needed to UFFDIO_CONTINUE-install
+		 * streamer-filled shmem, and a checkpoint may have no such
+		 * shmem at all (or the caller may not have spawned a daemon).
+		 * Degrade to the non-UFFD path instead of failing the whole
+		 * restore -- lazy_pages_sk_id stays -1 and the guards keyed on
+		 * it below leave task_args->uffd == -1.
+		 */
+		if (!opts.lazy_pages) {
+			pr_warn("stream-restore: no lazy-pages daemon on %s, "
+				"continuing without UFFD (shmem served inline)\n",
+				sun.sun_path);
+			ret = 0;
+			goto out;
+		}
 		pr_perror("connect to %s failed", sun.sun_path);
 		goto out;
 	}
@@ -1509,7 +1526,7 @@ int lazy_pages_finish_restore(void)
 	uint32_t fin = LAZY_PAGES_RESTORE_FINISHED;
 	int fd, ret;
 
-	if (!opts.lazy_pages && !opts.stream_restore)
+	if (!opts.lazy_pages && (!opts.stream_restore || lazy_pages_sk_id < 0))
 		return 0;
 
 	fd = fdstore_get(lazy_pages_sk_id);
