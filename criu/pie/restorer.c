@@ -2556,6 +2556,8 @@ __visible long __export_restore_task(struct task_restore_args *args)
 	if (args->stream_private_mode == 2 && args->vma_ios_fd != -1) {
 		sys_close(args->vma_ios_fd);
 		args->vma_ios_fd = -1;
+		/* Same fd number; clear it so nothing acts on a stale one. */
+		args->streamer_private_pages_fd = -1;
 	}
 
 	if (args->vma_ios_n > 0 && args->vma_ios_fd != -1) {
