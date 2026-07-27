@@ -327,7 +327,22 @@ static int memfd_open_inode_nocache(struct memfd_restore_inode *inode)
 		goto err;
 	}
 
-	if (opts.stream) {
+	if (opts.stream_restore && !(mie->seals & (F_SEAL_WRITE | F_SEAL_FUTURE_WRITE))) {
+		/*
+		 * Streaming restore: leave this memfd empty. It is already
+		 * sized by the ftruncate() above; the external streamer fills
+		 * it out-of-band, and the lazy-pages daemon installs the bytes
+		 * into the restored process's shmem VMAs via UFFDIO_CONTINUE
+		 * as each range becomes ready.
+		 *
+		 * Write-sealed inodes are excluded: apply_memfd_seals() runs
+		 * before the tasks resume, so the seal would land before the
+		 * streamer finished writing and its writes would fail EPERM.
+		 * Those fall through to the conventional fill below.
+		 */
+		pr_debug("stream-restore: deferring fill of memfd:%s (shmid %#lx) to streamer\n",
+			 mie->name, (unsigned long)mie->shmid);
+	} else if (opts.stream) {
 		/*
 		 * criu-image-streamer serves the image in a single sequential
 		 * pass and does not reopen it. The async fill daemon reads the
@@ -342,6 +357,11 @@ static int memfd_open_inode_nocache(struct memfd_restore_inode *inode)
 			.shmid = mie->shmid,
 			.size = mie->size,
 		};
+
+		if (opts.stream_restore)
+			pr_warn("stream-restore: memfd:%s (shmid %#lx) is write-sealed; "
+				"filling from image instead of streaming\n",
+				mie->name, (unsigned long)mie->shmid);
 
 		if (async_call(async_restore_shmem_content, 0,
 			       &async_arg, sizeof(async_arg), fd))

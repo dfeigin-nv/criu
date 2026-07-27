@@ -1210,6 +1210,17 @@ int check_options(void)
 		opts.compress_mode = COMPRESS_PER_PAGE;
 
 	/*
+	 * Under --stream-restore the private-page source is a memfd owned by
+	 * the streamer, not a pages-{N}.img we may rewrite. --auto-dedup makes
+	 * the restorer punch holes in that fd as it consumes each iovec, which
+	 * would discard streamer-provided bytes.
+	 */
+	if (opts.stream_restore && opts.auto_dedup) {
+		pr_err("--auto-dedup is not compatible with --stream-restore\n");
+		return 1;
+	}
+
+	/*
 	 * Compression is selected by the dump client and encoded in each page
 	 * server wire command. Letting the server select a mode independently
 	 * can make the payload disagree with the inventory written by the client.
