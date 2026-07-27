@@ -766,6 +766,7 @@ int parse_options(int argc, char **argv, bool *usage_error, bool *has_exec_cmd, 
 		{ "lsm-mount-context", required_argument, 0, 1099 },
 		{ "network-lock", required_argument, 0, 1100 },
 		{ "image-io-mode", required_argument, 0, 1101 },
+		{ "stream-private", required_argument, 0, 1106 },
 		BOOL_OPT("mntns-compat-mode", &opts.mntns_compat_mode),
 		BOOL_OPT("memfd-cache", &opts.memfd_cache),
 		BOOL_OPT("memfd-cache-prime", &opts.memfd_cache_prime),
@@ -1176,6 +1177,16 @@ int parse_options(int argc, char **argv, bool *usage_error, bool *has_exec_cmd, 
 		case 1101:
 			if (parse_image_io_mode(&opts, optarg))
 				return 2;
+			break;
+		case 1106:
+			if (!strcmp("mmap", optarg)) {
+				opts.stream_private_copy = 0;
+			} else if (!strcmp("copy", optarg)) {
+				opts.stream_private_copy = 1;
+			} else {
+				pr_err("Invalid value for --stream-private: %s\n", optarg);
+				return 1;
+			}
 			break;
 		case 'V':
 			pr_msg("Version: %s\n", CRIU_VERSION);

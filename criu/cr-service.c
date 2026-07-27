@@ -527,6 +527,10 @@ static int setup_opts_from_req(int sk, CriuOpts *req)
 		opts.stream_restore = req->stream_restore;
 	}
 
+	if (req->has_stream_private_copy) {
+		opts.stream_private_copy = req->stream_private_copy;
+	}
+
 	if (req->has_memfd_cache)
 		opts.memfd_cache = req->memfd_cache;
 	if (req->memfd_cache_id) {

@@ -219,6 +219,9 @@ struct cr_options {
 	bool orphan_pts_master;
 	int stream;
 	int stream_restore;
+	/* --stream-private: 0 = mmap over the streamer memfd (default),
+	 * 1 = UFFDIO_COPY into anonymous private VMAs. */
+	int stream_private_copy;
 	int stream_restore_async;	/* Plan v4 async overlap (default on). */
 	pid_t tree_id;
 	int log_level;

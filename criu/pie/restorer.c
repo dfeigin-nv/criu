@@ -2524,8 +2524,15 @@ __visible long __export_restore_task(struct task_restore_args *args)
 		 *
 		 * Discriminator: streamer_private_pages_fd >= 0. Default
 		 * (non-stream) restores keep the AIO path below.
+		 *
+		 * --stream-private=copy opts out: the ranges are then read out
+		 * of the same memfd into the already-mapped anonymous VMAs by
+		 * the reader below, so the VMAs stay genuinely anonymous and
+		 * re-dump as VMA_ANON_PRIVATE rather than
+		 * VMA_AREA_MEMFD|VMA_FILE_PRIVATE. That costs a copy and ~2x
+		 * peak RSS (source memfd page cache + destination anon).
 		 */
-		if (args->streamer_private_pages_fd >= 0) {
+		if (args->streamer_private_pages_fd >= 0 && !args->stream_private_copy) {
 			struct restore_vma_io *zr = args->vma_ios;
 			unsigned int zc_n = args->vma_ios_n;
 			int zc_fd = args->vma_ios_fd;

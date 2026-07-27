@@ -175,6 +175,7 @@ message criu_opts {
 	optional bool			memfd_cache		= 77;	/* node-local memfd content cache: share sealed populated memfds across restores */
 	optional string			memfd_cache_id		= 78;	/* cache scope key "checkpointID:version" */
 	optional bool			stream_restore		= 79;	/* streaming restore: memfd + UFFDIO_CONTINUE */
+	optional bool			stream_private_copy	= 80;	/* --stream-private=copy (default: mmap) */
 /*	optional bool			check_mounts		= 128;	*/
 }
 
