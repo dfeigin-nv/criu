@@ -26,6 +26,7 @@
 #include "mem.h"
 #include "criu-log.h"
 #include "vma.h"
+#include "mman.h"
 #include "proc_parse.h"
 #include "aio.h"
 #include "fault-injection.h"
