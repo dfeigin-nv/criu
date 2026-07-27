@@ -523,6 +523,10 @@ static int setup_opts_from_req(int sk, CriuOpts *req)
 		opts.lazy_pages = req->lazy_pages;
 	}
 
+	if (req->has_stream_restore) {
+		opts.stream_restore = req->stream_restore;
+	}
+
 	if (req->has_memfd_cache)
 		opts.memfd_cache = req->memfd_cache;
 	if (req->memfd_cache_id) {

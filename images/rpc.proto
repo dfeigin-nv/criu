@@ -170,10 +170,11 @@ message criu_opts {
 	/*
 	 * Fork memfd-cache fields, renumbered from the fork's original 73/74
 	 * (now upstream compress/compress_acceleration) to 77/78. go-criu must
-	 * match these tags exactly. stream_restore lives only in go-criu at 79.
+	 * match these tags exactly.
 	 */
 	optional bool			memfd_cache		= 77;	/* node-local memfd content cache: share sealed populated memfds across restores */
 	optional string			memfd_cache_id		= 78;	/* cache scope key "checkpointID:version" */
+	optional bool			stream_restore		= 79;	/* streaming restore: memfd + UFFDIO_CONTINUE */
 /*	optional bool			check_mounts		= 128;	*/
 }
 
