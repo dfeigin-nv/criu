@@ -209,6 +209,15 @@ struct task_restore_args {
 	 * with PIE setup; PIE must futex_wait on streamer_private_ready_futex
 	 * before consuming each vma_ios[i].
 	 */
+	/*
+	 * True when opts.stream_restore is on. This is the gate for
+	 * MODE_MINOR registration of shmem VMAs: it must not be derived
+	 * from the private-page fields, because a task in a multi-task
+	 * tree can have memfd-backed shmem but no private vma_ios of its
+	 * own, in which case those are unset and its shmem would never be
+	 * registered -- reading unsynchronised streamer page cache.
+	 */
+	bool stream_restore;
 	int streamer_private_pages_fd;
 	/*
 	 * --stream-private=copy: restore private anonymous VMAs by

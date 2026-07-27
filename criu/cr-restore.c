@@ -3671,6 +3671,7 @@ static int sigreturn_restore(pid_t pid, struct task_restore_args *task_args, uns
 	task_args->thread_args = thread_args;
 
 	task_args->auto_dedup = opts.auto_dedup;
+	task_args->stream_restore = opts.stream_restore;
 	task_args->stream_private_copy = opts.stream_restore && opts.stream_private_copy;
 
 	/*

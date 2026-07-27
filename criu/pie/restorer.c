@@ -2419,10 +2419,18 @@ __visible long __export_restore_task(struct task_restore_args *args)
 	 * under-classification (e.g. SysV shmem leaking into this
 	 * branch), tighten the predicate or add a capture-side flag.
 	 *
-	 * Gate: args->streamer_private_ready_futex — same single-source
-	 * runtime gate as commit 7. Default path stays byte-equivalent.
+	 * Gate: args->stream_restore. This deliberately does NOT key off the
+	 * private-page fields: a task in a multi-task tree can have
+	 * memfd-backed shmem but no private vma_ios of its own, in which case
+	 * streamer_private_ready_futex is NULL (mem.c leaves it unset both on
+	 * the empty-vma_io early return and when vma_ios_n is 0). Gating on
+	 * those would silently skip registration for such a task, and since
+	 * its memfds are left unfilled for the streamer there would then be
+	 * no synchronisation at all between the streamer's writes and the
+	 * task's reads — it would read whatever is in the page cache and the
+	 * restore would still report success.
 	 */
-	if (args->streamer_private_ready_futex && args->uffd > -1) {
+	if (args->stream_restore && args->uffd > -1) {
 		for (i = 0; i < args->vmas_n; i++) {
 			VmaEntry *e = args->vmas + i;
 			unsigned long len;
