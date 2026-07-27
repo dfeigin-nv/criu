@@ -220,13 +220,14 @@ struct task_restore_args {
 	bool stream_restore;
 	int streamer_private_pages_fd;
 	/*
-	 * --stream-private=copy: restore private anonymous VMAs by
-	 * registering them userfaultfd MODE_MISSING and letting the
-	 * lazy-pages daemon serve faults with UFFDIO_COPY, instead of
-	 * mapping them MAP_PRIVATE over the streamer memfd. Keeps the
-	 * VMAs genuinely anonymous at the cost of a per-page copy.
+	 * --stream-private: how private anonymous VMAs are restored.
+	 * 0 = MMAP (map over the streamer memfd, zero-copy),
+	 * 1 = COPY (eagerly read the memfd into anonymous memory),
+	 * 2 = UFFD (register MODE_MISSING, demand-page via UFFDIO_COPY).
+	 * Mirrors enum stream_private_mode in cr_options.h; PIE cannot
+	 * include that header, so it is carried as a plain int.
 	 */
-	bool stream_private_copy;
+	int stream_private_mode;
 	unsigned int *streamer_private_ready_futex;
 	unsigned int streamer_private_ready_futex_n;
 

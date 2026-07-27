@@ -3672,7 +3672,7 @@ static int sigreturn_restore(pid_t pid, struct task_restore_args *task_args, uns
 
 	task_args->auto_dedup = opts.auto_dedup;
 	task_args->stream_restore = opts.stream_restore;
-	task_args->stream_private_copy = opts.stream_restore && opts.stream_private_copy;
+	task_args->stream_private_mode = opts.stream_restore ? opts.stream_private_mode : 0;
 
 	/*
 	 * In the restorer we need to know if it is SELinux or not. For SELinux

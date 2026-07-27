@@ -141,6 +141,19 @@ enum criu_mode {
 	CR_SHOW_DEPRECATED,
 };
 
+/*
+ * How private anonymous VMAs are restored under --stream-restore.
+ *   MMAP: map them MAP_PRIVATE over the streamer memfd (zero-copy, CoW).
+ *   COPY: eagerly read the memfd into anonymous memory.
+ *   UFFD: register MODE_MISSING and demand-page via UFFDIO_COPY.
+ * COPY and UFFD both leave the VMAs genuinely anonymous.
+ */
+enum stream_private_mode {
+	STREAM_PRIVATE_MMAP = 0,
+	STREAM_PRIVATE_COPY = 1,
+	STREAM_PRIVATE_UFFD = 2,
+};
+
 struct cr_options {
 	int final_state;
 	int check_extra_features;
@@ -219,9 +232,8 @@ struct cr_options {
 	bool orphan_pts_master;
 	int stream;
 	int stream_restore;
-	/* --stream-private: 0 = mmap over the streamer memfd (default),
-	 * 1 = UFFDIO_COPY into anonymous private VMAs. */
-	int stream_private_copy;
+	/* --stream-private, see enum stream_private_mode. */
+	int stream_private_mode;
 	int stream_restore_async;	/* Plan v4 async overlap (default on). */
 	pid_t tree_id;
 	int log_level;

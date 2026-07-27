@@ -60,6 +60,12 @@ enum criu_pre_dump_mode {
 	VM_READ =	2;
 };
 
+enum criu_stream_private_mode {
+	STREAM_PRIVATE_MMAP	= 0;	/* map private VMAs over the streamer memfd (zero-copy) */
+	STREAM_PRIVATE_COPY	= 1;	/* eagerly copy into anonymous memory */
+	STREAM_PRIVATE_UFFD	= 2;	/* demand-page into anonymous memory via UFFDIO_COPY */
+};
+
 enum criu_image_io_mode {
 	IMAGE_IO_WRITEBACK	= 0;
 	IMAGE_IO_DIRECT	= 1;
@@ -175,7 +181,7 @@ message criu_opts {
 	optional bool			memfd_cache		= 77;	/* node-local memfd content cache: share sealed populated memfds across restores */
 	optional string			memfd_cache_id		= 78;	/* cache scope key "checkpointID:version" */
 	optional bool			stream_restore		= 79;	/* streaming restore: memfd + UFFDIO_CONTINUE */
-	optional bool			stream_private_copy	= 80;	/* --stream-private=copy (default: mmap) */
+	optional criu_stream_private_mode stream_private_mode	= 80 [default = STREAM_PRIVATE_MMAP];	/* --stream-private */
 /*	optional bool			check_mounts		= 128;	*/
 }
 

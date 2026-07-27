@@ -1108,6 +1108,37 @@ static void rst_tcp_socks_all(struct task_restore_args *ta)
 		rst_tcp_repair_off(&ta->tcp_socks[i]);
 }
 
+/*
+ * Mirror of memfd_private_anon_eligible() in parasite-syscall.c, applied in
+ * PIE to decide which private anonymous VMAs may be handed to the lazy-pages
+ * daemon under --stream-private=uffd.
+ *
+ * The exclusion set is deliberately the same one the dump side uses for memfd
+ * conversion. It is what keeps the vdso, vvar, vsyscall, stack and other
+ * special mappings off the daemon's fault path: routing those to the daemon is
+ * how the "vdso: Invalid ELF magic" failure appeared previously, because the
+ * mapping is consumed by vdso_proxify() inside PIE and cannot wait for a
+ * userfault round-trip.
+ */
+static bool stream_uffd_private_eligible(VmaEntry *e)
+{
+	unsigned long fork_madv = (1ul << MADV_DONTFORK) | (1ul << MADV_WIPEONFORK);
+
+	if (!vma_entry_is(e, VMA_ANON_PRIVATE) || !(e->flags & MAP_PRIVATE))
+		return false;
+	if (e->flags & (MAP_HUGETLB | MAP_GROWSDOWN | MAP_STACK | MAP_LOCKED | MAP_NORESERVE))
+		return false;
+	if (e->status & (VMA_AREA_STACK | VMA_AREA_VDSO | VMA_AREA_VVAR | VMA_AREA_VSYSCALL |
+			 VMA_AREA_MEMFD | VMA_AREA_NOT_ACCOUNTABLE | VMA_AREA_AIORING |
+			 VMA_AREA_SHSTK | VMA_EXT_PLUGIN | VMA_UNSUPP))
+		return false;
+	if (e->has_madv && (e->madv & (fork_madv | (1ul << MADV_DONTDUMP))))
+		return false;
+	if (!e->prot || e->pgoff)
+		return false;
+	return true;
+}
+
 static int enable_uffd(int uffd, unsigned long addr, unsigned long len,
 		       unsigned long mode)
 {
@@ -2450,6 +2481,30 @@ __visible long __export_restore_task(struct task_restore_args *args)
 		}
 	}
 
+	/*
+	 * --stream-private=uffd: register eligible private anonymous VMAs
+	 * MODE_MISSING so the daemon serves their pages with UFFDIO_COPY.
+	 * stream_uffd_private_eligible() excludes the vdso and the other
+	 * special mappings; those must never reach the daemon.
+	 */
+	if (args->stream_restore && args->stream_private_mode == 2 && args->uffd > -1) {
+		for (i = 0; i < args->vmas_n; i++) {
+			VmaEntry *e = args->vmas + i;
+			unsigned long len;
+
+			if (!stream_uffd_private_eligible(e))
+				continue;
+
+			len = vma_entry_len(e);
+			if (enable_uffd(args->uffd, e->start, len,
+					UFFDIO_REGISTER_MODE_MISSING) != 0) {
+				pr_err("stream: MISSING register %"PRIx64" len %lx failed\n",
+				       e->start, len);
+				goto core_restore_end;
+			}
+		}
+	}
+
 	if (args->uffd > -1) {
 		pr_debug("lazy-pages: closing uffd %d\n", args->uffd);
 		/*
@@ -2492,6 +2547,17 @@ __visible long __export_restore_task(struct task_restore_args *args)
 	 * delayed file-backed range is raw and page-aligned; encoded ranges are
 	 * premapped and decoded before PIE.
 	 */
+	/*
+	 * --stream-private=uffd leaves the private pages unpopulated: the
+	 * VMAs are registered MODE_MISSING below and the lazy-pages daemon
+	 * demand-pages them via UFFDIO_COPY. Reading them here would defeat
+	 * that, so close the streamer memfd and skip the reader.
+	 */
+	if (args->stream_private_mode == 2 && args->vma_ios_fd != -1) {
+		sys_close(args->vma_ios_fd);
+		args->vma_ios_fd = -1;
+	}
+
 	if (args->vma_ios_n > 0 && args->vma_ios_fd != -1) {
 		int rc;
 
@@ -2533,14 +2599,14 @@ __visible long __export_restore_task(struct task_restore_args *args)
 		 * Discriminator: streamer_private_pages_fd >= 0. Default
 		 * (non-stream) restores keep the AIO path below.
 		 *
-		 * --stream-private=copy opts out: the ranges are then read out
-		 * of the same memfd into the already-mapped anonymous VMAs by
-		 * the reader below, so the VMAs stay genuinely anonymous and
-		 * re-dump as VMA_ANON_PRIVATE rather than
-		 * VMA_AREA_MEMFD|VMA_FILE_PRIVATE. That costs a copy and ~2x
-		 * peak RSS (source memfd page cache + destination anon).
+		 * --stream-private=copy and =uffd opt out: the VMAs then stay
+		 * genuinely anonymous and re-dump as VMA_ANON_PRIVATE rather
+		 * than VMA_AREA_MEMFD|VMA_FILE_PRIVATE. 'copy' has the reader
+		 * below pull the same memfd in eagerly; 'uffd' leaves the pages
+		 * unpopulated for the daemon to demand-page via UFFDIO_COPY.
+		 * Both cost a copy and ~2x peak RSS.
 		 */
-		if (args->streamer_private_pages_fd >= 0 && !args->stream_private_copy) {
+		if (args->streamer_private_pages_fd >= 0 && args->stream_private_mode == 0) {
 			struct restore_vma_io *zr = args->vma_ios;
 			unsigned int zc_n = args->vma_ios_n;
 			int zc_fd = args->vma_ios_fd;

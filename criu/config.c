@@ -1180,9 +1180,11 @@ int parse_options(int argc, char **argv, bool *usage_error, bool *has_exec_cmd, 
 			break;
 		case 1106:
 			if (!strcmp("mmap", optarg)) {
-				opts.stream_private_copy = 0;
+				opts.stream_private_mode = STREAM_PRIVATE_MMAP;
 			} else if (!strcmp("copy", optarg)) {
-				opts.stream_private_copy = 1;
+				opts.stream_private_mode = STREAM_PRIVATE_COPY;
+			} else if (!strcmp("uffd", optarg)) {
+				opts.stream_private_mode = STREAM_PRIVATE_UFFD;
 			} else {
 				pr_err("Invalid value for --stream-private: %s\n", optarg);
 				return 1;
