@@ -439,12 +439,20 @@ void init_opts(void)
 	opts.decompress_threads = 1;
 
 	/*
-	 * stream-restore-async defaults ON: the streamer hands the memfd
-	 * over and acks immediately, overlapping the download with CRIU's
-	 * post-handover prep work. Kill switch: --no-stream-restore-async or
-	 * STREAM_RESTORE_ASYNC=0 env (consumed in mem.c).
+	 * stream-restore-async defaults OFF. In async mode the streamer must
+	 * hand back a second fd -- a ready-pipe it writes once the memfd is
+	 * fully filled -- so CRIU asks for 2 fds over SCM_RIGHTS. Providers
+	 * that only implement the original single-memfd reply then fail the
+	 * restore with
+	 *
+	 *   Failed to receive streamer private fds (n=2) ...
+	 *
+	 * Sync mode asks for 1 fd and gates on the streamer's 'A' ack, which
+	 * is already sent after the fill completes, so it is correct against
+	 * both provider generations. Enable --stream-restore-async only with
+	 * a provider that sends the ready-pipe.
 	 */
-	opts.stream_restore_async = 1;
+	opts.stream_restore_async = 0;
 }
 
 bool deprecated_ok(char *what)
