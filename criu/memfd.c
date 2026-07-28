@@ -273,6 +273,7 @@ static int memfd_open_inode_nocache(struct memfd_restore_inode *inode)
 	int fd = -1;
 	int ret, exit_code = -1;
 	int flags;
+	bool streamer_owned = false;
 
 	mie = inode->mie;
 
@@ -338,6 +339,7 @@ static int memfd_open_inode_nocache(struct memfd_restore_inode *inode)
 			       (unsigned long)mie->shmid);
 			goto err;
 		}
+		streamer_owned = true;
 	} else {
 		fd = memfd_create(mie->name, flags);
 		if (fd < 0) {
@@ -351,13 +353,23 @@ static int memfd_open_inode_nocache(struct memfd_restore_inode *inode)
 		goto err;
 	}
 
-	if (opts.stream_restore && !(mie->seals & (F_SEAL_WRITE | F_SEAL_FUTURE_WRITE))) {
+	if (streamer_owned && !(mie->seals & (F_SEAL_WRITE | F_SEAL_FUTURE_WRITE))) {
 		/*
-		 * Streaming restore: leave this memfd empty. It is already
-		 * sized by the ftruncate() above; the external streamer fills
-		 * it out-of-band, and the lazy-pages daemon installs the bytes
-		 * into the restored process's shmem VMAs via UFFDIO_CONTINUE
-		 * as each range becomes ready.
+		 * This inode came from the streamer, so leave it empty: it is
+		 * already sized by the ftruncate() above and the streamer
+		 * fills the very same inode out-of-band. Where a lazy-pages
+		 * daemon is present the bytes are additionally installed on
+		 * demand via UFFDIO_CONTINUE.
+		 *
+		 * The skip is gated on streamer_owned, NOT on
+		 * opts.stream_restore. A provider may stream private ranges
+		 * only and serve no shmem at all -- dynamo's
+		 * writePipelineCManifest emits "shmem_ranges":[] today -- in
+		 * which case STREAM_SHMEM_SK_OFF is absent, the memfd above is
+		 * one CRIU created itself, and nobody else will ever write to
+		 * it. Skipping the fill there leaves the restored process with
+		 * a zero-filled shmem region and it dies with SIGSEGV as soon
+		 * as it touches its own data.
 		 *
 		 * Write-sealed inodes are excluded: apply_memfd_seals() runs
 		 * before the tasks resume, so the seal would land before the
@@ -382,7 +394,7 @@ static int memfd_open_inode_nocache(struct memfd_restore_inode *inode)
 			.size = mie->size,
 		};
 
-		if (opts.stream_restore)
+		if (streamer_owned)
 			pr_warn("stream-restore: memfd:%s (shmid %#lx) is write-sealed; "
 				"filling from image instead of streaming\n",
 				mie->name, (unsigned long)mie->shmid);
