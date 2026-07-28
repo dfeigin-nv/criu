@@ -1824,35 +1824,6 @@ out:
 	return rc;
 }
 
-/*
- * Allocate the per-vma_io readiness futex array in shmalloc'd memory so
- * the words survive fork() AND unmap_old_vmas() into the PIE restorer.
- * shmalloc'd memory is in the rst-malloc MAP_SHARED|MAP_ANONYMOUS pool
- * mapped at restorer-fixed addresses preserved across unmap.
- *
- * Pre-filled to 1 by the caller right after the streamer ack: in the
- * synchronous local-files smoke + first-cut S3 paths the streamer is
- * fully done by the time PIE runs, so PIE's futex_wait loop short-
- * circuits on the first check. Async overlap can later replace the
- * ack with per-range eventfd notifications + a helper that writes
- * shmalloc'd words + FUTEX_WAKE.
- */
-static unsigned int *alloc_streamer_futex_array(unsigned int n)
-{
-	unsigned int *fut;
-	size_t bytes;
-
-	if (n == 0)
-		return NULL;
-	bytes = (size_t)n * sizeof(unsigned int);
-	fut = shmalloc(bytes);
-	if (!fut) {
-		pr_err("Failed to shmalloc %u-entry streamer futex array\n", n);
-		return NULL;
-	}
-	memset(fut, 0, bytes);
-	return fut;
-}
 
 static int prepare_vma_ios(struct pstree_item *t, struct task_restore_args *ta)
 {
@@ -1880,7 +1851,6 @@ static int prepare_vma_ios(struct pstree_item *t, struct task_restore_args *ta)
 
 	if (opts.stream_restore) {
 		int pages_fd = -1, pipe_fd = -1;
-		unsigned int i;
 
 		if (recv_streamer_private_fd(rsti(t)->pages_img_id, &pages_fd, &pipe_fd) < 0)
 			return -1;
@@ -1897,33 +1867,31 @@ static int prepare_vma_ios(struct pstree_item *t, struct task_restore_args *ta)
 		if (pagemap_render_iovec(&rsti(t)->vma_io, ta) < 0)
 			return -1;
 
-		ta->streamer_private_ready_futex = alloc_streamer_futex_array(ta->vma_ios_n);
-		if (ta->vma_ios_n && !ta->streamer_private_ready_futex)
-			return -1;
-		ta->streamer_private_ready_futex_n = ta->vma_ios_n;
-
 		/*
 		 * Synchronization model:
 		 *
-		 *  - sync mode (opts.stream_restore_async = 0): streamer's 'A'
-		 *    ack on the private socket already gated this function on
-		 *    full memfd fill. streamer_ready_pipe_fd is -1; PIE's read
-		 *    loop proceeds immediately.
-		 *  - async mode (default): 'A' ack arrived on memfd handover;
+		 *  - sync mode (opts.stream_restore_async = 0): the streamer's
+		 *    'A' ack on the private socket already gated this function
+		 *    on full memfd fill. streamer_ready_pipe_fd is -1 and PIE
+		 *    proceeds immediately.
+		 *  - async mode: the ack arrived on memfd handover and the
 		 *    streamer is still filling. streamer_ready_pipe_fd points
-		 *    at a pipe the streamer will write one byte to when fill
-		 *    completes (or close on abort). PIE blocks on sys_read
+		 *    at a pipe the streamer writes one byte to when the fill
+		 *    completes (or closes on abort); PIE blocks on sys_read
 		 *    before consuming the ranges.
 		 *
-		 * Either way the whole-memfd readiness is carried by the ack or
-		 * the pipe, so the per-range futex words are pre-marked ready
-		 * and PIE's wait-loop falls through on the first atomic load.
-		 * The per-range scaffolding is reserved for sub-memfd
-		 * parallelism if overlap measurement later shows room for it.
-
+		 * Either way readiness is whole-memfd, carried by the ack or
+		 * the pipe, so there is no per-range readiness to publish. The
+		 * per-range futex array stays unallocated: nothing reads it
+		 * (the PIE-side wait loop is not part of this branch), and
+		 * shmalloc'ing it here is not merely wasteful but wrong --
+		 * shmalloc draws from RM_SHARED, which is already switched off
+		 * by the time prepare_vma_ios() runs, so the allocation trips
+		 * BUG_ON(!t->enabled) in rst_mem_alloc() and segfaults the
+		 * restore.
 		 */
-		for (i = 0; i < ta->streamer_private_ready_futex_n; i++)
-			ta->streamer_private_ready_futex[i] = 1;
+		ta->streamer_private_ready_futex = NULL;
+		ta->streamer_private_ready_futex_n = 0;
 		return 0;
 	}
 
