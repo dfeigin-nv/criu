@@ -2466,7 +2466,20 @@ __visible long __export_restore_task(struct task_restore_args *args)
 			VmaEntry *e = args->vmas + i;
 			unsigned long len;
 
-			if (!vma_entry_is(e, VMA_ANON_SHARED))
+			/*
+			 * MODE_MINOR needs a shmem-backed MAP_SHARED
+			 * mapping. Anonymous shmem qualifies, and so does
+			 * memfd-backed shmem (VMA_AREA_MEMFD | VMA_FILE_SHARED)
+			 * — which is what vLLM's sleep-mode weight shadows
+			 * actually are, and where nearly all of a large dump's
+			 * bytes live. MAP_PRIVATE memfd VMAs (the
+			 * --memfd-private-anon conversion) are not shmem
+			 * mappings for UFFD purposes and must not register.
+			 */
+			if (!vma_entry_is(e, VMA_ANON_SHARED) &&
+			    !vma_entry_is(e, VMA_AREA_MEMFD))
+				continue;
+			if (!(e->flags & MAP_SHARED))
 				continue;
 			if (e->fd == -1UL)
 				continue;

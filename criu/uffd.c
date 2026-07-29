@@ -1776,6 +1776,134 @@ static int uffd_continue_memfd(struct lazy_pages_info *lpi,
  * Hugetlb shmem is excluded (UFFD MODE_MINOR doesn't support it; the
  * agent never registers MODE_MINOR for those VMAs).
  */
+/*
+ * Map a memfd-backed VMA onto the shmid the streamer knows it by.
+ *
+ * For anonymous shmem vma->shmid is the shmem id directly. For a
+ * VMA_AREA_MEMFD vma it is instead a *file id*, and reaching the shmid
+ * takes two hops:
+ *
+ *   vma->shmid -> files.img FILE_ENTRY(MEMFD).memfd.inode_id
+ *              -> memfd.img MemfdInodeEntry.shmid
+ *
+ * which is the id space pagemap-shmem-<shmid>.img is named for, and hence
+ * what the streamer puts in its shmid table. Without this the memfd VMAs
+ * never match and the daemon registers nothing — the CONTINUE path then
+ * silently does nothing while the restore still succeeds via inline reads.
+ */
+struct memfd_shmid_map {
+	uint32_t file_id;
+	uint64_t shmid;
+};
+
+static struct memfd_shmid_map *memfd_shmid_maps;
+static size_t memfd_shmid_map_n;
+
+static int build_memfd_shmid_map(void)
+{
+	struct cr_img *img;
+	uint64_t *shmid_by_inode = NULL;
+	size_t inode_cap = 0, n = 0, cap = 0;
+	int ret = -1;
+
+	/* Pass 1: memfd.img -> inode_id -> shmid. */
+	img = open_image(CR_FD_MEMFD_INODE, O_RSTR);
+	if (!img)
+		return 0; /* no memfd inodes in this image set */
+	while (1) {
+		MemfdInodeEntry *mie;
+		int rc = pb_read_one_eof(img, &mie, PB_MEMFD_INODE);
+
+		if (rc <= 0) {
+			if (rc < 0)
+				goto out_img;
+			break;
+		}
+		if (mie->inode_id >= inode_cap) {
+			size_t want = mie->inode_id + 64;
+			uint64_t *tmp = xrealloc(shmid_by_inode, want * sizeof(*tmp));
+
+			if (!tmp) {
+				memfd_inode_entry__free_unpacked(mie, NULL);
+				goto out_img;
+			}
+			memset(tmp + inode_cap, 0, (want - inode_cap) * sizeof(*tmp));
+			shmid_by_inode = tmp;
+			inode_cap = want;
+		}
+		shmid_by_inode[mie->inode_id] = mie->shmid;
+		memfd_inode_entry__free_unpacked(mie, NULL);
+	}
+	close_image(img);
+
+	if (!inode_cap) {
+		ret = 0;
+		goto out;
+	}
+
+	/* Pass 2: files.img -> MEMFD file id -> inode_id -> shmid. */
+	img = open_image(CR_FD_FILES, O_RSTR);
+	if (!img) {
+		ret = 0;
+		goto out;
+	}
+	while (1) {
+		FileEntry *fe;
+		int rc = pb_read_one_eof(img, &fe, PB_FILE);
+
+		if (rc <= 0) {
+			if (rc < 0)
+				goto out_img;
+			break;
+		}
+		if (fe->type == FD_TYPES__MEMFD && fe->memfd &&
+		    fe->memfd->inode_id < inode_cap &&
+		    shmid_by_inode[fe->memfd->inode_id]) {
+			if (n == cap) {
+				size_t want = cap ? cap * 2 : 64;
+				struct memfd_shmid_map *tmp =
+					xrealloc(memfd_shmid_maps, want * sizeof(*tmp));
+
+				if (!tmp) {
+					file_entry__free_unpacked(fe, NULL);
+					goto out_img;
+				}
+				memfd_shmid_maps = tmp;
+				cap = want;
+			}
+			memfd_shmid_maps[n].file_id = fe->memfd->id;
+			memfd_shmid_maps[n].shmid = shmid_by_inode[fe->memfd->inode_id];
+			n++;
+		}
+		file_entry__free_unpacked(fe, NULL);
+	}
+	close_image(img);
+	memfd_shmid_map_n = n;
+	pr_info("[stream-c] memfd shmid map: %zu file id(s)\n", n);
+	ret = 0;
+	goto out;
+
+out_img:
+	close_image(img);
+out:
+	xfree(shmid_by_inode);
+	return ret;
+}
+
+static uint64_t streamer_vma_shmid(VmaEntry *vma)
+{
+	size_t i;
+
+	if (!vma_entry_is(vma, VMA_AREA_MEMFD))
+		return vma->shmid;
+
+	for (i = 0; i < memfd_shmid_map_n; i++)
+		if (memfd_shmid_maps[i].file_id == (uint32_t)vma->shmid)
+			return memfd_shmid_maps[i].shmid;
+
+	return vma->shmid;
+}
+
 static int build_streamer_evfd_vmas(void)
 {
 	struct lazy_pages_info *lpi;
@@ -1783,6 +1911,9 @@ static int build_streamer_evfd_vmas(void)
 
 	if (streamer_evfd_n == 0)
 		return 0;
+
+	if (build_memfd_shmid_map())
+		return -1;
 
 	list_for_each_entry(lpi, &lpis, l) {
 		MmEntry *mm = init_mm_entry(lpi);
@@ -1804,14 +1935,17 @@ static int build_streamer_evfd_vmas(void)
 			 * generates a shmid for hugetlb so MAP_HUGETLB filter is
 			 * redundant — but keep it as a defense-in-depth gate.
 			 */
+			uint64_t shmid;
+
 			if (vma->shmid == 0)
 				continue;
 			if (vma->flags & MAP_HUGETLB)
 				continue;
+			shmid = streamer_vma_shmid(vma);
 			for (i = 0; i < streamer_evfd_n; i++) {
 				struct streamer_evfd_vma *ev;
 
-				if (vma->shmid != streamer_evfd_shmids[i])
+				if (shmid != streamer_evfd_shmids[i])
 					continue;
 				ev = xmalloc(sizeof(*ev));
 				if (!ev) {
@@ -1826,7 +1960,7 @@ static int build_streamer_evfd_vmas(void)
 				total++;
 				lp_debug(lpi,
 					 "[stream-c] shmid=0x%lx idx=%u vma=%lx-%lx\n",
-					 (unsigned long)vma->shmid, i,
+					 (unsigned long)shmid, i,
 					 (unsigned long)vma->start,
 					 (unsigned long)vma->end);
 			}
