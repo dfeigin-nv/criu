@@ -2430,10 +2430,63 @@ __visible long __export_restore_task(struct task_restore_args *args)
 		goto core_restore_end;
 	}
 
+
 	/*
-	 * Pipeline C (stream-restore): before the uffd is closed below,
-	 * walk the VMA table and UFFDIO_REGISTER each memfd-backed shmem
-	 * mapping with MODE_MINOR. This lets the daemon (criu/uffd.c)
+	 * --stream-private=uffd: register eligible private anonymous VMAs
+	 * MODE_MISSING so the daemon serves their pages with UFFDIO_COPY.
+	 * stream_uffd_private_eligible() excludes the vdso and the other
+	 * special mappings; those must never reach the daemon.
+	 */
+	if (args->stream_restore && args->stream_private_mode == 2 && args->uffd > -1) {
+		for (i = 0; i < args->vmas_n; i++) {
+			VmaEntry *e = args->vmas + i;
+			unsigned long len;
+
+			if (!stream_uffd_private_eligible(e))
+				continue;
+
+			len = vma_entry_len(e);
+			if (enable_uffd(args->uffd, e->start, len,
+					UFFDIO_REGISTER_MODE_MISSING) != 0) {
+				pr_err("stream: MISSING register %"PRIx64" len %lx failed\n",
+				       e->start, len);
+				goto core_restore_end;
+			}
+		}
+	}
+
+	/*
+	 * OK, lets try to map new one.
+	 */
+	for (i = 0; i < args->vmas_n; i++) {
+		vma_entry = args->vmas + i;
+
+		if (!vma_entry_is(vma_entry, VMA_AREA_REGULAR) && !vma_entry_is(vma_entry, VMA_AREA_AIORING))
+			continue;
+
+		if (vma_entry_is(vma_entry, VMA_PREMMAPED))
+			continue;
+
+		va = restore_mapping(vma_entry);
+
+		if (va != vma_entry->start) {
+			pr_err("Can't restore %" PRIx64 " mapping with %lx\n", vma_entry->start, va);
+			goto core_restore_end;
+		}
+	}
+
+	/*
+	 * Pipeline C (stream-restore): walk the VMA table and
+	 * UFFDIO_REGISTER each memfd-backed shmem mapping with MODE_MINOR.
+	 *
+	 * This must run AFTER the restore_mapping() loop above. MODE_MINOR
+	 * is only accepted on a shmem- or hugetlb-backed VMA
+	 * (vma_can_userfault()), and the memfd VMAs do not exist until
+	 * restore_mapping() mmaps them — registering earlier returns
+	 * EINVAL against a hole:
+	 *   register: 0x365400000, len 0x941000, mode 0x4 -> rc:-22
+	 * Premapped private VMAs are unaffected, which is why the
+	 * lazy-pages MISSING path never hit this. This lets the daemon (criu/uffd.c)
 	 * install streamer-filled bytes via UFFDIO_CONTINUE when the
 	 * restored process touches the page.
 	 *
@@ -2494,30 +2547,6 @@ __visible long __export_restore_task(struct task_restore_args *args)
 		}
 	}
 
-	/*
-	 * --stream-private=uffd: register eligible private anonymous VMAs
-	 * MODE_MISSING so the daemon serves their pages with UFFDIO_COPY.
-	 * stream_uffd_private_eligible() excludes the vdso and the other
-	 * special mappings; those must never reach the daemon.
-	 */
-	if (args->stream_restore && args->stream_private_mode == 2 && args->uffd > -1) {
-		for (i = 0; i < args->vmas_n; i++) {
-			VmaEntry *e = args->vmas + i;
-			unsigned long len;
-
-			if (!stream_uffd_private_eligible(e))
-				continue;
-
-			len = vma_entry_len(e);
-			if (enable_uffd(args->uffd, e->start, len,
-					UFFDIO_REGISTER_MODE_MISSING) != 0) {
-				pr_err("stream: MISSING register %"PRIx64" len %lx failed\n",
-				       e->start, len);
-				goto core_restore_end;
-			}
-		}
-	}
-
 	if (args->uffd > -1) {
 		pr_debug("lazy-pages: closing uffd %d\n", args->uffd);
 		/*
@@ -2528,25 +2557,6 @@ __visible long __export_restore_task(struct task_restore_args *args)
 		sys_close(args->uffd);
 	}
 
-	/*
-	 * OK, lets try to map new one.
-	 */
-	for (i = 0; i < args->vmas_n; i++) {
-		vma_entry = args->vmas + i;
-
-		if (!vma_entry_is(vma_entry, VMA_AREA_REGULAR) && !vma_entry_is(vma_entry, VMA_AREA_AIORING))
-			continue;
-
-		if (vma_entry_is(vma_entry, VMA_PREMMAPED))
-			continue;
-
-		va = restore_mapping(vma_entry);
-
-		if (va != vma_entry->start) {
-			pr_err("Can't restore %" PRIx64 " mapping with %lx\n", vma_entry->start, va);
-			goto core_restore_end;
-		}
-	}
 
 	/*
 	 * Now read the contents (if any).
