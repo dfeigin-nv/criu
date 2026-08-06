@@ -29,6 +29,7 @@
 #include "images/pagemap.pb-c.h"
 #include "namespaces.h"
 #include "asyncd.h"
+#include "extmem.h"
 
 #ifndef SEEK_DATA
 #define SEEK_DATA 3
@@ -574,6 +575,7 @@ static int open_shmem(int pid, struct vma_area *vma)
 	void *addr = MAP_FAILED;
 	int f = -1;
 	int flags, is_hugetlb, memfd_flag = 0;
+	int provider_ret = -ENOTSUP;
 
 	si = shmem_find(vi->shmid);
 	pr_info("Search for %#016" PRIx64 " shmem 0x%" PRIx64 " %p/%d\n", vi->start, vi->shmid, si, si ? si->pid : -1);
@@ -606,7 +608,18 @@ static int open_shmem(int pid, struct vma_area *vma)
 		memfd_flag |= MFD_HUGETLB | size_flag;
 	}
 
-	if (kdat.has_memfd && (!is_hugetlb || kdat.has_memfd_hugetlb)) {
+	if (!is_hugetlb)
+		provider_ret = extmem_get_shared(si->shmid, si->size, &f);
+	if (provider_ret == 0) {
+		if (extmem_validate_memfd(f, si->size)) {
+			pr_err("Provider returned an invalid shared descriptor\n");
+			goto err;
+		}
+		flags |= MAP_FILE;
+	} else if (provider_ret != -ENOTSUP) {
+		pr_err("External memory provider failed to open shmem 0x%lx\n", si->shmid);
+		goto err;
+	} else if (kdat.has_memfd && (!is_hugetlb || kdat.has_memfd_hugetlb)) {
 		f = memfd_create("", memfd_flag);
 		if (f < 0) {
 			pr_perror("Unable to create memfd");

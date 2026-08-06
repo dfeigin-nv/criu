@@ -4,6 +4,7 @@ ldflags-y		+= -r
 
 obj-y			+= action-scripts.o
 obj-y			+= external.o
+obj-y			+= extmem.o
 obj-y			+= aio.o
 obj-y			+= apparmor.o
 obj-y			+= bfd.o

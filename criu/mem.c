@@ -36,6 +36,7 @@
 #include "compel/infect-util.h"
 #include "pidfd-store.h"
 #include "compression.h"
+#include "extmem.h"
 
 #include "protobuf.h"
 #include "images/pagemap.pb-c.h"
@@ -1631,6 +1632,28 @@ int open_vmas(struct pstree_item *t)
 	filemap_ctx_init(false);
 
 	list_for_each_entry(vma, &vmas->h, list) {
+		int fd;
+		int ret;
+
+		if (vma_area_is(vma, VMA_ANON_PRIVATE) && !(vma->e->flags & MAP_GROWSDOWN) &&
+		    !(vma->e->madv & (1ul << MADV_WIPEONFORK)) && extmem_enabled()) {
+			ret = extmem_get_vma(pid, vma->e->start, vma_entry_len(vma->e), &fd);
+			if (ret == 0) {
+				if (extmem_validate_memfd(fd, vma_entry_len(vma->e))) {
+					close(fd);
+					pr_err("Provider returned an invalid private VMA descriptor\n");
+					return -1;
+				}
+				vma->e->fd = fd;
+				vma->e->flags &= ~MAP_ANONYMOUS;
+				vma->e->flags |= MAP_PRIVATE;
+				vma->e->status |= VMA_EXT_PROVIDER | VMA_CLOSE;
+				continue;
+			}
+			if (ret != -ENOTSUP)
+				return -1;
+		}
+
 		if (!vma_area_is(vma, VMA_AREA_REGULAR) || !vma->vm_open)
 			continue;
 

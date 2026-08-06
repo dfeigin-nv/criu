@@ -1624,6 +1624,7 @@ int inherit_fd_add(int fd, char *key)
 	}
 
 	inh->inh_fd = fd;
+	inh->inh_fd_id = -1;
 	list_add_tail(&inh->inh_list, &opts.inherit_fds);
 	return 0;
 }
@@ -1666,7 +1667,8 @@ int inherit_fd_lookup_id(char *id)
 	ret = -1;
 	list_for_each_entry(inh, &opts.inherit_fds, inh_list) {
 		if (!strcmp(inh->inh_id, id)) {
-			ret = fdstore_get(inh->inh_fd_id);
+			if (inh->inh_fd_id >= 0)
+				ret = fdstore_get(inh->inh_fd_id);
 			pr_debug("Found id %s (fd %d) in inherit fd list\n", id, ret);
 			break;
 		}

@@ -84,6 +84,7 @@
 #include "sk-queue.h"
 #include "sigframe.h"
 #include "fdstore.h"
+#include "extmem.h"
 #include "string.h"
 #include "memfd.h"
 #include "timens.h"
@@ -2497,6 +2498,7 @@ clean_cgroup:
 	fini_cgroup();
 err:
 	cr_plugin_fini(CR_PLUGIN_STAGE__RESTORE, ret);
+	extmem_report_timings();
 	return ret;
 }
 

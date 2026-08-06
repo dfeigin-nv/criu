@@ -102,6 +102,7 @@
 #define VMA_AREA_GUARD	 (1 << 16)
 #define VMA_AREA_UPROBES	(1 << 17)
 #define VMA_AREA_NOT_ACCOUNTABLE (1 << 18)
+#define VMA_EXT_PROVIDER (1 << 19)
 
 #define VMA_EXT_PLUGIN	  (1 << 27)
 #define VMA_CLOSE	  (1 << 28)
