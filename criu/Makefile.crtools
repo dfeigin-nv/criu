@@ -3,6 +3,7 @@ CFLAGS_kerndat.o	+= -DKDAT_MAGIC_2=${shell echo $${SOURCE_DATE_EPOCH:-$$(date +%
 ldflags-y		+= -r
 
 obj-y			+= action-scripts.o
+obj-y			+= agent-cuda.o
 obj-y			+= external.o
 obj-y			+= extmem.o
 obj-y			+= aio.o

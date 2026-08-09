@@ -5,6 +5,7 @@
 #include <unistd.h>
 #include <errno.h>
 #include <string.h>
+#include <time.h>
 
 #include <fcntl.h>
 
@@ -76,6 +77,7 @@
 #include "cgroup.h"
 #include "timerfd.h"
 #include "action-scripts.h"
+#include "agent-cuda.h"
 #include "shmem.h"
 #include "aio.h"
 #include "lsm.h"
@@ -127,6 +129,67 @@
 #endif
 
 struct pstree_item *current;
+
+static uint64_t restore_profile_start_ns;
+
+static uint64_t restore_monotonic_ns(void)
+{
+	struct timespec ts;
+
+	if (clock_gettime(CLOCK_REALTIME, &ts))
+		return 0;
+	return (uint64_t)ts.tv_sec * 1000000000ULL + ts.tv_nsec;
+}
+
+static void restore_phase_mark(const char *phase)
+{
+	uint64_t now = restore_monotonic_ns();
+
+	if (!restore_profile_start_ns)
+		restore_profile_start_ns = now;
+	dprintf(STDERR_FILENO, "CRIU_RESTORE_PHASE pid=%d phase=%s elapsed_s=%.6f\n", getpid(), phase,
+		(double)(now - restore_profile_start_ns) / 1000000000.0);
+}
+
+static void restore_phase_store(uint64_t *slot)
+{
+	uint64_t now = restore_monotonic_ns();
+	uint64_t old = __atomic_load_n(slot, __ATOMIC_RELAXED);
+
+	while (old < now && !__atomic_compare_exchange_n(slot, &old, now, false, __ATOMIC_RELAXED, __ATOMIC_RELAXED))
+		;
+}
+
+static void restore_phase_report_stored(const char *phase, uint64_t at)
+{
+	if (!at)
+		return;
+	dprintf(STDERR_FILENO, "CRIU_RESTORE_PHASE pid=child phase=%s elapsed_s=%.6f\n", phase,
+		(double)(at - restore_profile_start_ns) / 1000000000.0);
+}
+
+static void restore_phase_report_child(void)
+{
+	restore_phase_report_stored("provider-vmas-ready", task_entries->profile_provider_vmas_ns);
+	restore_phase_report_stored("root-mappings-ready", task_entries->profile_mappings_ns);
+	restore_phase_report_stored("tasks-forked", task_entries->profile_tasks_forked_ns);
+	restore_phase_report_stored("alive-start", task_entries->profile_alive_start_ns);
+	restore_phase_report_stored("fds-ready", task_entries->profile_fds_ns);
+	restore_phase_report_stored("vmas-open", task_entries->profile_vmas_open_ns);
+	restore_phase_report_stored("task-resources-ready", task_entries->profile_resources_ns);
+	restore_phase_report_stored("mm-ready", task_entries->profile_mm_ns);
+	restore_phase_report_stored("vmas-prepared", task_entries->profile_vmas_prepared_ns);
+	restore_phase_report_stored("sigreturn-enter", task_entries->profile_sigreturn_enter_ns);
+	restore_phase_report_stored("restorer-handoff", task_entries->profile_restorer_handoff_ns);
+	restore_phase_report_stored("restorer-start", task_entries->profile_restorer_start_ns);
+	restore_phase_report_stored("restorer-unmap-done", task_entries->profile_unmap_done_ns);
+	restore_phase_report_stored("restorer-mappings-done", task_entries->profile_mappings_done_ns);
+	restore_phase_report_stored("restorer-io-done", task_entries->profile_io_done_ns);
+	restore_phase_report_stored("restorer-madv-done", task_entries->profile_madv_done_ns);
+	restore_phase_report_stored("restorer-threads-start", task_entries->profile_threads_start_ns);
+	restore_phase_report_stored("restorer-threads-done", task_entries->profile_threads_done_ns);
+	restore_phase_report_stored("restorer-done", task_entries->profile_restorer_done_ns);
+}
 
 static int restore_task_with_children(void *);
 static int sigreturn_restore(pid_t pid, struct task_restore_args *ta, unsigned long alen, CoreEntry *core);
@@ -643,7 +706,11 @@ static int restore_one_alive_task(int pid, CoreEntry *core)
 {
 	unsigned args_len;
 	struct task_restore_args *ta;
+	bool profile = current == root_item;
 	pr_info("Restoring resources\n");
+	restore_phase_store(&task_entries->profile_alive_start_ns);
+	if (profile)
+		restore_phase_mark("alive-start");
 
 	rst_mem_switch_to_private();
 
@@ -656,12 +723,18 @@ static int restore_one_alive_task(int pid, CoreEntry *core)
 
 	if (prepare_fds(current))
 		return -1;
+	restore_phase_store(&task_entries->profile_fds_ns);
+	if (profile)
+		restore_phase_mark("fds-ready");
 
 	if (prepare_file_locks(pid))
 		return -1;
 
 	if (open_vmas(current))
 		return -1;
+	restore_phase_store(&task_entries->profile_vmas_open_ns);
+	if (profile)
+		restore_phase_mark("vmas-open");
 
 	if (prepare_aios(current, ta))
 		return -1;
@@ -712,12 +785,21 @@ static int restore_one_alive_task(int pid, CoreEntry *core)
 
 	if (prepare_itimers(pid, ta, core) < 0)
 		return -1;
+	restore_phase_store(&task_entries->profile_resources_ns);
+	if (profile)
+		restore_phase_mark("task-resources-ready");
 
 	if (prepare_mm(pid, ta))
 		return -1;
+	restore_phase_store(&task_entries->profile_mm_ns);
+	if (profile)
+		restore_phase_mark("mm-ready");
 
 	if (prepare_vmas(current, ta))
 		return -1;
+	restore_phase_store(&task_entries->profile_vmas_prepared_ns);
+	if (profile)
+		restore_phase_mark("vmas-prepared");
 
 	/*
 	 * Sockets have to be restored in their network namespaces,
@@ -731,6 +813,9 @@ static int restore_one_alive_task(int pid, CoreEntry *core)
 
 	if (arch_shstk_prepare(current, core, ta))
 		return -1;
+	restore_phase_store(&task_entries->profile_sigreturn_enter_ns);
+	if (profile)
+		restore_phase_mark("sigreturn-enter");
 
 	return sigreturn_restore(pid, ta, args_len, core);
 }
@@ -1529,6 +1614,8 @@ static int __restore_task_with_children(void *_arg)
 	int ret;
 
 	current = ca->item;
+	if (current == root_item)
+		restore_phase_mark("root-child-start");
 
 	if (current != root_item) {
 		char buf[12];
@@ -1642,9 +1729,11 @@ static int __restore_task_with_children(void *_arg)
 
 		if (restore_finish_ns_stage(CR_STATE_PREPARE_NAMESPACES, CR_STATE_FORKING) < 0)
 			goto err;
+		restore_phase_mark("root-namespace-ready");
 
 		if (root_prepare_shared())
 			goto err;
+		restore_phase_mark("root-shared-ready");
 
 		if (populate_root_fd_off())
 			goto err;
@@ -1656,8 +1745,17 @@ static int __restore_task_with_children(void *_arg)
 	if (restore_task_mnt_ns(current))
 		goto err;
 
+	if (prepare_extmem_vmas(current))
+		goto err;
+	restore_phase_store(&task_entries->profile_provider_vmas_ns);
+	if (current == root_item)
+		restore_phase_mark("provider-vmas-ready");
+
 	if (prepare_mappings(current))
 		goto err;
+	restore_phase_store(&task_entries->profile_mappings_ns);
+	if (current == root_item)
+		restore_phase_mark("root-mappings-ready");
 
 	if (prepare_sigactions(ca->core) < 0)
 		goto err;
@@ -1674,6 +1772,7 @@ static int __restore_task_with_children(void *_arg)
 
 	if (create_children_and_session())
 		goto err;
+	restore_phase_store(&task_entries->profile_tasks_forked_ns);
 
 	timing_stop(TIME_FORK);
 
@@ -1706,6 +1805,7 @@ static int __restore_task_with_children(void *_arg)
 		/* streamer serves each image once, one at a time; asyncd reads in parallel. */
 		if (!opts.stream && start_asyncd())
 			goto err;
+		restore_phase_mark("tasks-forked");
 
 		__restore_switch_stage(CR_STATE_PRE_RESTORER);
 	} else {
@@ -2061,6 +2161,7 @@ static int restore_root_task(struct pstree_item *init)
 	int root_seized = 0;
 	struct pstree_item *item;
 	pid_t *pids = NULL;
+	restore_phase_mark("root-coordinator-start");
 
 	ret = run_scripts(ACT_PRE_RESTORE);
 	if (ret != 0) {
@@ -2090,6 +2191,7 @@ static int restore_root_task(struct pstree_item *init)
 
 	if (prepare_namespace_before_tasks())
 		return -1;
+	restore_phase_mark("namespace-prepared");
 
 	if (vpid(init) == INIT_PID) {
 		if (!(root_ns_mask & CLONE_NEWPID)) {
@@ -2118,6 +2220,7 @@ static int restore_root_task(struct pstree_item *init)
 	ret = fork_with_pid(init);
 	if (ret < 0)
 		goto out;
+	restore_phase_mark("root-forked");
 
 	restore_origin_ns_hook();
 
@@ -2200,8 +2303,10 @@ skip_ns_bouncing:
 	ret = restore_wait_inprogress_tasks();
 	if (ret < 0)
 		goto out_kill;
+	restore_phase_mark("tasks-pre-restorer");
+	restore_phase_report_child();
 
-	ret = apply_memfd_seals();
+	ret = apply_memfd_seals(false);
 	if (ret < 0)
 		goto out_kill;
 
@@ -2218,6 +2323,7 @@ skip_ns_bouncing:
 	ret = restore_switch_stage(CR_STATE_RESTORE_SIGCHLD);
 	if (ret < 0)
 		goto out_kill;
+	restore_phase_mark("tasks-sigreturn-ready");
 
 	ret = stop_usernsd();
 	if (ret < 0)
@@ -2286,6 +2392,7 @@ skip_ns_bouncing:
 		pr_err("Can't catch all tasks\n");
 		goto out_kill_network_unlocked;
 	}
+	restore_phase_mark("tasks-caught");
 
 	if (lazy_pages_finish_restore())
 		goto out_kill_network_unlocked;
@@ -2299,12 +2406,20 @@ skip_ns_bouncing:
 	}
 	xfree(pids);
 	pids = NULL;
+	restore_phase_mark("tasks-stopped-on-sigreturn");
 
 	finalize_restore();
 
 	/* just before releasing threads we have to restore rseq_cs */
 	if (restore_rseq_cs())
 		pr_err("Unable to restore rseq_cs state\n");
+
+	ret = extmem_wait_ready();
+	if (ret < 0 && ret != -ENOTSUP) {
+		pr_err("External memory materialization failed before device restore\n");
+		goto out_kill_network_unlocked;
+	}
+	restore_phase_mark("host-memory-ready");
 
 	/*
 	 * Some external devices such as GPUs might need a very late
@@ -2331,10 +2446,30 @@ skip_ns_bouncing:
 		if (ret < 0 && ret != -ENOTSUP)
 			pr_debug("restore late stage hook for external plugin failed\n");
 	}
+	restore_phase_mark("late-device-hooks-complete");
 
 	ret = run_scripts(ACT_PRE_RESUME);
-	if (ret)
+	restore_phase_mark("pre-resume-script-complete");
+	if (ret) {
 		pr_err("Pre-resume script ret code %d\n", ret);
+		goto out_kill_network_unlocked;
+	}
+
+	if (agent_cuda_prepare())
+		goto out_kill_network_unlocked;
+	if (agent_cuda_requested()) {
+		ret = run_scripts(ACT_AGENT_CUDA_RESTORE);
+		if (agent_cuda_finish())
+			goto out_kill_network_unlocked;
+		if (ret) {
+			pr_err("Agent CUDA restore script ret code %d\n", ret);
+			goto out_kill_network_unlocked;
+		}
+	}
+
+	ret = apply_memfd_seals(true);
+	if (ret < 0)
+		goto out_kill_network_unlocked;
 
 	if (restore_freezer_state())
 		pr_err("Unable to restore freezer state\n");
@@ -2342,6 +2477,7 @@ skip_ns_bouncing:
 	/* Detaches from processes and they continue run through sigreturn. */
 	if (finalize_restore_detach())
 		goto out_kill_network_unlocked;
+	restore_phase_mark("tasks-resumed");
 
 	pr_info("Restore finished successfully. Tasks resumed.\n");
 	write_stats(RESTORE_STATS);
@@ -2432,6 +2568,9 @@ int cr_restore_tasks(void)
 {
 	int ret = -1;
 
+	restore_profile_start_ns = restore_monotonic_ns();
+	restore_phase_mark("restore-start");
+
 	if (init_service_fd())
 		return 1;
 
@@ -2483,6 +2622,7 @@ int cr_restore_tasks(void)
 
 	if (crtools_prepare_shared() < 0)
 		goto err;
+	restore_phase_mark("shared-metadata-ready");
 
 	if (prepare_cgroup())
 		goto clean_cgroup;
@@ -2494,10 +2634,19 @@ int cr_restore_tasks(void)
 		goto clean_cgroup;
 
 	ret = restore_root_task(root_item);
+	restore_phase_mark("root-task-returned");
 clean_cgroup:
 	fini_cgroup();
 err:
 	cr_plugin_fini(CR_PLUGIN_STAGE__RESTORE, ret);
+	if (ret) {
+		if (extmem_abort())
+			pr_err("Failed to abort external memory provider session\n");
+	} else if (extmem_commit()) {
+		/* Tasks have already resumed; report cleanup failure without changing
+		 * the completed restore into an error. */
+		pr_err("Failed to commit external memory provider session\n");
+	}
 	extmem_report_timings();
 	return ret;
 }
@@ -3274,6 +3423,7 @@ static int sigreturn_restore(pid_t pid, struct task_restore_args *task_args, uns
 		if (restore_finish_stage(task_entries, CR_STATE_PRE_RESTORER) < 0)
 			goto err;
 	}
+	restore_phase_store(&task_entries->profile_restorer_handoff_ns);
 
 	/*
 	 * We're about to search for free VM area and inject the restorer blob
@@ -3512,7 +3662,8 @@ static int sigreturn_restore(pid_t pid, struct task_restore_args *task_args, uns
 		thread_args[i].clear_tid_addr = CORE_THREAD_ARCH_INFO(tcore)->clear_tid_addr;
 		core_get_tls(tcore, &thread_args[i].tls);
 
-		if (tcore->thread_core->has_cg_set && rsti(current)->cg_set != tcore->thread_core->cg_set) {
+		if (tcore->thread_core->has_cg_set && rsti(current)->cg_set != tcore->thread_core->cg_set &&
+		    cgroup_has_threaded_controller()) {
 			thread_args[i].cg_set = tcore->thread_core->cg_set;
 			thread_args[i].cgroupd_sk = dup(get_service_fd(CGROUPD_SK));
 		} else {

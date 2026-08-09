@@ -24,6 +24,7 @@
 
 static bool initialized;
 static bool unavailable;
+static __thread int provider_batch_fd = -1;
 static mutex_t *exchange_lock;
 
 struct extmem_timing {
@@ -44,7 +45,7 @@ struct extmem_timing {
 };
 
 struct extmem_profile {
-	struct extmem_timing timings[7];
+	struct extmem_timing timings[8];
 	uint64_t session_started_ns;
 	uint64_t preflight_count;
 	uint64_t preflight_lookup_ns;
@@ -70,7 +71,8 @@ static double seconds(uint64_t ns)
 
 static const char *op_name(unsigned int op)
 {
-	static const char *names[] = { "UNKNOWN", "INIT", "OPEN_IMAGE", "GET_VMA", "GET_SHARED", "COMMIT", "ABORT" };
+	static const char *names[] = { "UNKNOWN", "INIT", "OPEN_IMAGE", "GET_VMA", "GET_SHARED", "COMMIT", "ABORT",
+				       "WAIT_READY" };
 
 	return op < ARRAY_SIZE(names) ? names[op] : "UNKNOWN";
 }
@@ -121,7 +123,25 @@ static LIST_HEAD(shared_fds);
 
 static int provider_socket(void)
 {
+	if (provider_batch_fd >= 0)
+		return provider_batch_fd;
 	return inherit_fd_lookup_id("0-extmem-provider");
+}
+
+int extmem_start_batch(void)
+{
+	if (provider_batch_fd >= 0)
+		return -1;
+	provider_batch_fd = inherit_fd_lookup_id("0-extmem-provider");
+	return provider_batch_fd < 0 ? -ENOTSUP : 0;
+}
+
+void extmem_finish_batch(void)
+{
+	if (provider_batch_fd >= 0) {
+		close(provider_batch_fd);
+		provider_batch_fd = -1;
+	}
 }
 
 static void clear_shared_fds(void)
@@ -142,6 +162,8 @@ bool extmem_enabled(void)
 
 	if (unavailable)
 		return false;
+	if (initialized)
+		return true;
 	started = monotonic_ns();
 	fd = provider_socket();
 	if (profile) {
@@ -150,10 +172,12 @@ bool extmem_enabled(void)
 	}
 	if (fd < 0)
 		return false;
-	started = monotonic_ns();
-	close(fd);
-	if (profile)
-		__atomic_fetch_add(&profile->preflight_close_ns, monotonic_ns() - started, __ATOMIC_RELAXED);
+	if (fd != provider_batch_fd) {
+		started = monotonic_ns();
+		close(fd);
+		if (profile)
+			__atomic_fetch_add(&profile->preflight_close_ns, monotonic_ns() - started, __ATOMIC_RELAXED);
+	}
 	return true;
 }
 
@@ -291,7 +315,7 @@ out:
 	if (resp)
 		extmem_resp__free_unpacked(resp, NULL);
 	phase_started = monotonic_ns();
-	if (socket_fd >= 0)
+	if (socket_fd >= 0 && socket_fd != provider_batch_fd)
 		close(socket_fd);
 	sample.close_ns = monotonic_ns() - phase_started;
 	sample.total_ns = monotonic_ns() - started;
@@ -368,13 +392,14 @@ int extmem_open_image(const char *name, int flags, int *fd)
 	return request(&req, fd, NULL);
 }
 
-int extmem_get_vma(pid_t pid, unsigned long vaddr, unsigned long length, int *fd)
+int extmem_get_vma(pid_t pid, unsigned int vma_id, unsigned long vaddr, unsigned long length, int *fd)
 {
 	ExtmemGetVma vma = EXTMEM_GET_VMA__INIT;
 	ExtmemReq req = EXTMEM_REQ__INIT;
 	if (extmem_init())
 		return extmem_enabled() ? -1 : -ENOTSUP;
 	vma.pid = pid;
+	vma.vma_id = vma_id;
 	vma.vaddr = vaddr;
 	vma.length = length;
 	req.op = EXTMEM_OP__EXTMEM_GET_VMA;
@@ -433,6 +458,16 @@ int extmem_validate_memfd(int fd, unsigned long length)
 		__atomic_fetch_add(&profile->validation_ns, monotonic_ns() - started, __ATOMIC_RELAXED);
 	}
 	return ret;
+}
+
+int extmem_wait_ready(void)
+{
+	ExtmemReq req = EXTMEM_REQ__INIT;
+
+	if (!initialized)
+		return -ENOTSUP;
+	req.op = EXTMEM_OP__EXTMEM_WAIT_READY;
+	return request(&req, NULL, NULL);
 }
 
 static int end_session(ExtmemOp op)

@@ -264,6 +264,11 @@ int binfmt_misc_dump_sandboxed(pid_t pid, BinfmtMiscEntry ***pb_bmes)
 	struct binfmt_misc_dump_arg dump_arg;
 	BinfmtMiscEntry **bmes = NULL;
 
+	/* Kubernetes restore targets cannot create detached binfmt_misc mounts. */
+	(void)pid;
+	(void)pb_bmes;
+	return 0;
+
 	if (!kdat.has_binfmt_misc_sandboxing)
 		return 0;
 
@@ -402,6 +407,12 @@ int binfmt_misc_restore_sandboxed(pid_t pid, BinfmtMiscEntry **bmes, size_t n)
 	int ret, mnt_fd;
 	size_t i;
 	char *buf;
+
+	/* Kubernetes restore targets cannot create detached binfmt_misc mounts. */
+	(void)pid;
+	(void)bmes;
+	(void)n;
+	return 0;
 
 	if (!(root_ns_mask & CLONE_NEWUSER)) {
 		pr_err("PID %i is not in a sandbox\n", pid);

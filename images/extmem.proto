@@ -9,6 +9,7 @@ enum extmem_op {
 	EXTMEM_GET_SHARED = 4;
 	EXTMEM_COMMIT = 5;
 	EXTMEM_ABORT = 6;
+	EXTMEM_WAIT_READY = 7;
 }
 
 message extmem_open_image {
@@ -18,8 +19,9 @@ message extmem_open_image {
 
 message extmem_get_vma {
 	required uint32 pid = 1;
-	required uint64 vaddr = 2;
-	required uint64 length = 3;
+	required uint32 vma_id = 2;
+	required uint64 vaddr = 3;
+	required uint64 length = 4;
 }
 
 message extmem_get_shared {

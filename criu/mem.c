@@ -1130,7 +1130,7 @@ static int premap_priv_vmas(struct pstree_item *t, struct vm_area_list *vmas, vo
 		if (!vma_area_is_private(vma, kdat.task_size))
 			continue;
 		exceptional = (vma->e->flags & MAP_HUGETLB) ||
-			      (vma->e->status & VMA_EXT_PLUGIN);
+			      (vma->e->status & (VMA_EXT_PLUGIN | VMA_EXT_PROVIDER));
 
 		/*
 		 * PIE cannot link against liblz4. Premap ordinary private VMAs which
@@ -1187,8 +1187,8 @@ static int premap_priv_vmas(struct pstree_item *t, struct vm_area_list *vmas, vo
 			continue;
 		}
 
-		/* VMA offset may change due to plugin so we cannot premap */
-		if (vma->e->status & VMA_EXT_PLUGIN) {
+		/* External mappings are installed by their provider, so we cannot premap them. */
+		if (vma->e->status & (VMA_EXT_PLUGIN | VMA_EXT_PROVIDER)) {
 			if (has_lz4) {
 				pr_err("External-plugin VMA %#" PRIx64 "-%#" PRIx64
 				       " contains an LZ4 block\n",
@@ -1244,6 +1244,7 @@ static int restore_priv_vma_content(struct pstree_item *t, struct page_read *pr)
 	unsigned int nr_compared = 0;
 	unsigned int nr_enqueued = 0;
 	unsigned int nr_lazy = 0;
+	unsigned int nr_provider = 0;
 	unsigned long va;
 	void *buf = NULL;
 	bool page_read_closed = false;
@@ -1300,6 +1301,18 @@ static int restore_priv_vma_content(struct pstree_item *t, struct page_read *pr)
 			else if (unlikely(!vma_area_is_private(vma, kdat.task_size))) {
 				pr_err("Trying to restore page for non-private VMA\n");
 				goto err_addr;
+			}
+
+			if (vma->e->status & VMA_EXT_PROVIDER) {
+				unsigned long len = min_t(unsigned long, (nr_pages - i) * PAGE_SIZE,
+							  vma->e->end - va);
+
+				pr->skip_pages(pr, len);
+				va += len;
+				len >>= PAGE_SHIFT;
+				nr_provider += len;
+				i += len;
+				continue;
 			}
 
 			if (!vma_area_is(vma, VMA_PREMMAPED)) {
@@ -1473,6 +1486,7 @@ err_read:
 	pr_info("nr_dropped_pages:  %d\n", nr_dropped);
 	pr_info("nr_enqueued:       %d\n", nr_enqueued);
 	pr_info("nr_lazy:           %d\n", nr_lazy);
+	pr_info("nr_provider:       %d\n", nr_provider);
 
 	exit_code = 0;
 	goto out;
@@ -1626,32 +1640,41 @@ int unmap_guard_pages(struct pstree_item *t)
 int open_vmas(struct pstree_item *t)
 {
 	int pid = vpid(t);
+	int exit_code = 0;
+	int batch_ret;
+	bool provider;
+	unsigned int vma_id = 0;
 	struct vma_area *vma;
 	struct vm_area_list *vmas = &rsti(t)->vmas;
 
 	filemap_ctx_init(false);
+	batch_ret = extmem_start_batch();
+	provider = batch_ret == 0;
+	if (batch_ret != 0 && batch_ret != -ENOTSUP) {
+		exit_code = -1;
+		goto out;
+	}
 
 	list_for_each_entry(vma, &vmas->h, list) {
-		int fd;
-		int ret;
+		unsigned int current_vma_id = vma_id++;
 
-		if (vma_area_is(vma, VMA_ANON_PRIVATE) && !(vma->e->flags & MAP_GROWSDOWN) &&
-		    !(vma->e->madv & (1ul << MADV_WIPEONFORK)) && extmem_enabled()) {
-			ret = extmem_get_vma(pid, vma->e->start, vma_entry_len(vma->e), &fd);
-			if (ret == 0) {
-				if (extmem_validate_memfd(fd, vma_entry_len(vma->e))) {
-					close(fd);
-					pr_err("Provider returned an invalid private VMA descriptor\n");
-					return -1;
-				}
-				vma->e->fd = fd;
-				vma->e->flags &= ~MAP_ANONYMOUS;
-				vma->e->flags |= MAP_PRIVATE;
-				vma->e->status |= VMA_EXT_PROVIDER | VMA_CLOSE;
-				continue;
+		if (vma->e->status & VMA_EXT_PROVIDER) {
+			int fd = -1;
+			int ret;
+
+			if (!provider) {
+				exit_code = -1;
+				goto out;
 			}
-			if (ret != -ENOTSUP)
-				return -1;
+			ret = extmem_get_vma(pid, current_vma_id, vma->e->start, vma_entry_len(vma->e), &fd);
+			if (ret || extmem_validate_memfd(fd, vma_entry_len(vma->e))) {
+				close_safe(&fd);
+				pr_err("Provider failed to return the prepared private VMA descriptor\n");
+				exit_code = -1;
+				goto out;
+			}
+			vma->e->fd = fd;
+			continue;
 		}
 
 		if (!vma_area_is(vma, VMA_AREA_REGULAR) || !vma->vm_open)
@@ -1662,7 +1685,8 @@ int open_vmas(struct pstree_item *t)
 
 		if (vma->vm_open(pid, vma)) {
 			pr_err("`- Can't open vma\n");
-			return -1;
+			exit_code = -1;
+			goto out;
 		}
 
 		/*
@@ -1674,9 +1698,62 @@ int open_vmas(struct pstree_item *t)
 			vma->e->status |= VMA_CLOSE;
 	}
 
+out:
+	if (provider)
+		extmem_finish_batch();
 	filemap_ctx_fini();
 
+	return exit_code;
+}
+
+int prepare_extmem_vmas(struct pstree_item *t)
+{
+	int pid = vpid(t);
+	int batch_ret;
+	unsigned int vma_id = 0;
+	struct vma_area *vma;
+	struct vm_area_list *vmas = &rsti(t)->vmas;
+
+	batch_ret = extmem_start_batch();
+	if (batch_ret == -ENOTSUP)
+		return 0;
+	if (batch_ret)
+		return -1;
+
+	list_for_each_entry(vma, &vmas->h, list) {
+		int fd;
+		int ret;
+		unsigned int current_vma_id = vma_id++;
+
+		if (!vma_area_is(vma, VMA_ANON_PRIVATE) || (vma->e->flags & MAP_GROWSDOWN) ||
+		    (vma->e->madv & (1ul << MADV_WIPEONFORK)))
+			continue;
+
+		ret = extmem_get_vma(pid, current_vma_id, vma->e->start, vma_entry_len(vma->e), &fd);
+		if (ret == -ENOTSUP)
+			continue;
+		if (ret)
+			goto err;
+		if (extmem_validate_memfd(fd, vma_entry_len(vma->e))) {
+			close(fd);
+			pr_err("Provider returned an invalid private VMA descriptor\n");
+			goto err;
+		}
+
+		close(fd);
+
+		vma->e->flags &= ~MAP_ANONYMOUS;
+		vma->e->flags |= MAP_PRIVATE;
+		vma->e->status |= VMA_EXT_PROVIDER | VMA_CLOSE;
+		vma->pvma = NULL;
+	}
+
+	extmem_finish_batch();
 	return 0;
+
+err:
+	extmem_finish_batch();
+	return -1;
 }
 
 static int prepare_vma_ios(struct pstree_item *t, struct task_restore_args *ta)

@@ -20,6 +20,25 @@ struct task_entries {
 	mutex_t last_pid_mutex;
 	struct decompression_shared_budget decompression_budget;
 	int asyncd_sk_id;
+	uint64_t profile_provider_vmas_ns;
+	uint64_t profile_mappings_ns;
+	uint64_t profile_tasks_forked_ns;
+	uint64_t profile_alive_start_ns;
+	uint64_t profile_fds_ns;
+	uint64_t profile_vmas_open_ns;
+	uint64_t profile_resources_ns;
+	uint64_t profile_mm_ns;
+	uint64_t profile_vmas_prepared_ns;
+	uint64_t profile_sigreturn_enter_ns;
+	uint64_t profile_restorer_handoff_ns;
+	uint64_t profile_restorer_start_ns;
+	uint64_t profile_unmap_done_ns;
+	uint64_t profile_mappings_done_ns;
+	uint64_t profile_io_done_ns;
+	uint64_t profile_madv_done_ns;
+	uint64_t profile_threads_start_ns;
+	uint64_t profile_threads_done_ns;
+	uint64_t profile_restorer_done_ns;
 };
 
 struct fdt {

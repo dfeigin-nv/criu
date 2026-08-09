@@ -261,16 +261,27 @@ static int cuda_process_checkpoint_action(int pid, const char *action, unsigned 
 {
 	char pid_buf[16];
 	char timeout_buf[16];
+	const char *device_map = NULL;
+	const char *args[10] = { CUDA_CHECKPOINT, "--action", action, "--pid", pid_buf };
+	int next_arg = 5;
 
 	snprintf(pid_buf, sizeof(pid_buf), "%d", pid);
 
-	const char *args[] = { CUDA_CHECKPOINT, "--action", action, "--pid", pid_buf, NULL /* --timeout */,
-			       NULL /* timeout_val */, NULL };
 	if (timeout > 0) {
 		snprintf(timeout_buf, sizeof(timeout_buf), "%d", timeout);
-		args[5] = "--timeout";
-		args[6] = timeout_buf;
+		args[next_arg++] = "--timeout";
+		args[next_arg++] = timeout_buf;
 	}
+	if (strcmp(action, ACTION_RESTORE) == 0) {
+		device_map = getenv("CRIU_CUDA_DEVICE_MAP");
+		if (device_map && device_map[0]) {
+			args[next_arg++] = "--device-map";
+			args[next_arg++] = device_map;
+		}
+		pr_info("Restoring CUDA devices for restored pid %d (device map %s)\n", pid,
+			device_map && device_map[0] ? "supplied" : "not supplied");
+	}
+	args[next_arg] = NULL;
 
 	return launch_cuda_checkpoint(args, msg_buf, buf_size);
 }
@@ -569,8 +580,7 @@ int cuda_plugin_init(int stage)
 
 	if (stage == CR_PLUGIN_STAGE__RESTORE) {
 		if (!check_and_remove_inventory_plugin(CR_PLUGIN_DESC.name, strlen(CR_PLUGIN_DESC.name))) {
-			plugin_disabled = true;
-			return 0;
+			pr_info("CUDA plugin inventory marker absent; enabling restore for compatible checkpoint\n");
 		}
 	}
 

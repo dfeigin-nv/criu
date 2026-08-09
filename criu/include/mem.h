@@ -47,6 +47,7 @@ extern int collect_madv_guards(pid_t pid, struct vm_area_list *vma_area_list);
 
 struct task_restore_args;
 int open_vmas(struct pstree_item *t);
+int prepare_extmem_vmas(struct pstree_item *t);
 int prepare_vmas(struct pstree_item *t, struct task_restore_args *ta);
 int unmap_guard_pages(struct pstree_item *t);
 int prepare_mappings(struct pstree_item *t);

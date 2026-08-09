@@ -68,6 +68,18 @@ static CgSetEntry *find_rst_set_by_id(u32 id)
 	return NULL;
 }
 
+int cgroup_has_threaded_controller(void)
+{
+	unsigned int i;
+
+	for (i = 0; i < n_controllers; i++) {
+		if (controllers[i]->has_is_threaded && controllers[i]->is_threaded)
+			return 1;
+	}
+
+	return 0;
+}
+
 #define CGCMP_MATCH 1 /* check for exact match */
 #define CGCMP_ISSUB 2 /* check set is subset of ctls */
 

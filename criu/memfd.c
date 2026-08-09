@@ -19,6 +19,7 @@
 #include "file-ids.h"
 #include "namespaces.h"
 #include "asyncd.h"
+#include "extmem.h"
 #include "shmem.h"
 #include "hugetlb.h"
 
@@ -49,6 +50,7 @@ struct memfd_restore_inode {
 	unsigned int pending_seals;
 	MemfdInodeEntry *mie;
 	bool was_opened_rw;
+	bool provider_backed;
 };
 
 static LIST_HEAD(memfd_inodes);
@@ -237,6 +239,7 @@ static int collect_one_memfd_inode(void *o, ProtobufCMessage *base, struct cr_im
 	inode->fdstore_id = -1;
 	inode->pending_seals = 0;
 	inode->was_opened_rw = false;
+	inode->provider_backed = false;
 
 	list_add_tail(&inode->list, &memfd_inodes);
 
@@ -264,6 +267,23 @@ static int memfd_open_inode_nocache(struct memfd_restore_inode *inode)
 	int flags;
 
 	mie = inode->mie;
+	if (!mie->has_hugetlb_flag || !mie->hugetlb_flag) {
+		ret = extmem_get_shared(mie->shmid, mie->size, &fd);
+		if (ret == 0) {
+			if (extmem_validate_memfd(fd, mie->size)) {
+				pr_err("Provider returned an invalid memfd descriptor\n");
+				goto err;
+			}
+			/* The provider fills before pre-resume; apply the saved seals after it is ready. */
+			inode->pending_seals = mie->seals;
+			inode->provider_backed = true;
+			goto set_permissions;
+		}
+		if (ret != -ENOTSUP) {
+			pr_err("External memory provider failed to open memfd shmem 0x%x\n", mie->shmid);
+			goto err;
+		}
+	}
 	if (mie->seals == F_SEAL_SEAL) {
 		inode->pending_seals = 0;
 		flags = 0;
@@ -308,6 +328,7 @@ static int memfd_open_inode_nocache(struct memfd_restore_inode *inode)
 			goto err;
 	}
 
+set_permissions:
 	if (mie->has_mode)
 		ret = cr_fchperm(fd, mie->uid, mie->gid, mie->mode);
 	else
@@ -483,7 +504,7 @@ struct file_desc *collect_memfd(u32 id)
 	return fdesc;
 }
 
-int apply_memfd_seals(void)
+int apply_memfd_seals(bool provider_backed)
 {
 	/*
 	 * We apply the seals after all the mappings are done because the seal
@@ -496,7 +517,7 @@ int apply_memfd_seals(void)
 	struct memfd_restore_inode *inode;
 
 	list_for_each_entry(inode, &memfd_inodes, list) {
-		if (!inode->pending_seals)
+		if (!inode->pending_seals || inode->provider_backed != provider_backed)
 			continue;
 
 		fd = memfd_open_inode(inode);

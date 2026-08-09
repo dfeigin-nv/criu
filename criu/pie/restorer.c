@@ -100,6 +100,24 @@
 
 static struct task_entries *task_entries_local;
 
+static uint64_t restorer_monotonic_ns(void)
+{
+	struct timespec ts;
+
+	if (sys_clock_gettime(CLOCK_REALTIME, &ts))
+		return 0;
+	return (uint64_t)ts.tv_sec * 1000000000ULL + ts.tv_nsec;
+}
+
+static void restorer_profile_store(uint64_t *slot)
+{
+	uint64_t now = restorer_monotonic_ns();
+	uint64_t old = __atomic_load_n(slot, __ATOMIC_RELAXED);
+
+	while (old < now && !__atomic_compare_exchange_n(slot, &old, now, false, __ATOMIC_RELAXED, __ATOMIC_RELAXED))
+		;
+}
+
 static atomic_t thread_inprogress;
 static void *rst_mem;
 static long rst_mem_size;
@@ -2269,6 +2287,7 @@ __visible long __export_restore_task(struct task_restore_args *args)
 	fi_strategy = args->fault_strategy;
 
 	task_entries_local = args->task_entries;
+	restorer_profile_store(&task_entries_local->profile_restorer_start_ns);
 	helpers = args->helpers;
 	n_helpers = args->helpers_n;
 	zombies = args->zombies;
@@ -2340,6 +2359,7 @@ __visible long __export_restore_task(struct task_restore_args *args)
 	if (unmap_old_vmas((void *)args->premmapped_addr, args->premmapped_len, bootstrap_start, bootstrap_len,
 			   args->task_size))
 		goto core_restore_end;
+	restorer_profile_store(&task_entries_local->profile_unmap_done_ns);
 
 	/* Map vdso that wasn't parked */
 	if (args->can_map_vdso && (map_vdso(args, args->compatible_mode) < 0))
@@ -2416,6 +2436,7 @@ __visible long __export_restore_task(struct task_restore_args *args)
 			goto core_restore_end;
 		}
 	}
+	restorer_profile_store(&task_entries_local->profile_mappings_done_ns);
 
 	/*
 	 * Now read the contents (if any).
@@ -2440,6 +2461,7 @@ __visible long __export_restore_task(struct task_restore_args *args)
 		if (rc < 0)
 			goto core_restore_end;
 	}
+	restorer_profile_store(&task_entries_local->profile_io_done_ns);
 
 	/*
 	 * Proxify vDSO.
@@ -2509,6 +2531,7 @@ __visible long __export_restore_task(struct task_restore_args *args)
 	ret = restore_madv_guard_regions(args);
 	if (ret)
 		goto core_restore_end;
+	restorer_profile_store(&task_entries_local->profile_madv_done_ns);
 
 	/*
 	 * Tune up the task fields.
@@ -2623,6 +2646,7 @@ __visible long __export_restore_task(struct task_restore_args *args)
 	 * +--------------------------------------------------------------------------+
 	 */
 
+	restorer_profile_store(&task_entries_local->profile_threads_start_ns);
 	if (args->nr_threads > 1) {
 		struct thread_restore_args *thread_args = args->thread_args;
 		long clone_flags = CLONE_VM | CLONE_FILES | CLONE_SIGHAND | CLONE_THREAD | CLONE_SYSVSEM | CLONE_FS;
@@ -2696,6 +2720,7 @@ __visible long __export_restore_task(struct task_restore_args *args)
 		if (fd >= 0)
 			sys_close(fd);
 	}
+	restorer_profile_store(&task_entries_local->profile_threads_done_ns);
 
 	restore_rlims(args);
 
@@ -2715,6 +2740,7 @@ __visible long __export_restore_task(struct task_restore_args *args)
 		goto core_restore_end;
 
 	pr_info("%ld: Restored\n", sys_getpid());
+	restorer_profile_store(&task_entries_local->profile_restorer_done_ns);
 
 	restore_finish_stage(task_entries_local, CR_STATE_RESTORE);
 
