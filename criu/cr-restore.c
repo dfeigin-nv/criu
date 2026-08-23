@@ -84,6 +84,7 @@
 #include "sk-queue.h"
 #include "sigframe.h"
 #include "fdstore.h"
+#include "extmem.h"
 #include "string.h"
 #include "memfd.h"
 #include "timens.h"
@@ -1652,6 +1653,9 @@ static int __restore_task_with_children(void *_arg)
 	if (setup_newborn_fds(current))
 		goto err;
 
+	if (current == root_item && prepare_extmem_vmas())
+		goto err;
+
 	if (restore_task_mnt_ns(current))
 		goto err;
 
@@ -2200,6 +2204,13 @@ skip_ns_bouncing:
 	if (ret < 0)
 		goto out_kill;
 
+	/* ACT_PRE_RESUME runs after sealing, so verify provider readiness here. */
+	ret = extmem_wait_ready();
+	if (ret < 0 && ret != -ENOTSUP) {
+		pr_err("External memory provider is not ready\n");
+		goto out_kill;
+	}
+
 	ret = apply_memfd_seals();
 	if (ret < 0)
 		goto out_kill;
@@ -2480,6 +2491,10 @@ int cr_restore_tasks(void)
 	if (inherit_fd_move_to_fdstore())
 		goto err;
 
+	ret = extmem_init();
+	if (ret < 0 && ret != -ENOTSUP)
+		goto err;
+
 	if (crtools_prepare_shared() < 0)
 		goto err;
 
@@ -2497,6 +2512,12 @@ clean_cgroup:
 	fini_cgroup();
 err:
 	cr_plugin_fini(CR_PLUGIN_STAGE__RESTORE, ret);
+	if (ret) {
+		if (extmem_abort())
+			pr_err("Failed to abort external memory provider session\n");
+	} else if (extmem_commit()) {
+		pr_err("Failed to commit external memory provider session\n");
+	}
 	return ret;
 }
 
