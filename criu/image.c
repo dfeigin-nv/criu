@@ -725,8 +725,8 @@ static int do_open_image(struct cr_img *img, int dfd, int type, unsigned long of
 
 	flags = oflags & ~(O_NOBUF | O_SERVICE | O_FORCE_LOCAL);
 
-	/* Metadata opens before fdstore setup must use CRIU's local image directory. */
-	if (oflags & O_FORCE_LOCAL || !extmem_is_active())
+	/* Inventory is opened locally before the provider can be initialized. */
+	if (oflags & O_FORCE_LOCAL)
 		provider_ret = -ENOTSUP;
 	else
 		provider_ret = extmem_open_image(path, flags, &provider_fd);

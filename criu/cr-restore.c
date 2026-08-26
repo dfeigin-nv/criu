@@ -2441,6 +2441,7 @@ int prepare_dummy_task_state(struct pstree_item *pi)
 int cr_restore_tasks(void)
 {
 	int ret = -1;
+	bool plugin_initialized = false;
 
 	if (init_service_fd())
 		return 1;
@@ -2465,19 +2466,26 @@ int cr_restore_tasks(void)
 	if (tty_init_restore())
 		return -1;
 
+	if (fdstore_init())
+		return -1;
+
+	if (inherit_fd_move_to_fdstore())
+		return -1;
+
+	ret = extmem_init();
+	if (ret < 0 && ret != -ENOTSUP)
+		goto err;
+
 	if (opts.cpu_cap & CPU_CAP_IMAGE) {
 		if (cpu_validate_cpuinfo())
-			return -1;
+			goto err;
 	}
 
 	if (prepare_task_entries() < 0)
-		return -1;
+		goto err;
 
 	if (prepare_pstree() < 0)
-		return -1;
-
-	if (fdstore_init())
-		return -1;
+		goto err;
 
 	/*
 	 * For the AMDGPU plugin, its parallel restore feature needs to use fdstore to store
@@ -2486,14 +2494,8 @@ int cr_restore_tasks(void)
 	 * must be initialized after fdstore_init.
 	 */
 	if (cr_plugin_init(CR_PLUGIN_STAGE__RESTORE))
-		return -1;
-
-	if (inherit_fd_move_to_fdstore())
 		goto err;
-
-	ret = extmem_init();
-	if (ret < 0 && ret != -ENOTSUP)
-		goto err;
+	plugin_initialized = true;
 
 	if (crtools_prepare_shared() < 0)
 		goto err;
@@ -2511,7 +2513,8 @@ int cr_restore_tasks(void)
 clean_cgroup:
 	fini_cgroup();
 err:
-	cr_plugin_fini(CR_PLUGIN_STAGE__RESTORE, ret);
+	if (plugin_initialized)
+		cr_plugin_fini(CR_PLUGIN_STAGE__RESTORE, ret);
 	if (ret) {
 		if (extmem_abort())
 			pr_err("Failed to abort external memory provider session\n");
