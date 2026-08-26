@@ -1976,7 +1976,7 @@ static int finalize_restore_detach(void)
 				pr_perror("Restoring regs for %d failed", pid);
 				return -1;
 			}
-			if (ptrace(PTRACE_DETACH, pid, NULL, 0)) {
+			if (ptrace(PTRACE_DETACH, pid, NULL, 0) && errno != ESRCH) {
 				pr_perror("Unable to detach %d", pid);
 				return -1;
 			}
