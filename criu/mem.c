@@ -1047,29 +1047,6 @@ static int premap_private_vma(struct pstree_item *t, struct vma_area *vma, void 
 	return 0;
 }
 
-static int premap_provider_vma(struct pstree_item *t, struct vma_area *vma, unsigned int vma_id, void **addr)
-{
-	int fd = -1;
-	int ret;
-
-	ret = extmem_get_vma(vpid(t), vma_id, vma->e->start, vma_entry_len(vma->e), &fd);
-	if (ret || extmem_validate_memfd_mapping_fd(fd, vma_entry_len(vma->e))) {
-		close_safe(&fd);
-		pr_err("Provider did not return a usable private VMA memfd\n");
-		return -1;
-	}
-
-	vma->e->fd = fd;
-	ret = premap_private_vma(t, vma, addr);
-	close_safe(&fd);
-	vma->e->fd = -1;
-	if (ret)
-		return ret;
-
-	vma->e->status &= ~VMA_CLOSE;
-	return 0;
-}
-
 static inline bool vma_force_premap(struct vma_area *vma, struct list_head *head)
 {
 	/*
@@ -1125,15 +1102,12 @@ static int premap_priv_vmas(struct pstree_item *t, struct vm_area_list *vmas, vo
 {
 	struct vma_area *vma;
 	unsigned long pstart = 0;
-	unsigned int vma_id = 0;
-	bool provider_fd_acquired = false;
 	int ret = 0;
 	LIST_HEAD(empty);
 
 	filemap_ctx_init(true);
 
 	list_for_each_entry(vma, &vmas->h, list) {
-		unsigned int current_vma_id = vma_id++;
 		bool exceptional;
 		int has_lz4 = 0;
 		int has_parent = 0;
@@ -1155,21 +1129,6 @@ static int premap_priv_vmas(struct pstree_item *t, struct vm_area_list *vmas, vo
 
 		if (!vma_area_is_private(vma, kdat.task_size))
 			continue;
-		if ((vma->e->status & VMA_EXT_PROVIDER) && !(vma->e->flags & MAP_HUGETLB)) {
-			if (!provider_fd_acquired) {
-				ret = extmem_acquire_provider_fd();
-				if (ret) {
-					pr_err("Provider is unavailable for private VMA\n");
-					ret = -1;
-					break;
-				}
-				provider_fd_acquired = true;
-			}
-			ret = premap_provider_vma(t, vma, current_vma_id, at);
-			if (ret < 0)
-				break;
-			continue;
-		}
 		exceptional = (vma->e->flags & MAP_HUGETLB) ||
 			      (vma->e->status & (VMA_EXT_PLUGIN | VMA_EXT_PROVIDER));
 
@@ -1267,8 +1226,6 @@ static int premap_priv_vmas(struct pstree_item *t, struct vm_area_list *vmas, vo
 			break;
 	}
 
-	if (provider_fd_acquired)
-		extmem_release_provider_fd();
 	filemap_ctx_fini();
 
 	return ret;
@@ -1694,8 +1651,6 @@ int open_vmas(struct pstree_item *t)
 			int fd = -1;
 			int ret;
 
-			if (vma_area_is(vma, VMA_PREMMAPED))
-				continue;
 			if (!provider_fd_acquired) {
 				ret = extmem_acquire_provider_fd();
 				if (ret) {
