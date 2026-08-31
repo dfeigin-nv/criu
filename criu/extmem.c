@@ -312,29 +312,12 @@ int extmem_get_shared(unsigned long shmid, unsigned long length, int *fd)
 	return provider_request(&req, fd);
 }
 
-int extmem_validate_mapping_fd(int fd, unsigned long length)
-{
-	struct stat st;
-
-	if (fstat(fd, &st) || !S_ISREG(st.st_mode) || st.st_size < (off_t)length)
-		return -1;
-
-	return 0;
-}
-
-int extmem_validate_memfd_mapping_fd(int fd, unsigned long length)
-{
-	if (extmem_validate_mapping_fd(fd, length))
-		return -1;
-
-	return fcntl(fd, F_GET_SEALS) < 0 ? -1 : 0;
-}
-
 int extmem_validate_memfd(int fd, unsigned long length, unsigned int saved_seals)
 {
+	struct stat st;
 	int seals;
 
-	if (extmem_validate_memfd_mapping_fd(fd, length))
+	if (fstat(fd, &st) || !S_ISREG(st.st_mode) || st.st_size < (off_t)length)
 		return -1;
 
 	seals = fcntl(fd, F_GET_SEALS);

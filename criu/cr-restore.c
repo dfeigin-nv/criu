@@ -1653,6 +1653,9 @@ static int __restore_task_with_children(void *_arg)
 	if (setup_newborn_fds(current))
 		goto err;
 
+	if (current == root_item && prepare_extmem_vmas())
+		goto err;
+
 	if (restore_task_mnt_ns(current))
 		goto err;
 
@@ -1973,7 +1976,7 @@ static int finalize_restore_detach(void)
 				pr_perror("Restoring regs for %d failed", pid);
 				return -1;
 			}
-			if (ptrace(PTRACE_DETACH, pid, NULL, 0) && errno != ESRCH) {
+			if (ptrace(PTRACE_DETACH, pid, NULL, 0)) {
 				pr_perror("Unable to detach %d", pid);
 				return -1;
 			}
