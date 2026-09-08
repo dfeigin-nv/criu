@@ -1185,6 +1185,14 @@ static inline int fork_with_pid(struct pstree_item *item)
 
 	ca.item = item;
 	ca.clone_flags = rsti(item)->clone_flags;
+	/*
+	 * An external PID namespace is the namespace in which the restored
+	 * root belongs, not its parent.  fork_with_pid() has already selected
+	 * it through the inherited fd above, so recreating CLONE_NEWPID here
+	 * would add an otherwise invisible nested namespace on every restore.
+	 */
+	if (external_pidns)
+		ca.clone_flags &= ~CLONE_NEWPID;
 
 	BUG_ON(ca.clone_flags & CLONE_VM);
 
