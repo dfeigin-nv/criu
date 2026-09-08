@@ -957,6 +957,20 @@ static int prepare_pstree_kobj_ids(void)
 		cflags &= CLONE_ALLNS;
 
 		if (item == root_item) {
+			struct ns_id *pid_ns;
+
+			/*
+			 * An external PID namespace supplied as an inherited FD is
+			 * the root task's destination.  Do not retain CLONE_NEWPID
+			 * in the root topology: otherwise CRIU enters that namespace
+			 * and creates a child of it for every restore.
+			 */
+			pid_ns = lookup_ns_by_id(item->ids->pid_ns_id, &pid_ns_desc);
+			if (pid_ns && pid_ns->ext_key) {
+				rsti(item)->clone_flags &= ~CLONE_NEWPID;
+				cflags &= ~CLONE_NEWPID;
+			}
+
 			pr_info("Will restore in %lx namespaces\n", cflags);
 			root_ns_mask = cflags;
 		} else if (cflags & ~(root_ns_mask & CLONE_SUBNS)) {

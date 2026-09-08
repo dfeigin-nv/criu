@@ -55,5 +55,15 @@ grep -B 5 Error images_pidns/restore.log || echo ok
 PID=$(cat images_pidns/test.pidfile)
 AFTER=$(grep NSpid /proc/$PID/status)
 echo "after c/r: $AFTER"
+
+# An external PID namespace is the restore target itself. Restoring through it
+# must not create a child PID namespace, which would add another PID to NSpid.
+set -- $AFTER
+[ "$#" -eq 2 ] || {
+	echo "restore created a nested PID namespace"
+	echo FAIL
+	exit 1
+}
+
 echo PASS
 exit 0
